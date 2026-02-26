@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PO Inbox Monitor</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header>
+    <h1>PO Inbox Monitor</h1>
+  </header>
+
+  <main>
+
+    <!-- Sync button -->
+    <section class="sync-bar">
+      <form method="post" action="/sync">
+        <button type="submit" class="btn-sync">&#x21BB; Sync Inbox</button>
+      </form>
+    </section>
+
+    <!-- Last sync result -->
+    {% if last_sync %}
+    <section class="sync-result">
+      <strong>Last sync:</strong>
+      {{ last_sync.total_seen }} seen &mdash;
+      {{ last_sync.inserted }} inserted &mdash;
+      {{ last_sync.skipped_duplicates }} duplicates skipped &mdash;
+      {{ last_sync.ignored_non_po }} non-PO ignored
+    </section>
+    {% endif %}
+
+    <!-- Summary -->
+    <section class="summary">
+      <span><strong>Total records:</strong> {{ counts.get("total", 0) }}</span>
+      <span><strong>NEW:</strong> {{ counts.get("NEW", 0) }}</span>
+    </section>
+
+    <!-- Filters -->
+    <section class="filters">
+      <form method="get" action="/">
+        <label for="status">Status:</label>
+        <select name="status" id="status">
+          <option value="">All</option>
+          <option value="NEW" {% if status_filter == "NEW" %}selected{% endif %}>NEW</option>
+          <option value="IN_REVIEW" {% if status_filter == "IN_REVIEW" %}selected{% endif %}>IN_REVIEW</option>
+          <option value="DONE" {% if status_filter == "DONE" %}selected{% endif %}>DONE</option>
+        </select>
+
+        <label for="likely_po">Likely PO:</label>
+        <select name="likely_po" id="likely_po">
+          <option value="">All</option>
+          <option value="yes" {% if likely_po_filter == "yes" %}selected{% endif %}>Yes</option>
+          <option value="no" {% if likely_po_filter == "no" %}selected{% endif %}>No</option>
+        </select>
+
+        <button type="submit">Filter</button>
+        <a href="/" class="btn-clear">Clear</a>
+      </form>
+    </section>
+
+    <!-- Worklist table -->
+    <section class="table-wrapper">
+      {% if records %}
+      <table>
+        <thead>
+          <tr>
+            <th>Received</th>
+            <th>Sender</th>
+            <th>Subject</th>
+            <th>Attachment</th>
+            <th>Likely PO</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for r in records %}
+          <tr class="{% if r.is_likely_po %}row-po{% else %}row-normal{% endif %}">
+            <td>{{ r.received_at }}</td>
+            <td>{{ r.sender }}</td>
+            <td>{{ r.subject }}</td>
+            <td>{{ r.attachment_name }}</td>
+            <td>{% if r.is_likely_po %}<span class="badge-yes">Yes</span>{% else %}<span class="badge-no">No</span>{% endif %}</td>
+            <td><span class="status-badge status-{{ r.status | lower }}">{{ r.status }}</span></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <p class="empty-msg">No records found. Click <strong>Sync Inbox</strong> to import messages.</p>
+      {% endif %}
+    </section>
+
+  </main>
+
+  <footer>
+    <p>PO Inbox Monitor &mdash; first draft &mdash; mock mode</p>
+  </footer>
+</body>
+</html>

@@ -1,0 +1,206 @@
+/* PO Inbox Monitor — base styles */
+
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+body {
+  font-family: system-ui, -apple-system, sans-serif;
+  font-size: 14px;
+  background: #f4f6f9;
+  color: #222;
+  margin: 0;
+  padding: 0;
+}
+
+header {
+  background: #1e3a5f;
+  color: #fff;
+  padding: 14px 24px;
+}
+
+header h1 {
+  margin: 0;
+  font-size: 1.4rem;
+  letter-spacing: 0.02em;
+}
+
+main {
+  max-width: 1100px;
+  margin: 24px auto;
+  padding: 0 16px;
+}
+
+footer {
+  text-align: center;
+  color: #888;
+  font-size: 0.8rem;
+  padding: 24px;
+}
+
+/* Sync bar */
+.sync-bar {
+  margin-bottom: 12px;
+}
+
+.btn-sync {
+  background: #1e3a5f;
+  color: #fff;
+  border: none;
+  padding: 8px 18px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.95rem;
+}
+
+.btn-sync:hover {
+  background: #2a5080;
+}
+
+/* Sync result banner */
+.sync-result {
+  background: #e8f4fd;
+  border-left: 4px solid #2196f3;
+  padding: 8px 14px;
+  border-radius: 4px;
+  margin-bottom: 12px;
+  font-size: 0.9rem;
+}
+
+/* Summary */
+.summary {
+  display: flex;
+  gap: 24px;
+  background: #fff;
+  border: 1px solid #dde2ea;
+  border-radius: 6px;
+  padding: 10px 16px;
+  margin-bottom: 14px;
+}
+
+/* Filters */
+.filters {
+  background: #fff;
+  border: 1px solid #dde2ea;
+  border-radius: 6px;
+  padding: 10px 16px;
+  margin-bottom: 14px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.filters form {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.filters select {
+  padding: 4px 8px;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+}
+
+.filters button {
+  background: #1e3a5f;
+  color: #fff;
+  border: none;
+  padding: 5px 14px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.filters button:hover {
+  background: #2a5080;
+}
+
+.btn-clear {
+  color: #555;
+  font-size: 0.85rem;
+  text-decoration: none;
+}
+
+/* Table */
+.table-wrapper {
+  background: #fff;
+  border: 1px solid #dde2ea;
+  border-radius: 6px;
+  overflow-x: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+thead {
+  background: #f0f3f8;
+}
+
+th, td {
+  padding: 9px 12px;
+  text-align: left;
+  border-bottom: 1px solid #eaecf0;
+}
+
+th {
+  font-weight: 600;
+  color: #444;
+  white-space: nowrap;
+}
+
+tr:last-child td {
+  border-bottom: none;
+}
+
+tr.row-po {
+  background: #fffbf0;
+}
+
+.empty-msg {
+  padding: 24px;
+  color: #666;
+  text-align: center;
+}
+
+/* Badges */
+.badge-yes {
+  background: #d4edda;
+  color: #155724;
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.badge-no {
+  background: #f8d7da;
+  color: #721c24;
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-size: 0.8rem;
+}
+
+.status-badge {
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.status-new {
+  background: #cfe2ff;
+  color: #084298;
+}
+
+.status-in_review {
+  background: #fff3cd;
+  color: #664d03;
+}
+
+.status-done {
+  background: #d1e7dd;
+  color: #0a3622;
+}
