@@ -1,0 +1,13 @@
+.env
+.env.local
+data/*.db
+data/*.sqlite
+data/*.log
+data/*.txt
+data/*.csv
+storage/*
+!storage/.gitkeep
+samples/inbox/uploaded/*
+!samples/inbox/uploaded/.gitkeep
+__pycache__/
+*.pyc
