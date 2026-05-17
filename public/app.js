@@ -264,7 +264,8 @@ function normalizeFieldValue(type, value) {
   if (value === "") return null;
   if (type === "date" && value) return value.slice(0, 10);
   return value;
-}\n
+}
+
 async function loadLogs() {
   const rows = await api("/api/logs");
   document.querySelector("#logs").innerHTML = rows
