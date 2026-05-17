@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>POInbox PO Intake</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header>
+      <div>
+        <h1>PO Intake Queue</h1>
+        <p>Shared inbox purchase order detection, extraction, and review.</p>
+      </div>
+      <div class="actions">
+        <div class="view-switcher" role="tablist" aria-label="App view">
+          <button class="secondary active-view" id="dashboardViewBtn">PO Dashboard</button>
+          <button class="secondary" id="adminViewBtn">Admin</button>
+        </div>
+        <button id="syncBtn" title="Connector stub for Gmail or Outlook">Sync Inbox</button>
+        <button id="importBtn">Import Samples</button>
+      </div>
+    </header>
+
+    <main id="dashboardView">
+      <section class="summary" id="summary"></section>
+
+      <section class="toolbar">
+        <select id="statusFilter">
+          <option value="">All statuses</option>
+          <option>Received</option>
+          <option>Needs Review</option>
+          <option>Booked</option>
+          <option>Rejected</option>
+        </select>
+        <input id="searchInput" placeholder="Search customer, PO number, sender" />
+        <button class="secondary" id="exportBtn">Export</button>
+      </section>
+
+      <section class="split">
+        <div class="list-panel">
+          <table>
+            <thead>
+              <tr>
+                <th>Status</th>
+                <th>Received</th>
+                <th>Customer</th>
+                <th>PO #</th>
+                <th>Order Type</th>
+                <th>Sender</th>
+                <th>Lines</th>
+                <th>Total</th>
+                <th>Confidence</th>
+                <th>Updated</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="poRows"></tbody>
+          </table>
+        </div>
+
+        <aside class="detail-panel" id="detail">
+          <div class="empty-state">Select a purchase order to review extracted fields and source text.</div>
+        </aside>
+      </section>
+
+      <section class="logs">
+        <div class="section-title">Processing Log</div>
+        <div id="logs"></div>
+      </section>
+    </main>
+
+    <main class="hidden" id="adminView">
+      <section class="admin-grid">
+        <div class="admin-panel">
+          <div class="admin-head">
+            <div>
+              <h2>Customer Part Cross Reference</h2>
+              <p>Map customer part numbers to internal part numbers by customer.</p>
+            </div>
+            <div class="actions">
+              <input id="xrefCsvInput" type="file" accept=".csv" hidden />
+              <button class="secondary" id="xrefCsvBtn">Upload CSV</button>
+              <button class="secondary" id="xrefCsvDownloadBtn">Download CSV</button>
+            </div>
+          </div>
+          <div class="upload-message" id="xrefMessage"></div>
+          <div class="admin-form">
+            <input id="xrefCustomer" placeholder="Customer" />
+            <input id="xrefCustomerPart" placeholder="Customer part #" />
+            <input id="xrefInternalPart" placeholder="Internal part #" />
+            <button id="addXrefBtn">Add / Update</button>
+          </div>
+          <div class="admin-table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Customer</th>
+                  <th>Customer Part #</th>
+                  <th>Internal Part #</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="xrefRows"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="admin-panel">
+          <div class="admin-head">
+            <div>
+              <h2>Order Types</h2>
+              <p>Configure the order type dropdown used in PO review.</p>
+            </div>
+          </div>
+          <div class="admin-form order-form">
+            <input id="orderTypeName" placeholder="Order type name" />
+            <button id="addOrderTypeBtn">Add</button>
+          </div>
+          <div class="admin-table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Status</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="orderTypeRows"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <div class="modal-backdrop hidden" id="uploadModal" aria-hidden="true">
+      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="uploadTitle">
+        <div class="modal-head">
+          <div>
+            <h2 id="uploadTitle">Import Samples</h2>
+            <p>Upload PO samples or import files already in the sample inbox folder.</p>
+          </div>
+          <button class="icon-btn" id="closeUploadBtn" title="Close">x</button>
+        </div>
+
+        <div class="drop-zone" id="dropZone">
+          <input id="fileInput" type="file" accept=".pdf,.txt,.eml" multiple hidden />
+          <div class="drop-title">Drop files here</div>
+          <div class="drop-copy">PDF, TXT, or EML files. Multiple files are supported.</div>
+          <button class="secondary" id="selectFileBtn">Select File</button>
+        </div>
+
+        <div class="selected-files" id="selectedFiles">No files selected.</div>
+        <div class="upload-message" id="uploadMessage"></div>
+
+        <div class="modal-actions">
+          <button id="uploadProcessBtn">Upload & Process</button>
+          <button class="secondary" id="folderImportBtn">Import Existing Sample Folder</button>
+          <button class="secondary" id="cancelUploadBtn">Cancel</button>
+        </div>
+      </section>
+    </div>
+
+    <div class="modal-backdrop hidden" id="exportModal" aria-hidden="true">
+      <section class="modal compact-modal" role="dialog" aria-modal="true" aria-labelledby="exportTitle">
+        <div class="modal-head">
+          <div>
+            <h2 id="exportTitle">Export PO Data</h2>
+            <p>Download CSV data using the current dashboard filters.</p>
+          </div>
+          <button class="icon-btn" id="closeExportBtn" title="Close">x</button>
+        </div>
+        <div class="modal-actions">
+          <button id="exportHeaderBtn">Header Only</button>
+          <button id="exportLinesBtn">Header + Lines</button>
+          <button class="secondary" id="cancelExportBtn">Cancel</button>
+        </div>
+      </section>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
