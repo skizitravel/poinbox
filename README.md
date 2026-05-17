@@ -11,12 +11,31 @@ This repository contains a local MVP for purchase order intake from a shared inb
 - Serves a local review UI for status changes, header edits, line edits, adding lines, and deleting lines
 - Includes a Gmail/Outlook connector interface stub for adding real inbox sync after the sample-mode vertical slice is validated
 
-## Quick Start
+## Run In A Browser With GitHub Codespaces
 
-Install Python 3.11+ and then install the optional PDF dependency:
+Use this path if your computer has a browser but cannot install Python or other developer tools.
+
+1. Open [https://github.com/skizitravel/poinbox](https://github.com/skizitravel/poinbox).
+2. Click **Code**.
+3. Open the **Codespaces** tab.
+4. Click **Create codespace on main**.
+5. Wait for the setup to finish.
+6. In the Codespaces terminal, run:
+
+```bash
+python server/app.py
+```
+
+Codespaces should prompt you to open forwarded port `8000`. If it does not, open the **Ports** tab, find port `8000`, and click the globe/open-browser icon.
+
+The app will run in a browser tab from the Codespaces URL. Data created there lives inside that Codespace unless you export it or commit code changes.
+
+## Local Quick Start
+
+Install Python 3.11+ and then install dependencies:
 
 ```powershell
-python -m pip install pypdf
+python -m pip install -r requirements.txt
 ```
 
 Create your local environment file:
