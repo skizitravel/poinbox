@@ -1,0 +1,1965 @@
+let selectedId = null;
+let currentDetail = null;
+let selectedUploadFiles = [];
+let orderTypes = [];
+let xrefs = [];
+let users = [];
+let customers = [];
+let departments = [];
+let testDocuments = [];
+let evaluationData = { run: null, results: [] };
+let inboxAccounts = [];
+let inboxSyncRuns = [];
+let inboxDetectionResults = [];
+let gmailConfig = {};
+let currentInboxConfig = null;
+let configuringInboxId = null;
+let currentUser = null;
+let activeAdminTab = "users";
+let editingUserId = null;
+let editingCustomerId = null;
+let currentCustomerDetail = null;
+let editingAddressId = null;
+let editingContactId = null;
+let pendingReviewAction = null;
+let editingGoldenDocumentId = null;
+let currentGoldenAnswer = null;
+
+const statuses = ["Received", "Needs Review", "Booked", "Rejected"];
+const headerFields = [
+  ["status", "Status", "select"],
+  ["order_type_id", "Order Type", "orderType"],
+  ["customer_company_name", "Customer Company"],
+  ["customer_contact_name", "Customer Contact"],
+  ["po_number", "PO Number"],
+  ["po_revision", "PO Revision"],
+  ["quote_number", "Quote Number"],
+  ["date_received", "Date Received", "date"],
+  ["payment_terms", "Payment Terms"],
+  ["freight_terms", "Freight Terms"],
+  ["total_value", "Total Value", "readonly"],
+  ["currency", "Currency"],
+  ["bill_to_address", "Bill To Address", "textarea", "wide"],
+  ["ship_to_address", "Ship To Address", "textarea", "wide"],
+  ["extraction_notes", "Extraction Notes", "textarea", "wide"],
+];
+
+const lineFields = [
+  ["line_number", "Line"],
+  ["customer_part_number", "Customer Part #"],
+  ["internal_part_number", "Internal Part #"],
+  ["description", "Description"],
+  ["quantity", "Qty", "number"],
+  ["unit_of_measure", "UOM"],
+  ["unit_price", "Unit Price", "number"],
+  ["line_total", "Line Total", "lineTotal"],
+  ["requested_date", "Requested Date", "date"],
+  ["extraction_notes", "Notes"],
+];
+
+async function api(path, options = {}) {
+  const { skipAuthRedirect = false, ...fetchOptions } = options;
+  const res = await fetch(path, {
+    headers: { "Content-Type": "application/json" },
+    ...fetchOptions,
+  });
+  if (res.status === 401 && !skipAuthRedirect) {
+    showLogin("Please log in to continue.");
+    throw new Error("Please log in to continue.");
+  }
+  if (res.status === 403) {
+    throw new Error("You do not have permission for that action.");
+  }
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+function hasPermission(permission) {
+  return Boolean(currentUser?.permissions?.includes(permission));
+}
+
+function canViewDashboard() {
+  return hasPermission("po_dashboard:view");
+}
+
+function canEditDashboard() {
+  return hasPermission("po_dashboard:edit");
+}
+
+function canViewAdmin() {
+  return hasPermission("admin:view");
+}
+
+function canManageUsers() {
+  return hasPermission("users:manage");
+}
+
+function setMessage(selector, message, kind = "") {
+  const el = document.querySelector(selector);
+  el.className = `upload-message ${kind}`;
+  el.textContent = message;
+}
+
+async function refresh() {
+  if (!canViewDashboard()) return;
+  await Promise.all([loadSummary(), loadPOs(), loadLogs()]);
+  if (selectedId) await openDetail(selectedId, false);
+}
+
+async function loadSummary() {
+  const data = await api("/api/summary");
+  const counts = data.status_counts;
+  document.querySelector("#summary").innerHTML = `
+    ${metric("Emails", data.total_emails)}
+    ${metric("POs", data.total_purchase_orders)}
+    ${metric("Received", counts.Received)}
+    ${metric("Needs Review", counts["Needs Review"])}
+    ${metric("Booked", counts.Booked)}
+    ${metric("Rejected", counts.Rejected)}
+  `;
+}
+
+function metric(label, value) {
+  return `<div class="metric"><span>${label}</span><strong>${value}</strong></div>`;
+}
+
+async function loadPOs() {
+  const status = encodeURIComponent(document.querySelector("#statusFilter").value);
+  const search = encodeURIComponent(document.querySelector("#searchInput").value);
+  const rows = await api(`/api/purchase-orders?status=${status}&search=${search}`);
+  document.querySelector("#poRows").innerHTML = rows
+    .map((row) => {
+      const active = row.id === selectedId ? "active" : "";
+      return `
+        <tr class="${active}" onclick="openDetail(${row.id})">
+          <td>${badge(row.status)}</td>
+          <td>${safe(row.date_received)}</td>
+          <td>${safe(row.customer_company_name)}</td>
+          <td><strong>${safe(row.po_number)}</strong></td>
+          <td>${safe(row.po_revision)}</td>
+          <td>${safe(row.order_type_name)}</td>
+          <td>${safe(row.source_display || sourceLabel(row))}</td>
+          <td>${safe(row.source_sender)}</td>
+          <td>${row.line_count}</td>
+          <td>${money(row.total_value, row.currency)}</td>
+          <td>${pct(row.extraction_confidence)}</td>
+          <td>${safe(row.updated_at)}</td>
+          <td>${canEditDashboard() ? `<button class="danger table-action" onclick="deletePO(event, ${row.id})">Delete</button>` : ""}</td>
+        </tr>
+      `;
+    })
+    .join("");
+}
+
+async function openDetail(id, mark = true) {
+  currentDetail = await api(`/api/purchase-orders/${id}`);
+  orderTypes = currentDetail.order_types || orderTypes;
+  if (mark) selectedId = id;
+  renderDetail();
+  await loadPOs();
+}
+
+function renderDetail() {
+  const po = currentDetail.purchase_order;
+  const source = currentDetail.attachment?.extracted_text || currentDetail.email?.body_text || "";
+  const editActions = canEditDashboard()
+    ? `<button class="secondary" onclick="savePO()">Save Header</button>
+      <button onclick="quickStatus('Booked')">Mark Booked</button>
+      <button class="danger" onclick="quickStatus('Rejected')">Reject</button>`
+    : '<span class="view-only-note">View Only</span>';
+  document.querySelector("#detail").innerHTML = `
+    <div class="detail-head">
+      <div>
+        <h2>${safe(po.po_number) || "Purchase Order"}</h2>
+        <p>${safe(po.source_subject)}</p>
+        <p class="muted-line">Source: ${safe(po.source_display || sourceLabel(po))}</p>
+      </div>
+      <div class="detail-status">${!canEditDashboard() ? '<span class="badge ViewOnly">View Only</span>' : ""}${badge(po.status)}</div>
+    </div>
+    <div class="grid">${headerFields.map((field) => renderField(po, field, "po")).join("")}</div>
+    <div class="line-actions">
+      ${renderViewPoButton()}
+      ${editActions}
+    </div>
+
+    <div class="section-title">Line Items</div>
+    <div id="lines">${currentDetail.lines.map(renderLine).join("")}</div>
+    ${canEditDashboard() ? '<button class="secondary" onclick="addLine()">Add Line</button>' : ""}
+
+    ${renderMasterDataReviews()}
+
+    <div class="section-title">Source</div>
+    <div class="source">${safe(source)}</div>
+
+    <div class="section-title">Email Metadata</div>
+    <div class="source">${safe(JSON.stringify(currentDetail.email, null, 2))}</div>
+  `;
+}
+
+function renderField(record, field, prefix) {
+  const [key, label, type = "text", size = ""] = field;
+  const id = `${prefix}_${key}`;
+  const confidence = confidenceFor(record, key);
+  const review = confidence < 0.7 ? "review" : "";
+  const reviewNote = confidence < 0.7 ? '<div class="review-note">Review</div>' : "";
+  if (!canEditDashboard() && !["readonly", "lineTotal"].includes(type)) {
+    return renderReadonlyField(record, key, label, size, review, reviewNote);
+  }
+  if (type === "select") {
+    return `<div class="field ${size} ${review}"><label>${label}</label><select id="${id}">${statuses
+      .map((s) => `<option ${record[key] === s ? "selected" : ""}>${s}</option>`)
+      .join("")}</select>${reviewNote}</div>`;
+  }
+  if (type === "orderType") {
+    return `<div class="field ${size} ${review}"><label>${label}</label><select id="${id}">
+      <option value="">Select order type</option>
+      ${orderTypes.map((orderType) => `<option value="${orderType.id}" ${Number(record[key]) === Number(orderType.id) ? "selected" : ""}>${safe(orderType.name)}</option>`).join("")}
+    </select>${reviewNote}</div>`;
+  }
+  if (type === "readonly") {
+    return `<div class="field ${size}"><label>${label}</label><div class="readonly-value">${money(record[key], record.currency)}</div></div>`;
+  }
+  if (type === "lineTotal") {
+    return `<div class="field ${size}"><label>${label}</label><div class="readonly-value">${money(calculatedLineTotal(record), currentDetail?.purchase_order?.currency || "USD")}</div></div>`;
+  }
+  if (type === "textarea") {
+    return `<div class="field ${size} ${review}"><label>${label}</label><textarea id="${id}">${safe(record[key])}</textarea>${reviewNote}</div>`;
+  }
+  return `<div class="field ${size} ${review}"><label>${label}</label><input id="${id}" type="${type}" value="${safe(inputValue(record[key], type))}" />${reviewNote}</div>`;
+}
+
+function renderReadonlyField(record, key, label, size, review, reviewNote) {
+  let value = record[key];
+  if (key === "status") value = badge(value);
+  else if (key === "order_type_id") value = safe(record.order_type_name || "");
+  else value = safe(inputValue(value, "text"));
+  return `<div class="field ${size} ${review}"><label>${label}</label><div class="readonly-value">${value}</div>${reviewNote}</div>`;
+}
+
+function inputValue(value, type) {
+  if (value == null) return "";
+  if (type === "date") return String(value).slice(0, 10);
+  return value;
+}
+
+function confidenceFor(record, key) {
+  try {
+    const confidence = JSON.parse(record.field_confidence_json || "{}");
+    if (confidence[key] != null) return Number(confidence[key]);
+  } catch {
+    return 0.5;
+  }
+  const important = ["customer_company_name", "po_number", "po_revision", "bill_to_address", "ship_to_address", "quote_number", "payment_terms", "freight_terms", "customer_part_number", "quantity", "unit_price", "line_total", "order_type_id"];
+  return important.includes(key) && !record[key] ? 0.2 : 0.9;
+}
+
+function calculatedLineTotal(line) {
+  if (line.quantity != null && line.unit_price != null && line.quantity !== "" && line.unit_price !== "") {
+    return Number(line.quantity) * Number(line.unit_price);
+  }
+  return line.line_total;
+}
+
+function renderViewPoButton() {
+  const attachment = currentDetail.attachment;
+  if (attachment && String(attachment.filename || "").toLowerCase().endsWith(".pdf")) {
+    return `<button class="secondary" onclick="window.open('/api/attachments/${attachment.id}/view', '_blank')">View PO</button>`;
+  }
+  return `<button class="secondary" disabled>No PDF available</button>`;
+}
+
+function renderLine(line) {
+  return `
+    <div class="line-card" data-line-id="${line.id}">
+      <div class="grid">
+        ${lineFields.map((field) => renderField(line, field, `line_${line.id}`)).join("")}
+      </div>
+      ${canEditDashboard() ? `<div class="line-actions">
+        <button class="secondary" onclick="saveLine(${line.id})">Save Line</button>
+        <button class="danger" onclick="deleteLine(${line.id})">Delete</button>
+      </div>` : ""}
+    </div>
+  `;
+}
+
+function renderMasterDataReviews() {
+  const reviews = currentDetail.master_data_reviews || [];
+  const openReviews = reviews.filter((review) => review.status === "open");
+  if (!reviews.length) {
+    return `
+      <div class="section-title">Master Data Review</div>
+      <div class="review-panel muted-panel">No master data review items.</div>
+    `;
+  }
+  return `
+    <div class="section-title">Master Data Review</div>
+    <div class="review-panel">
+      ${openReviews.length ? "" : '<div class="muted-panel">All master data review items are resolved.</div>'}
+      ${reviews.map(renderMasterDataReview).join("")}
+    </div>
+  `;
+}
+
+function renderMasterDataReview(review) {
+  const suggested = review.suggested_value || parseJson(review.suggested_value_json);
+  const disabled = !canViewAdmin() || review.status !== "open" || actionBlockedByMissingCustomer(review);
+  const action = reviewActionLabel(review.review_type);
+  return `
+    <div class="master-review-item ${review.status}">
+      <div>
+        <strong>${reviewTypeLabel(review.review_type)}</strong>
+        <p>${safe(review.message)}</p>
+        <pre class="inline-pre">${safe(reviewSuggestedText(review, suggested))}</pre>
+        ${actionBlockedByMissingCustomer(review) ? '<div class="review-note">Add or match the customer before adding this record.</div>' : ""}
+      </div>
+      <div class="review-actions">
+        <span class="badge ${review.status === "open" ? "NeedsReview" : "Booked"}">${safe(review.status)}</span>
+        ${action && canViewAdmin() && review.status === "open" ? `<button class="secondary" ${disabled ? "disabled" : ""} onclick="startMasterDataReviewAction(${review.id})">${action}</button>` : ""}
+      </div>
+    </div>
+  `;
+}
+
+function actionBlockedByMissingCustomer(review) {
+  return ["bill_to_address", "ship_to_address", "contact"].includes(review.review_type) && !review.matched_customer_id;
+}
+
+function reviewActionLabel(type) {
+  return {
+    customer: "Add Customer",
+    bill_to_address: "Add Bill-To Address",
+    ship_to_address: "Add Ship-To Address",
+    contact: "Add Contact",
+  }[type];
+}
+
+function reviewTypeLabel(type) {
+  return {
+    customer: "Customer",
+    bill_to_address: "Bill-To Address",
+    ship_to_address: "Ship-To Address",
+    contact: "Customer Contact",
+  }[type] || type;
+}
+
+function reviewSuggestedText(review, suggested) {
+  if (review.review_type === "customer") return suggested.customer_name || "";
+  if (review.review_type === "contact") return [suggested.first_name, suggested.last_name].filter(Boolean).join(" ");
+  return suggested.address_text || formatSuggestedAddress(suggested);
+}
+
+function formatSuggestedAddress(suggested) {
+  const locality = [suggested.city, suggested.state, suggested.zip_code].filter(Boolean).join(" ");
+  return [suggested.address_line_1, suggested.address_line_2, suggested.address_line_3, locality, suggested.country].filter(Boolean).join("\n");
+}
+
+function parseJson(text) {
+  try {
+    return JSON.parse(text || "{}");
+  } catch {
+    return {};
+  }
+}
+
+async function startMasterDataReviewAction(reviewId) {
+  const review = (currentDetail.master_data_reviews || []).find((item) => Number(item.id) === Number(reviewId));
+  if (!review || !canViewAdmin()) return;
+  const suggested = review.suggested_value || parseJson(review.suggested_value_json);
+  pendingReviewAction = { reviewId, type: review.review_type };
+  if (review.review_type === "customer") {
+    await openCustomerModal();
+    document.querySelector("#customerName").value = suggested.customer_name || currentDetail.purchase_order.customer_company_name || "";
+    document.querySelector("#customerPaymentTerms").value = suggested.payment_terms || currentDetail.purchase_order.payment_terms || "";
+    return;
+  }
+  if (!review.matched_customer_id) return;
+  await openCustomerModal(review.matched_customer_id);
+  if (review.review_type === "contact") {
+    openContactModal(null, suggested);
+    return;
+  }
+  const addressType = review.review_type === "ship_to_address" ? "ship_to" : "bill_to";
+  pendingReviewAction.type = addressType;
+  prefillAddressFromReview(addressType, suggested);
+}
+
+function prefillAddressFromReview(addressType, suggested) {
+  const addressText = typeof suggested === "string" ? suggested : suggested.address_text || "";
+  clearAddressForm();
+  document.querySelector("#addressType").value = addressType;
+  document.querySelector("#addressLabel").value = addressType === "ship_to" ? "PO Ship To" : "PO Bill To";
+  document.querySelector("#addressLine1").value = suggested.address_line_1 || addressText;
+  document.querySelector("#addressLine2").value = suggested.address_line_2 || "";
+  document.querySelector("#addressLine3").value = suggested.address_line_3 || "";
+  document.querySelector("#addressCity").value = suggested.city || "";
+  document.querySelector("#addressState").value = suggested.state || "";
+  document.querySelector("#addressCountry").value = suggested.country || "";
+  document.querySelector("#addressZip").value = suggested.zip_code || "";
+}
+
+async function resolveMasterDataReview(reviewId, payload = {}) {
+  const data = await api(`/api/master-data-reviews/${reviewId}/resolve`, { method: "POST", body: JSON.stringify(payload) });
+  currentDetail = data;
+  if (selectedId) renderDetail();
+}
+
+async function savePO() {
+  if (!canEditDashboard()) return;
+  const payload = readFields(headerFields, "po");
+  await api(`/api/purchase-orders/${selectedId}`, { method: "PUT", body: JSON.stringify(payload) });
+  await refresh();
+}
+
+async function quickStatus(status) {
+  if (!canEditDashboard()) return;
+  await api(`/api/purchase-orders/${selectedId}`, { method: "PUT", body: JSON.stringify({ status }) });
+  await refresh();
+}
+
+async function saveLine(id) {
+  if (!canEditDashboard()) return;
+  const payload = readFields(lineFields, `line_${id}`);
+  await api(`/api/purchase-orders/${selectedId}/lines/${id}`, { method: "PUT", body: JSON.stringify(payload) });
+  await refresh();
+}
+
+async function deleteLine(id) {
+  if (!canEditDashboard()) return;
+  await api(`/api/purchase-orders/${selectedId}/lines/${id}`, { method: "DELETE" });
+  await refresh();
+}
+
+async function addLine() {
+  if (!canEditDashboard()) return;
+  await api(`/api/purchase-orders/${selectedId}/lines`, {
+    method: "POST",
+    body: JSON.stringify({ line_number: String(currentDetail.lines.length + 1), unit_of_measure: "EA" }),
+  });
+  await refresh();
+}
+
+async function deletePO(event, id) {
+  event.stopPropagation();
+  if (!canEditDashboard()) return;
+  if (!confirm("Are you sure? Deleting PO cannot be reversed.")) {
+    return;
+  }
+  await api(`/api/purchase-orders/${id}`, { method: "DELETE" });
+  if (selectedId === id) {
+    selectedId = null;
+    currentDetail = null;
+    document.querySelector("#detail").innerHTML = '<div class="empty-state">Select a purchase order to review extracted fields and source text.</div>';
+  }
+  await Promise.all([loadSummary(), loadPOs(), loadLogs()]);
+}
+
+function readFields(fields, prefix) {
+  const payload = {};
+  for (const [key, , type = "text"] of fields) {
+    if (type === "readonly" || type === "lineTotal") continue;
+    const value = document.querySelector(`#${prefix}_${key}`).value;
+    payload[key] = type === "number" && value !== "" ? Number(value) : normalizeFieldValue(type, value);
+  }
+  return payload;
+}
+
+function normalizeFieldValue(type, value) {
+  if (value === "") return null;
+  if (type === "date" && value) return value.slice(0, 10);
+  return value;
+}
+
+async function loadLogs() {
+  const rows = await api("/api/logs");
+  document.querySelector("#logs").innerHTML = rows
+    .map((row) => `<div class="log-row"><strong>${row.level}</strong> ${safe(row.message)} <span>${safe(row.created_at)}</span></div>`)
+    .join("");
+}
+
+async function switchView(view) {
+  if (view === "admin" && !canViewAdmin()) {
+    alert("You do not have access to Admin.");
+    view = canViewDashboard() ? "dashboard" : "none";
+  }
+  if (view === "dashboard" && !canViewDashboard()) {
+    alert("You do not have access to the PO Dashboard.");
+    view = canViewAdmin() ? "admin" : "none";
+  }
+  const dashboard = document.querySelector("#dashboardView");
+  const admin = document.querySelector("#adminView");
+  document.querySelector("#dashboardViewBtn").classList.toggle("active-view", view === "dashboard");
+  document.querySelector("#adminViewBtn").classList.toggle("active-view", view === "admin");
+  dashboard.classList.toggle("hidden", view !== "dashboard");
+  admin.classList.toggle("hidden", view !== "admin");
+  if (view === "admin") {
+    await loadAdminData();
+    switchAdminTab(canManageUsers() ? "users" : activeAdminTab);
+  } else if (view === "dashboard") {
+    await refresh();
+  }
+}
+
+async function loadAdminData() {
+  if (!canViewAdmin()) return;
+  const requests = [api("/api/order-types"), api("/api/customer-part-xrefs"), api("/api/customers"), api("/api/departments")];
+  if (canManageUsers()) requests.push(api("/api/users"));
+  const [orderTypeData, xrefData, customerData, departmentData, userData] = await Promise.all(requests);
+  orderTypes = orderTypeData;
+  xrefs = xrefData;
+  customers = customerData;
+  departments = departmentData;
+  users = userData || [];
+  document.querySelector("#usersPanel").classList.toggle("hidden", !canManageUsers());
+  document.querySelector("#adminTabUsersBtn").classList.toggle("hidden", !canManageUsers());
+  renderOrderTypes();
+  renderXrefs();
+  renderUsers();
+  renderCustomers();
+  renderDepartments();
+  await loadTestingData();
+}
+
+function switchAdminTab(tab) {
+  if (tab === "users" && !canManageUsers()) tab = "master";
+  activeAdminTab = tab;
+  const tabs = ["users", "master", "setup", "testing"];
+  for (const name of tabs) {
+    document.querySelector(`#adminTab${capitalize(name)}`).classList.toggle("hidden", name !== tab);
+    document.querySelector(`#adminTab${capitalize(name)}Btn`).classList.toggle("active-admin-tab", name === tab);
+  }
+}
+
+function capitalize(value) {
+  return value.charAt(0).toUpperCase() + value.slice(1);
+}
+
+function renderOrderTypes() {
+  document.querySelector("#orderTypeRows").innerHTML = orderTypes
+    .map(
+      (row) => `
+      <tr>
+        <td><input id="order_type_name_${row.id}" value="${safe(row.name)}" /></td>
+        <td>${row.is_active ? "Active" : "Inactive"}</td>
+        <td>
+          <button class="secondary" onclick="saveOrderType(${row.id})">Save</button>
+          <button class="danger" onclick="deleteOrderType(${row.id})">Delete</button>
+        </td>
+      </tr>
+    `,
+    )
+    .join("");
+}
+
+function renderDepartments() {
+  document.querySelector("#departmentRows").innerHTML = departments
+    .map(
+      (row) => `
+      <tr>
+        <td><input id="department_name_${row.id}" value="${safe(row.name)}" /></td>
+        <td>${row.is_active ? "Active" : "Inactive"}</td>
+        <td>
+          <button class="secondary" onclick="saveDepartment(${row.id})">Save</button>
+          <button class="danger" onclick="deleteDepartment(${row.id})">Delete</button>
+        </td>
+      </tr>
+    `,
+    )
+    .join("");
+}
+
+async function loadTestingData() {
+  if (!canViewAdmin()) return;
+  const [documentsData, evaluationsData, inboxData, gmailData, detectionData] = await Promise.all([
+    api("/api/testing/documents"),
+    api("/api/testing/evaluations"),
+    api("/api/inbox-accounts"),
+    api("/api/gmail-oauth-config"),
+    api("/api/inbox-detection-results"),
+  ]);
+  testDocuments = documentsData.documents || [];
+  evaluationData = evaluationsData.latest || { run: null, results: [] };
+  inboxAccounts = inboxData.accounts || [];
+  inboxSyncRuns = inboxData.sync_runs || [];
+  gmailConfig = gmailData || {};
+  inboxDetectionResults = detectionData.results || [];
+  renderTestDocuments();
+  renderEvaluation();
+  renderGmailConfig();
+  renderInboxAccounts(inboxData.gmail_configured);
+  renderSyncRuns();
+  renderDetectionResults();
+}
+
+function renderTestDocuments() {
+  document.querySelector("#testDocumentRows").innerHTML = testDocuments
+    .map(
+      (row) => `
+      <tr>
+        <td>${safe(row.original_filename || row.filename)}</td>
+        <td><select id="test_doc_type_${row.id}">${testDocumentTypes().map((type) => `<option value="${type}" ${row.document_type === type ? "selected" : ""}>${type}</option>`).join("")}</select></td>
+        <td><select id="test_expected_${row.id}">${testClassifications().map((type) => `<option value="${type}" ${row.expected_classification === type ? "selected" : ""}>${type}</option>`).join("")}</select></td>
+        <td>${row.has_golden_answer ? "Yes" : "No"}</td>
+        <td>${row.last_detected_classification ? `${safe(row.last_detected_classification)} ${row.last_detection_correct ? "OK" : "Review"}` : ""}</td>
+        <td><input id="test_notes_${row.id}" value="${safe(row.notes)}" /></td>
+        <td>
+          <button class="secondary table-action" onclick="saveTestDocument(${row.id})">Save</button>
+          <button class="secondary table-action" onclick="openGoldenModal(${row.id})">Golden</button>
+          <button class="danger table-action" onclick="deleteTestDocument(${row.id})">Delete</button>
+        </td>
+      </tr>
+    `,
+    )
+    .join("");
+}
+
+function testDocumentTypes() {
+  return ["po_pdf", "po_email_body", "scanned_po_pdf", "quote", "order_confirmation", "invoice", "rfq", "random_email", "other"];
+}
+
+function testClassifications() {
+  return ["purchase_order", "possible_po", "not_po"];
+}
+
+async function uploadTestDocuments(fileList) {
+  if (!canViewAdmin() || !fileList?.length) return;
+  const form = new FormData();
+  Array.from(fileList).forEach((file) => form.append("files", file));
+  setMessage("#testingMessage", "Uploading test documents...");
+  const res = await fetch("/api/testing/documents/upload", { method: "POST", body: form });
+  const data = await res.json();
+  if (!res.ok || data.error) {
+    setMessage("#testingMessage", data.error || "Upload failed.", "error");
+    return;
+  }
+  testDocuments = data.documents || [];
+  const rejected = data.rejected_files?.length ? ` Rejected: ${data.rejected_files.map((file) => file.filename).join(", ")}.` : "";
+  setMessage("#testingMessage", `Uploaded ${data.imported}.${rejected}`, data.rejected_files?.length ? "error" : "success");
+  renderTestDocuments();
+}
+
+async function saveTestDocument(id) {
+  const payload = {
+    document_type: document.querySelector(`#test_doc_type_${id}`).value,
+    expected_classification: document.querySelector(`#test_expected_${id}`).value,
+    notes: document.querySelector(`#test_notes_${id}`).value.trim(),
+  };
+  const data = await api(`/api/testing/documents/${id}`, { method: "PUT", body: JSON.stringify(payload) });
+  testDocuments = data.documents || [];
+  renderTestDocuments();
+}
+
+async function deleteTestDocument(id) {
+  if (!confirm("Delete this test document?")) return;
+  const data = await api(`/api/testing/documents/${id}`, { method: "DELETE" });
+  testDocuments = data.documents || [];
+  renderTestDocuments();
+}
+
+function renderEvaluation() {
+  const run = evaluationData.run;
+  document.querySelector("#evaluationSummary").innerHTML = run
+    ? `
+      ${metric("Docs", run.document_count)}
+      ${metric("TP", run.true_positives)}
+      ${metric("FP", run.false_positives)}
+      ${metric("TN", run.true_negatives)}
+      ${metric("FN", run.false_negatives)}
+      ${metric("Fields", pct(run.field_match_rate))}
+      ${metric("Lines", pct(run.line_match_rate))}
+      ${metric("Confidence", pct(run.average_confidence))}
+    `
+    : '<div class="muted-panel">No evaluation run yet.</div>';
+  document.querySelector("#evaluationRows").innerHTML = (evaluationData.results || [])
+    .map((row) => {
+      const fields = parseJson(row.field_results_json);
+      const lines = parseJson(row.line_results_json);
+      return `
+      <tr title="${safe(JSON.stringify({ fields, lines }, null, 2))}">
+        <td>${safe(row.original_filename || row.filename)}</td>
+        <td>${safe(row.expected_classification)}</td>
+        <td>${safe(row.detected_classification)}</td>
+        <td>${row.detection_correct ? "Yes" : "No"}</td>
+        <td>${pct(matchRateFromFieldResults(fields))}</td>
+        <td>${lineRateText(lines)}</td>
+        <td>${row.processing_latency_ms} ms</td>
+      </tr>
+    `;
+    })
+    .join("");
+}
+
+function matchRateFromFieldResults(fields) {
+  const values = Object.values(fields || {});
+  const compared = values.filter((item) => item.expected || item.actual);
+  if (!compared.length) return null;
+  return compared.filter((item) => item.match).length / compared.length;
+}
+
+function lineRateText(lines) {
+  if (!lines || !lines.lines) return "";
+  let compared = 0;
+  let matched = 0;
+  for (const line of lines.lines) {
+    for (const item of Object.values(line)) {
+      compared += 1;
+      if (item.match) matched += 1;
+    }
+  }
+  return compared ? pct(matched / compared) : "";
+}
+
+async function runEvaluation() {
+  setMessage("#testingMessage", "Running extraction evaluation...");
+  const data = await api("/api/testing/evaluations/run", { method: "POST", body: JSON.stringify({}) });
+  evaluationData = data;
+  setMessage("#testingMessage", "Evaluation complete.", "success");
+  renderEvaluation();
+  await loadTestingData();
+}
+
+function renderInboxAccounts(gmailConfigured = false) {
+  document.querySelector("#connectGmailBtn").title = gmailConfigured ? "Start Gmail OAuth" : "Set Gmail config first";
+  document.querySelector("#inboxAccountRows").innerHTML = inboxAccounts
+    .map(
+      (row) => `
+      <tr>
+        <td>${safe(row.provider)}</td>
+        <td><input id="inbox_name_${row.id}" value="${safe(row.display_name)}" /></td>
+        <td><input id="inbox_monitored_${row.id}" value="${safe(row.monitored_email)}" /></td>
+        <td><input id="inbox_folder_${row.id}" value="${safe(row.folder || "INBOX")}" /></td>
+        <td>${row.is_enabled ? "Enabled" : "Disabled"}</td>
+        <td>${safe(row.sync_status)}</td>
+        <td>${safe(row.last_sync_at)}</td>
+        <td>
+          <button class="secondary table-action" onclick="openInboxConfig(${row.id})">Configure</button>
+          <button class="secondary table-action" onclick="saveInboxAccount(${row.id})">Save</button>
+          <button class="secondary table-action" onclick="toggleInboxAccount(${row.id}, ${row.is_enabled ? "false" : "true"})">${row.is_enabled ? "Deactivate" : "Activate"}</button>
+          <button class="secondary table-action" onclick="syncInboxAccount(${row.id})" ${row.is_enabled ? "" : "disabled"}>Sync Now</button>
+          <button class="danger table-action" onclick="deleteInboxAccount(${row.id})">Delete</button>
+        </td>
+      </tr>
+    `,
+    )
+    .join("");
+}
+
+function renderGmailConfig() {
+  document.querySelector("#gmailClientId").value = gmailConfig.client_id || "";
+  document.querySelector("#gmailRedirectUri").value = gmailConfig.redirect_uri || "http://127.0.0.1:8000/api/oauth/gmail/callback";
+  document.querySelector("#gmailScopes").value = gmailConfig.scopes || "https://www.googleapis.com/auth/gmail.readonly";
+  document.querySelector("#gmailClientSecret").placeholder = gmailConfig.client_secret_configured ? "Secret configured - leave blank to keep it" : "Google OAuth client secret";
+}
+
+function renderSyncRuns() {
+  document.querySelector("#syncRunRows").innerHTML = inboxSyncRuns
+    .map((row) => {
+      const errors = parseJson(row.errors_json);
+      return `
+      <tr>
+        <td>${safe(row.started_at || row.created_at)}</td>
+        <td>${safe(row.provider)}</td>
+        <td>${safe(row.status)}</td>
+        <td>${row.messages_seen}</td>
+        <td>${row.messages_imported}</td>
+        <td>${row.messages_skipped}</td>
+        <td>${row.purchase_orders_created}</td>
+        <td>${safe(Array.isArray(errors) ? errors.join(" ") : "")}</td>
+      </tr>
+    `;
+    })
+    .join("");
+}
+
+function renderDetectionResults() {
+  document.querySelector("#detectionResultRows").innerHTML = inboxDetectionResults
+    .map(
+      (row) => `
+      <tr>
+        <td>${safe(row.created_at)}</td>
+        <td>${safe(row.provider_message_id)}</td>
+        <td>${safe(row.detected_classification)}</td>
+        <td>${pct(row.detection_confidence)}</td>
+        <td>${row.attachment_count || 0}</td>
+        <td>${row.duplicate_skipped ? "Yes" : "No"}</td>
+        <td>${row.purchase_order_id ? safe(row.purchase_order_id) : ""}</td>
+        <td>${row.processing_latency_ms || ""} ms</td>
+        <td>${safe(row.error_message)}</td>
+      </tr>
+    `,
+    )
+    .join("");
+}
+
+async function addInboxAccount() {
+  const payload = {
+    provider: "gmail",
+    display_name: document.querySelector("#inboxDisplayName").value.trim() || "Gmail Test Inbox",
+    monitored_email: document.querySelector("#inboxMonitoredEmail").value.trim(),
+    folder: document.querySelector("#inboxFolder").value.trim() || "INBOX",
+    is_enabled: true,
+  };
+  const data = await api("/api/inbox-accounts", { method: "POST", body: JSON.stringify(payload) });
+  inboxAccounts = data.accounts || [];
+  inboxSyncRuns = data.sync_runs || [];
+  renderInboxAccounts(data.gmail_configured);
+  renderSyncRuns();
+}
+
+async function connectGmail() {
+  const data = await api("/api/inbox-accounts/gmail/connect", { method: "POST", body: "{}" });
+  if (data.error) {
+    setMessage("#testingMessage", data.error, "error");
+    return;
+  }
+  if (data.auth_url) window.open(data.auth_url, "_blank");
+}
+
+async function saveInboxAccount(id) {
+  const existing = inboxAccounts.find((row) => Number(row.id) === Number(id)) || {};
+  const payload = {
+    display_name: document.querySelector(`#inbox_name_${id}`).value.trim(),
+    monitored_email: document.querySelector(`#inbox_monitored_${id}`).value.trim(),
+    folder: document.querySelector(`#inbox_folder_${id}`).value.trim(),
+    is_enabled: existing.is_enabled ?? true,
+    evaluate_without_attachments: existing.evaluate_without_attachments ?? false,
+    sync_interval_hours: existing.sync_interval_hours || 24,
+    sync_start_time: existing.sync_start_time || "02:00",
+  };
+  const data = await api(`/api/inbox-accounts/${id}`, { method: "PUT", body: JSON.stringify(payload) });
+  inboxAccounts = data.accounts || [];
+  renderInboxAccounts(data.gmail_configured);
+}
+
+async function toggleInboxAccount(id, enabled) {
+  const row = inboxAccounts.find((item) => Number(item.id) === Number(id));
+  if (!row) return;
+  const payload = {
+    display_name: row.display_name || "",
+    monitored_email: row.monitored_email || "",
+    folder: row.folder || "INBOX",
+    is_enabled: enabled,
+    evaluate_without_attachments: row.evaluate_without_attachments ?? false,
+    sync_interval_hours: row.sync_interval_hours || 24,
+    sync_start_time: row.sync_start_time || "02:00",
+  };
+  const data = await api(`/api/inbox-accounts/${id}`, { method: "PUT", body: JSON.stringify(payload) });
+  inboxAccounts = data.accounts || [];
+  renderInboxAccounts(data.gmail_configured);
+}
+
+async function openInboxConfig(id) {
+  configuringInboxId = id;
+  setMessage("#inboxConfigMessage", "");
+  const data = await api(`/api/inbox-accounts/${id}/config`);
+  if (data.error) {
+    setMessage("#testingMessage", data.error, "error");
+    return;
+  }
+  currentInboxConfig = data;
+  renderInboxConfig();
+  document.querySelector("#inboxConfigModal").classList.remove("hidden");
+  document.querySelector("#inboxConfigModal").setAttribute("aria-hidden", "false");
+}
+
+function closeInboxConfig() {
+  configuringInboxId = null;
+  currentInboxConfig = null;
+  document.querySelector("#inboxConfigModal").classList.add("hidden");
+  document.querySelector("#inboxConfigModal").setAttribute("aria-hidden", "true");
+}
+
+function renderInboxConfig() {
+  const account = currentInboxConfig?.account || {};
+  const labels = currentInboxConfig?.labels || [];
+  document.querySelector("#configInboxName").value = account.display_name || "";
+  document.querySelector("#configConnectedEmail").value = account.connected_email || "";
+  document.querySelector("#configMonitoredEmail").value = account.monitored_email || "";
+  document.querySelector("#configFolder").value = account.folder || "INBOX";
+  document.querySelector("#configInboxEnabled").checked = Boolean(account.is_enabled);
+  document.querySelector("#configEvalNoAttachments").checked = Boolean(account.evaluate_without_attachments);
+  document.querySelector("#configSyncInterval").value = account.sync_interval_hours || 24;
+  document.querySelector("#configSyncStart").value = account.sync_start_time || "02:00";
+  document.querySelector("#configNextSync").textContent = account.next_sync_at || "Not scheduled";
+  const labelList = document.querySelector("#inboxLabelList");
+  if (!labels.length) {
+    labelList.innerHTML = `<div class="muted-panel">No labels cached yet. Use Refresh Labels after Gmail is connected.</div>`;
+    return;
+  }
+  labelList.innerHTML = labels
+    .map(
+      (label) => `
+      <label class="label-row">
+        <input type="checkbox" data-label-id="${safe(label.label_id)}" ${label.is_selected ? "checked" : ""} />
+        <span class="label-main">${safe(label.label_name || label.label_id)}</span>
+        <span class="label-meta">${safe(label.label_id)}${label.label_type ? ` · ${safe(label.label_type)}` : ""}</span>
+      </label>
+    `,
+    )
+    .join("");
+}
+
+async function refreshInboxLabels() {
+  if (!configuringInboxId) return;
+  setMessage("#inboxConfigMessage", "Refreshing Gmail labels...");
+  const data = await api(`/api/inbox-accounts/${configuringInboxId}/labels/refresh`, { method: "POST", body: "{}" });
+  currentInboxConfig = data;
+  renderInboxConfig();
+  if (data.error) {
+    setMessage("#inboxConfigMessage", data.error, "error");
+    return;
+  }
+  setMessage("#inboxConfigMessage", "Labels refreshed.", "success");
+}
+
+async function saveInboxConfig() {
+  if (!configuringInboxId) return;
+  const interval = Number(document.querySelector("#configSyncInterval").value || 24);
+  if (!Number.isFinite(interval) || interval < 1) {
+    setMessage("#inboxConfigMessage", "Sync interval must be at least 1 hour.", "error");
+    return;
+  }
+  const selectedLabelIds = Array.from(document.querySelectorAll("#inboxLabelList input[type='checkbox']:checked")).map((input) => input.dataset.labelId);
+  const payload = {
+    display_name: document.querySelector("#configInboxName").value.trim(),
+    monitored_email: document.querySelector("#configMonitoredEmail").value.trim(),
+    folder: document.querySelector("#configFolder").value.trim() || "INBOX",
+    is_enabled: document.querySelector("#configInboxEnabled").checked,
+    evaluate_without_attachments: document.querySelector("#configEvalNoAttachments").checked,
+    sync_interval_hours: interval,
+    sync_start_time: document.querySelector("#configSyncStart").value || "02:00",
+    selected_label_ids: selectedLabelIds,
+  };
+  const data = await api(`/api/inbox-accounts/${configuringInboxId}/config`, { method: "PUT", body: JSON.stringify(payload) });
+  if (data.error) {
+    setMessage("#inboxConfigMessage", data.error, "error");
+    return;
+  }
+  currentInboxConfig = data;
+  setMessage("#inboxConfigMessage", "Configuration saved.", "success");
+  renderInboxConfig();
+  await loadTestingData();
+}
+
+async function saveGmailConfig() {
+  const payload = {
+    client_id: document.querySelector("#gmailClientId").value.trim(),
+    client_secret: document.querySelector("#gmailClientSecret").value.trim(),
+    redirect_uri: document.querySelector("#gmailRedirectUri").value.trim(),
+    scopes: document.querySelector("#gmailScopes").value.trim(),
+  };
+  const data = await api("/api/gmail-oauth-config", { method: "POST", body: JSON.stringify(payload) });
+  gmailConfig = data;
+  document.querySelector("#gmailClientSecret").value = "";
+  setMessage("#gmailConfigMessage", data.client_secret_configured ? "Gmail config saved. Secret is configured." : "Gmail config saved. Client secret is not configured.", data.client_secret_configured ? "success" : "error");
+  renderGmailConfig();
+  await loadTestingData();
+}
+
+async function syncInboxAccount(id) {
+  setMessage("#testingMessage", "Running inbox sync...");
+  const data = await api(`/api/inbox-accounts/${id}/sync`, { method: "POST", body: "{}" });
+  inboxAccounts = data.accounts || [];
+  inboxSyncRuns = data.sync_runs || [];
+  if (data.error) {
+    setMessage("#testingMessage", data.error, "error");
+    renderInboxAccounts(data.gmail_configured);
+    renderSyncRuns();
+    return;
+  }
+  const detection = await api("/api/inbox-detection-results");
+  inboxDetectionResults = detection.results || [];
+  setMessage("#testingMessage", data.sync_run?.status === "failed" ? "Sync failed. Check sync run errors." : "Sync complete.", data.sync_run?.status === "failed" ? "error" : "success");
+  renderInboxAccounts(data.gmail_configured);
+  renderSyncRuns();
+  renderDetectionResults();
+}
+
+async function deleteInboxAccount(id) {
+  if (!confirm("Delete this inbox connection?")) return;
+  const data = await api(`/api/inbox-accounts/${id}`, { method: "DELETE" });
+  inboxAccounts = data.accounts || [];
+  inboxSyncRuns = data.sync_runs || [];
+  renderInboxAccounts(data.gmail_configured);
+  renderSyncRuns();
+}
+
+function renderXrefs() {
+  document.querySelector("#xrefRows").innerHTML = xrefs
+    .map(
+      (row) => `
+      <tr>
+        <td><input id="xref_customer_${row.id}" value="${safe(row.customer_name)}" /></td>
+        <td><input id="xref_customer_part_${row.id}" value="${safe(row.customer_part_number)}" /></td>
+        <td><input id="xref_internal_part_${row.id}" value="${safe(row.internal_part_number)}" /></td>
+        <td>
+          <button class="secondary" onclick="saveXref(${row.id})">Save</button>
+          <button class="danger" onclick="deleteXref(${row.id})">Delete</button>
+        </td>
+      </tr>
+    `,
+    )
+    .join("");
+}
+
+function renderCustomers() {
+  document.querySelector("#customerRows").innerHTML = customers
+    .map(
+      (row) => `
+      <tr>
+        <td>${safe(row.customer_name)}</td>
+        <td>${safe(row.customer_number)}</td>
+        <td>${safe(row.payment_terms)}</td>
+        <td>${row.bill_to_count || 0}</td>
+        <td>${row.ship_to_count || 0}</td>
+        <td>${row.contact_count || 0}</td>
+        <td><button class="secondary" onclick="openCustomerModal(${row.id})">Edit</button></td>
+      </tr>
+    `,
+    )
+    .join("");
+}
+
+async function openCustomerModal(id = null) {
+  editingCustomerId = id;
+  editingAddressId = null;
+  currentCustomerDetail = null;
+  setMessage("#customerModalMessage", "");
+  document.querySelector("#customerName").value = "";
+  document.querySelector("#customerNumber").value = "";
+  document.querySelector("#customerPaymentTerms").value = "";
+  clearAddressForm();
+  document.querySelector("#addressRows").innerHTML = "";
+  document.querySelector("#contactRows").innerHTML = "";
+  document.querySelector("#customerChildEditors").classList.toggle("hidden", !id);
+  document.querySelector("#deleteCustomerBtn").classList.toggle("hidden", !id);
+  if (id) {
+    currentCustomerDetail = await api(`/api/customers/${id}`);
+    const customer = currentCustomerDetail.customer;
+    document.querySelector("#customerName").value = customer.customer_name || "";
+    document.querySelector("#customerNumber").value = customer.customer_number || "";
+    document.querySelector("#customerPaymentTerms").value = customer.payment_terms || "";
+    renderCustomerChildren();
+  }
+  document.querySelector("#customerModal").classList.remove("hidden");
+}
+
+function closeCustomerModal() {
+  editingCustomerId = null;
+  editingAddressId = null;
+  currentCustomerDetail = null;
+  pendingReviewAction = null;
+  document.querySelector("#customerModal").classList.add("hidden");
+}
+
+async function saveCustomer() {
+  const payload = {
+    customer_name: document.querySelector("#customerName").value.trim(),
+    customer_number: document.querySelector("#customerNumber").value.trim(),
+    payment_terms: document.querySelector("#customerPaymentTerms").value.trim(),
+  };
+  const path = editingCustomerId ? `/api/customers/${editingCustomerId}` : "/api/customers";
+  const method = editingCustomerId ? "PUT" : "POST";
+  const data = await api(path, { method, body: JSON.stringify(payload) });
+  if (data.error) {
+    setMessage("#customerModalMessage", data.error, "error");
+    return;
+  }
+  editingCustomerId = data.customer.id;
+  currentCustomerDetail = data;
+  document.querySelector("#customerChildEditors").classList.remove("hidden");
+  document.querySelector("#deleteCustomerBtn").classList.remove("hidden");
+  setMessage("#customerModalMessage", "Customer saved.", "success");
+  if (pendingReviewAction?.type === "customer") {
+    await resolveMasterDataReview(pendingReviewAction.reviewId, { matched_customer_id: editingCustomerId, matched_record_id: editingCustomerId });
+    pendingReviewAction = null;
+  }
+  await reloadCustomers();
+  renderCustomerChildren();
+}
+
+async function deleteCustomer() {
+  if (!editingCustomerId) return;
+  if (!confirm("Delete this customer profile?")) return;
+  await api(`/api/customers/${editingCustomerId}`, { method: "DELETE" });
+  closeCustomerModal();
+  await reloadCustomers();
+}
+
+async function reloadCustomers() {
+  customers = await api("/api/customers");
+  renderCustomers();
+}
+
+function renderCustomerChildren() {
+  if (!currentCustomerDetail) return;
+  document.querySelector("#addressRows").innerHTML = currentCustomerDetail.addresses
+    .map(
+      (row) => `
+      <tr>
+        <td>${row.address_type === "ship_to" ? "Ship To" : "Bill To"}</td>
+        <td>${safe(row.label)}</td>
+        <td><pre class="inline-pre">${safe(formatAddress(row))}</pre></td>
+        <td>${row.is_default ? "Default" : ""}</td>
+        <td><button class="secondary table-action" onclick="editAddress(${row.id})">Edit</button><button class="danger table-action" onclick="deleteAddress(${row.id})">Delete</button></td>
+      </tr>
+    `,
+    )
+    .join("");
+  document.querySelector("#contactRows").innerHTML = currentCustomerDetail.contacts
+    .map(
+      (row) => `
+      <tr>
+        <td>${safe(row.first_name)}</td>
+        <td>${safe(row.last_name)}</td>
+        <td>${safe(row.job_title)}</td>
+        <td>${safe(row.phone_number)}</td>
+        <td>${safe(row.email)}</td>
+        <td><button class="secondary table-action" onclick="openContactModal(${row.id})">Edit</button></td>
+      </tr>
+    `,
+    )
+    .join("");
+}
+
+async function addAddress() {
+  if (!editingCustomerId) {
+    setMessage("#customerModalMessage", "Save the customer before adding addresses.", "error");
+    return;
+  }
+  const payload = addressPayloadFromForm();
+  const path = editingAddressId ? `/api/customer-addresses/${editingAddressId}` : `/api/customers/${editingCustomerId}/addresses`;
+  const method = editingAddressId ? "PUT" : "POST";
+  currentCustomerDetail = await api(path, { method, body: JSON.stringify(payload) });
+  const savedAddressId = editingAddressId || newestId(currentCustomerDetail.addresses);
+  if (pendingReviewAction?.type === payload.address_type) {
+    await resolveMasterDataReview(pendingReviewAction.reviewId, { matched_customer_id: editingCustomerId, matched_record_id: savedAddressId });
+    pendingReviewAction = null;
+  }
+  clearAddressForm();
+  renderCustomerChildren();
+  await reloadCustomers();
+}
+
+async function deleteAddress(id) {
+  currentCustomerDetail = await api(`/api/customer-addresses/${id}`, { method: "DELETE" });
+  renderCustomerChildren();
+  await reloadCustomers();
+}
+
+function editAddress(id) {
+  const row = currentCustomerDetail.addresses.find((address) => Number(address.id) === Number(id));
+  if (!row) return;
+  editingAddressId = id;
+  document.querySelector("#addressType").value = row.address_type || "bill_to";
+  document.querySelector("#addressLabel").value = row.label || "";
+  document.querySelector("#addressLine1").value = row.address_line_1 || "";
+  document.querySelector("#addressLine2").value = row.address_line_2 || "";
+  document.querySelector("#addressLine3").value = row.address_line_3 || "";
+  document.querySelector("#addressCity").value = row.city || "";
+  document.querySelector("#addressState").value = row.state || "";
+  document.querySelector("#addressCountry").value = row.country || "";
+  document.querySelector("#addressZip").value = row.zip_code || "";
+  document.querySelector("#addressDefault").checked = Boolean(row.is_default);
+  document.querySelector("#addAddressBtn").textContent = "Save Address";
+}
+
+function addressPayloadFromForm() {
+  return {
+    address_type: document.querySelector("#addressType").value,
+    label: document.querySelector("#addressLabel").value.trim(),
+    address_line_1: document.querySelector("#addressLine1").value.trim(),
+    address_line_2: document.querySelector("#addressLine2").value.trim(),
+    address_line_3: document.querySelector("#addressLine3").value.trim(),
+    city: document.querySelector("#addressCity").value.trim(),
+    state: document.querySelector("#addressState").value.trim(),
+    country: document.querySelector("#addressCountry").value.trim(),
+    zip_code: document.querySelector("#addressZip").value.trim(),
+    is_default: document.querySelector("#addressDefault").checked,
+  };
+}
+
+function clearAddressForm() {
+  editingAddressId = null;
+  for (const selector of ["#addressLabel", "#addressLine1", "#addressLine2", "#addressLine3", "#addressCity", "#addressState", "#addressCountry", "#addressZip"]) {
+    document.querySelector(selector).value = "";
+  }
+  document.querySelector("#addressType").value = "bill_to";
+  document.querySelector("#addressDefault").checked = false;
+  document.querySelector("#addAddressBtn").textContent = "Add Address";
+}
+
+function formatAddress(row) {
+  const locality = [row.city, row.state, row.zip_code].filter(Boolean).join(" ");
+  const parts = [row.address_line_1, row.address_line_2, row.address_line_3, locality, row.country].filter(Boolean);
+  return parts.join("\n") || row.address_text || "";
+}
+
+function newestId(rows) {
+  return Math.max(...(rows || []).map((row) => Number(row.id || 0)), 0) || null;
+}
+
+function openContactModal(id = null, prefill = {}) {
+  if (!editingCustomerId) {
+    setMessage("#customerModalMessage", "Save the customer before adding contacts.", "error");
+    return;
+  }
+  editingContactId = id;
+  const row = id ? currentCustomerDetail.contacts.find((contact) => Number(contact.id) === Number(id)) || {} : prefill;
+  document.querySelector("#contactModalTitle").textContent = id ? "Edit Contact" : "Add Contact";
+  document.querySelector("#modalContactFirstName").value = row.first_name || "";
+  document.querySelector("#modalContactLastName").value = row.last_name || "";
+  document.querySelector("#modalContactJobTitle").value = row.job_title || "";
+  document.querySelector("#modalContactPhone").value = row.phone_number || "";
+  document.querySelector("#modalContactEmail").value = row.email || "";
+  document.querySelector("#deleteContactModalBtn").classList.toggle("hidden", !id);
+  setMessage("#contactModalMessage", "");
+  document.querySelector("#contactModal").classList.remove("hidden");
+}
+
+function closeContactModal() {
+  editingContactId = null;
+  document.querySelector("#contactModal").classList.add("hidden");
+}
+
+async function saveContactModal() {
+  const payload = {
+    first_name: document.querySelector("#modalContactFirstName").value.trim(),
+    last_name: document.querySelector("#modalContactLastName").value.trim(),
+    job_title: document.querySelector("#modalContactJobTitle").value.trim(),
+    phone_number: document.querySelector("#modalContactPhone").value.trim(),
+    email: document.querySelector("#modalContactEmail").value.trim(),
+  };
+  const path = editingContactId ? `/api/customer-contacts/${editingContactId}` : `/api/customers/${editingCustomerId}/contacts`;
+  const method = editingContactId ? "PUT" : "POST";
+  currentCustomerDetail = await api(path, { method, body: JSON.stringify(payload) });
+  const savedContactId = editingContactId || newestId(currentCustomerDetail.contacts);
+  if (pendingReviewAction?.type === "contact") {
+    await resolveMasterDataReview(pendingReviewAction.reviewId, { matched_customer_id: editingCustomerId, matched_record_id: savedContactId });
+    pendingReviewAction = null;
+  }
+  closeContactModal();
+  renderCustomerChildren();
+  await reloadCustomers();
+}
+
+async function deleteContactModal() {
+  if (!editingContactId) return;
+  currentCustomerDetail = await api(`/api/customer-contacts/${editingContactId}`, { method: "DELETE" });
+  closeContactModal();
+  renderCustomerChildren();
+  await reloadCustomers();
+}
+
+async function openGoldenModal(documentId) {
+  editingGoldenDocumentId = documentId;
+  currentGoldenAnswer = await api(`/api/testing/documents/${documentId}/golden-answer`);
+  const header = currentGoldenAnswer.header || {};
+  document.querySelector("#goldenExpectedIsPo").checked = header.expected_is_po !== 0;
+  document.querySelector("#goldenCustomer").value = header.customer_company_name || "";
+  document.querySelector("#goldenContact").value = header.customer_contact_name || "";
+  document.querySelector("#goldenPoNumber").value = header.po_number || "";
+  document.querySelector("#goldenQuoteNumber").value = header.quote_number || "";
+  document.querySelector("#goldenDateReceived").value = inputValue(header.date_received, "date");
+  document.querySelector("#goldenTotalValue").value = header.total_value || "";
+  document.querySelector("#goldenCurrency").value = header.currency || "USD";
+  document.querySelector("#goldenPaymentTerms").value = header.payment_terms || "";
+  document.querySelector("#goldenFreightTerms").value = header.freight_terms || "";
+  document.querySelector("#goldenBillTo").value = header.bill_to_address || "";
+  document.querySelector("#goldenShipTo").value = header.ship_to_address || "";
+  document.querySelector("#goldenNotes").value = header.notes || "";
+  clearGoldenLineForm();
+  renderGoldenLines();
+  document.querySelector("#goldenModal").classList.remove("hidden");
+}
+
+function closeGoldenModal() {
+  editingGoldenDocumentId = null;
+  currentGoldenAnswer = null;
+  document.querySelector("#goldenModal").classList.add("hidden");
+}
+
+async function saveGoldenHeader() {
+  if (!editingGoldenDocumentId) return;
+  const payload = {
+    expected_is_po: document.querySelector("#goldenExpectedIsPo").checked,
+    customer_company_name: document.querySelector("#goldenCustomer").value.trim(),
+    customer_contact_name: document.querySelector("#goldenContact").value.trim(),
+    po_number: document.querySelector("#goldenPoNumber").value.trim(),
+    quote_number: document.querySelector("#goldenQuoteNumber").value.trim(),
+    date_received: document.querySelector("#goldenDateReceived").value,
+    total_value: document.querySelector("#goldenTotalValue").value,
+    currency: document.querySelector("#goldenCurrency").value.trim(),
+    payment_terms: document.querySelector("#goldenPaymentTerms").value.trim(),
+    freight_terms: document.querySelector("#goldenFreightTerms").value.trim(),
+    bill_to_address: document.querySelector("#goldenBillTo").value.trim(),
+    ship_to_address: document.querySelector("#goldenShipTo").value.trim(),
+    notes: document.querySelector("#goldenNotes").value.trim(),
+  };
+  const data = await api(`/api/testing/documents/${editingGoldenDocumentId}/golden-answer`, { method: "PUT", body: JSON.stringify(payload) });
+  currentGoldenAnswer = data.golden_answer;
+  await loadTestingData();
+  renderGoldenLines();
+}
+
+function renderGoldenLines() {
+  const lines = currentGoldenAnswer?.lines || [];
+  document.querySelector("#goldenLineRows").innerHTML = lines
+    .map(
+      (line) => `
+      <tr>
+        <td>${safe(line.line_number)}</td>
+        <td>${safe(line.customer_part_number)}</td>
+        <td>${safe(line.internal_part_number)}</td>
+        <td>${safe(line.description)}</td>
+        <td>${safe(line.quantity)}</td>
+        <td>${safe(line.unit_price)}</td>
+        <td>${safe(line.line_total)}</td>
+        <td>${safe(line.requested_date)}</td>
+        <td><button class="danger table-action" onclick="deleteGoldenLine(${line.id})">Delete</button></td>
+      </tr>
+    `,
+    )
+    .join("");
+}
+
+async function addGoldenLine() {
+  if (!currentGoldenAnswer?.header?.id) {
+    await saveGoldenHeader();
+  }
+  const headerId = currentGoldenAnswer?.header?.id;
+  if (!headerId) return;
+  const payload = {
+    line_number: document.querySelector("#goldenLineNumber").value.trim(),
+    customer_part_number: document.querySelector("#goldenCustomerPart").value.trim(),
+    internal_part_number: document.querySelector("#goldenInternalPart").value.trim(),
+    description: document.querySelector("#goldenDescription").value.trim(),
+    quantity: document.querySelector("#goldenQuantity").value,
+    unit_of_measure: document.querySelector("#goldenUom").value.trim(),
+    unit_price: document.querySelector("#goldenUnitPrice").value,
+    requested_date: document.querySelector("#goldenRequestedDate").value,
+  };
+  currentGoldenAnswer = await api(`/api/testing/golden-answers/${headerId}/lines`, { method: "POST", body: JSON.stringify(payload) });
+  clearGoldenLineForm();
+  renderGoldenLines();
+  await loadTestingData();
+}
+
+async function deleteGoldenLine(id) {
+  currentGoldenAnswer = await api(`/api/testing/golden-lines/${id}`, { method: "DELETE" });
+  renderGoldenLines();
+}
+
+function clearGoldenLineForm() {
+  for (const selector of ["#goldenLineNumber", "#goldenCustomerPart", "#goldenInternalPart", "#goldenDescription", "#goldenQuantity", "#goldenUom", "#goldenUnitPrice", "#goldenRequestedDate"]) {
+    document.querySelector(selector).value = "";
+  }
+}
+
+function renderUsers() {
+  if (!canManageUsers()) return;
+  document.querySelector("#userRows").innerHTML = users
+    .map(
+      (row) => `
+      <tr>
+        <td>${safe(row.first_name)}</td>
+        <td>${safe(row.last_name)}</td>
+        <td>${safe(row.job_title)}</td>
+        <td>${safe(row.email)}</td>
+        <td>${row.is_active ? "Active" : "Inactive"}</td>
+        <td>${row.is_admin ? "Yes" : "No"}</td>
+        <td>${row.can_access_admin ? "Yes" : "No"}</td>
+        <td>${row.can_access_po_dashboard ? "Yes" : "No"}</td>
+        <td>${accessLabel(row.po_dashboard_access_level)}</td>
+        <td>${safe(row.created_at)}</td>
+        <td>
+          <button class="secondary" onclick="openUserModal(${row.id})">Edit</button>
+        </td>
+      </tr>
+    `,
+    )
+    .join("");
+}
+
+async function inviteUser() {
+  if (!canManageUsers()) return;
+  const payload = {
+    first_name: document.querySelector("#inviteFirstName").value.trim(),
+    last_name: document.querySelector("#inviteLastName").value.trim(),
+    job_title: document.querySelector("#inviteJobTitle").value.trim(),
+    email: document.querySelector("#inviteEmail").value.trim(),
+    can_access_po_dashboard: true,
+    po_dashboard_access_level: "view_only",
+  };
+  if (!payload.first_name || !payload.last_name || !payload.email) {
+    setMessage("#usersMessage", "First name, last name, and email are required.", "error");
+    return;
+  }
+  const data = await api("/api/users", { method: "POST", body: JSON.stringify(payload) });
+  if (data.error) {
+    setMessage("#usersMessage", data.error, "error");
+    return;
+  }
+  users = data.users;
+  document.querySelector("#inviteFirstName").value = "";
+  document.querySelector("#inviteLastName").value = "";
+  document.querySelector("#inviteJobTitle").value = "";
+  document.querySelector("#inviteEmail").value = "";
+  setMessage("#usersMessage", "User invited.", "success");
+  renderUsers();
+}
+
+function accessLabel(value) {
+  return value === "view_only" ? "View Only" : value === "edit" ? "Edit" : "None";
+}
+
+function openUserModal(id) {
+  const user = users.find((row) => Number(row.id) === Number(id));
+  if (!user) return;
+  editingUserId = id;
+  document.querySelector("#editUserFirstName").value = user.first_name || "";
+  document.querySelector("#editUserLastName").value = user.last_name || "";
+  document.querySelector("#editUserJobTitle").value = user.job_title || "";
+  document.querySelector("#editUserEmail").value = user.email || "";
+  document.querySelector("#editUserActive").checked = Boolean(user.is_active);
+  document.querySelector("#editUserAdmin").checked = Boolean(user.is_admin);
+  document.querySelector("#editUserAdminAccess").checked = Boolean(user.can_access_admin);
+  document.querySelector("#editUserDashboardAccess").checked = Boolean(user.can_access_po_dashboard);
+  document.querySelector("#editUserPoLevel").value = user.po_dashboard_access_level || "none";
+  setMessage("#userModalMessage", "");
+  document.querySelector("#userModal").classList.remove("hidden");
+}
+
+function closeUserModal() {
+  editingUserId = null;
+  document.querySelector("#userModal").classList.add("hidden");
+}
+
+async function saveUser(id = editingUserId) {
+  if (!canManageUsers()) return;
+  const payload = {
+    first_name: document.querySelector("#editUserFirstName").value.trim(),
+    last_name: document.querySelector("#editUserLastName").value.trim(),
+    job_title: document.querySelector("#editUserJobTitle").value.trim(),
+    email: document.querySelector("#editUserEmail").value.trim(),
+    is_active: document.querySelector("#editUserActive").checked,
+    is_admin: document.querySelector("#editUserAdmin").checked,
+    can_access_admin: document.querySelector("#editUserAdminAccess").checked,
+    can_access_po_dashboard: document.querySelector("#editUserDashboardAccess").checked,
+    po_dashboard_access_level: document.querySelector("#editUserPoLevel").value,
+  };
+  const data = await api(`/api/users/${id}`, { method: "PUT", body: JSON.stringify(payload) });
+  if (data.error) {
+    setMessage("#userModalMessage", data.error, "error");
+    users = data.users || users;
+    renderUsers();
+    return;
+  }
+  users = data.users;
+  setMessage("#usersMessage", "User updated.", "success");
+  closeUserModal();
+  renderUsers();
+}
+
+async function deactivateUser(id = editingUserId) {
+  if (!canManageUsers()) return;
+  const data = await api(`/api/users/${id}`, { method: "DELETE" });
+  if (data.error) {
+    setMessage("#userModalMessage", data.error, "error");
+    users = data.users || users;
+    renderUsers();
+    return;
+  }
+  users = data.users;
+  setMessage("#usersMessage", "User deactivated.", "success");
+  closeUserModal();
+  renderUsers();
+}
+
+async function addOrderType() {
+  if (!canViewAdmin()) return;
+  const input = document.querySelector("#orderTypeName");
+  if (!input.value.trim()) return;
+  const data = await api("/api/order-types", { method: "POST", body: JSON.stringify({ name: input.value.trim() }) });
+  orderTypes = data.order_types;
+  input.value = "";
+  renderOrderTypes();
+}
+
+async function saveOrderType(id) {
+  if (!canViewAdmin()) return;
+  const name = document.querySelector(`#order_type_name_${id}`).value.trim();
+  const data = await api(`/api/order-types/${id}`, { method: "PUT", body: JSON.stringify({ name, is_active: true }) });
+  orderTypes = data.order_types;
+  renderOrderTypes();
+}
+
+async function deleteOrderType(id) {
+  if (!canViewAdmin()) return;
+  const data = await api(`/api/order-types/${id}`, { method: "DELETE" });
+  orderTypes = data.order_types;
+  if (data.message) {
+    alert(data.message);
+  }
+  renderOrderTypes();
+}
+
+async function addDepartment() {
+  if (!canViewAdmin()) return;
+  const input = document.querySelector("#departmentName");
+  if (!input.value.trim()) return;
+  const data = await api("/api/departments", { method: "POST", body: JSON.stringify({ name: input.value.trim() }) });
+  departments = data.departments;
+  input.value = "";
+  renderDepartments();
+}
+
+async function saveDepartment(id) {
+  if (!canViewAdmin()) return;
+  const name = document.querySelector(`#department_name_${id}`).value.trim();
+  const data = await api(`/api/departments/${id}`, { method: "PUT", body: JSON.stringify({ name, is_active: true }) });
+  departments = data.departments;
+  renderDepartments();
+}
+
+async function deleteDepartment(id) {
+  if (!canViewAdmin()) return;
+  const data = await api(`/api/departments/${id}`, { method: "DELETE" });
+  departments = data.departments;
+  renderDepartments();
+}
+
+async function addXref() {
+  if (!canViewAdmin()) return;
+  const payload = {
+    customer_name: document.querySelector("#xrefCustomer").value.trim(),
+    customer_part_number: document.querySelector("#xrefCustomerPart").value.trim(),
+    internal_part_number: document.querySelector("#xrefInternalPart").value.trim(),
+  };
+  if (!payload.customer_name || !payload.customer_part_number || !payload.internal_part_number) {
+    setXrefMessage("Customer, customer part number, and internal part number are required.", "error");
+    return;
+  }
+  const data = await api("/api/customer-part-xrefs", { method: "POST", body: JSON.stringify(payload) });
+  xrefs = data.xrefs;
+  document.querySelector("#xrefCustomer").value = "";
+  document.querySelector("#xrefCustomerPart").value = "";
+  document.querySelector("#xrefInternalPart").value = "";
+  setXrefMessage("Cross reference saved.", "success");
+  renderXrefs();
+}
+
+async function saveXref(id) {
+  if (!canViewAdmin()) return;
+  const payload = {
+    customer_name: document.querySelector(`#xref_customer_${id}`).value.trim(),
+    customer_part_number: document.querySelector(`#xref_customer_part_${id}`).value.trim(),
+    internal_part_number: document.querySelector(`#xref_internal_part_${id}`).value.trim(),
+  };
+  const data = await api(`/api/customer-part-xrefs/${id}`, { method: "PUT", body: JSON.stringify(payload) });
+  xrefs = data.xrefs;
+  setXrefMessage("Cross reference updated.", "success");
+  renderXrefs();
+}
+
+async function deleteXref(id) {
+  if (!canViewAdmin()) return;
+  const data = await api(`/api/customer-part-xrefs/${id}`, { method: "DELETE" });
+  xrefs = data.xrefs;
+  renderXrefs();
+}
+
+async function uploadXrefCsv(file) {
+  if (!canViewAdmin()) return;
+  if (!file) return;
+  if (!file.name.toLowerCase().endsWith(".csv")) {
+    setXrefMessage("Only CSV files are allowed.", "error");
+    return;
+  }
+  const form = new FormData();
+  form.append("files", file);
+  setXrefMessage("Uploading cross reference CSV...");
+  const res = await fetch("/api/customer-part-xrefs/upload", { method: "POST", body: form });
+  const data = await res.json();
+  if (!res.ok || data.error) {
+    setXrefMessage(data.error || "CSV upload failed.", "error");
+    return;
+  }
+  xrefs = data.xrefs;
+  const errorText = data.errors?.length ? ` Errors: ${data.errors.join(" ")}` : "";
+  setXrefMessage(`Imported ${data.imported}, skipped ${data.skipped}.${errorText}`, data.errors?.length ? "error" : "success");
+  renderXrefs();
+}
+
+async function uploadCustomerCsv(file, contacts = false) {
+  if (!canViewAdmin()) return;
+  if (!file) return;
+  if (!file.name.toLowerCase().endsWith(".csv")) {
+    setCustomersMessage("Only CSV files are allowed.", "error");
+    return;
+  }
+  const form = new FormData();
+  form.append("files", file);
+  setCustomersMessage("Uploading customer CSV...");
+  const path = contacts ? "/api/customer-contacts/upload-csv" : "/api/customers/upload-csv";
+  const res = await fetch(path, { method: "POST", body: form });
+  const data = await res.json();
+  if (!res.ok || data.error) {
+    setCustomersMessage(data.error || "Customer CSV upload failed.", "error");
+    return;
+  }
+  customers = data.customers || customers;
+  const errorText = data.errors?.length ? ` Errors: ${data.errors.join(" ")}` : "";
+  setCustomersMessage(`Imported ${data.imported}, skipped ${data.skipped}.${errorText}`, data.errors?.length ? "error" : "success");
+  renderCustomers();
+}
+
+function setCustomersMessage(message, kind = "") {
+  const el = document.querySelector("#customersMessage");
+  el.className = `upload-message ${kind}`;
+  el.textContent = message;
+}
+
+function setXrefMessage(message, kind = "") {
+  const el = document.querySelector("#xrefMessage");
+  el.className = `upload-message ${kind}`;
+  el.textContent = message;
+}
+
+function openExportModal() {
+  document.querySelector("#exportModal").classList.remove("hidden");
+  document.querySelector("#exportModal").setAttribute("aria-hidden", "false");
+}
+
+function closeExportModal() {
+  document.querySelector("#exportModal").classList.add("hidden");
+  document.querySelector("#exportModal").setAttribute("aria-hidden", "true");
+}
+
+function exportPOs(mode) {
+  const status = encodeURIComponent(document.querySelector("#statusFilter").value);
+  const search = encodeURIComponent(document.querySelector("#searchInput").value);
+  window.location.href = `/api/export/purchase-orders.csv?mode=${mode}&status=${status}&search=${search}`;
+  closeExportModal();
+}
+
+function openCustomerCsvModal() {
+  document.querySelector("#customerCsvModal").classList.remove("hidden");
+  document.querySelector("#customerCsvModal").setAttribute("aria-hidden", "false");
+}
+
+function closeCustomerCsvModal() {
+  document.querySelector("#customerCsvModal").classList.add("hidden");
+  document.querySelector("#customerCsvModal").setAttribute("aria-hidden", "true");
+}
+
+function downloadCustomerCsv(mode) {
+  if (mode === "contacts") {
+    window.location.href = "/api/customer-contacts.csv";
+  } else {
+    window.location.href = `/api/customers.csv?mode=${mode}`;
+  }
+  closeCustomerCsvModal();
+}
+
+function badge(status) {
+  const klass = String(status || "").replace(/\s/g, "");
+  return `<span class="badge ${klass}">${safe(status)}</span>`;
+}
+
+function sourceLabel(row) {
+  if (row.source_type === "email" || ["gmail", "outlook"].includes(row.email_provider)) return row.source_sender || "Email";
+  if (row.source_type === "sample_import" || row.email_provider === "sample") return "Sample Import";
+  if (row.source_type === "manual") return "Manually Entered";
+  return "Unknown";
+}
+
+function pct(value) {
+  return value == null ? "" : `${Math.round(Number(value) * 100)}%`;
+}
+
+function money(value, currency = "USD") {
+  if (value == null || value === "") return "";
+  return `${currency || "USD"} ${Number(value).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+function safe(value) {
+  if (value == null) return "";
+  return String(value).replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+}
+
+function openUploadModal() {
+  if (!canEditDashboard()) return;
+  selectedUploadFiles = [];
+  renderSelectedFiles();
+  setUploadMessage("");
+  document.querySelector("#fileInput").value = "";
+  document.querySelector("#uploadModal").classList.remove("hidden");
+  document.querySelector("#uploadModal").setAttribute("aria-hidden", "false");
+}
+
+function closeUploadModal() {
+  document.querySelector("#uploadModal").classList.add("hidden");
+  document.querySelector("#uploadModal").setAttribute("aria-hidden", "true");
+}
+
+function setFiles(files) {
+  const allowed = [".pdf", ".txt", ".eml"];
+  const incoming = Array.from(files || []);
+  const rejected = incoming.filter((file) => !allowed.some((ext) => file.name.toLowerCase().endsWith(ext)));
+  selectedUploadFiles = incoming.filter((file) => allowed.some((ext) => file.name.toLowerCase().endsWith(ext)));
+  renderSelectedFiles();
+  if (rejected.length) {
+    setUploadMessage(`Ignored unsupported file type: ${rejected.map((file) => file.name).join(", ")}`, "error");
+  } else {
+    setUploadMessage("");
+  }
+}
+
+function renderSelectedFiles() {
+  const container = document.querySelector("#selectedFiles");
+  if (!selectedUploadFiles.length) {
+    container.textContent = "No files selected.";
+    return;
+  }
+  container.innerHTML = `<ul>${selectedUploadFiles.map((file) => `<li>${safe(file.name)} (${Math.ceil(file.size / 1024)} KB)</li>`).join("")}</ul>`;
+}
+
+function setUploadMessage(message, kind = "") {
+  const el = document.querySelector("#uploadMessage");
+  el.className = `upload-message ${kind}`;
+  el.textContent = message;
+}
+
+function showLogin(message = "") {
+  currentUser = null;
+  document.querySelector("#loginView").classList.remove("hidden");
+  document.querySelector("#appShell").classList.add("hidden");
+  setMessage("#loginMessage", message);
+}
+
+function showApp() {
+  document.querySelector("#loginView").classList.add("hidden");
+  document.querySelector("#appShell").classList.remove("hidden");
+  configureAccessUI();
+}
+
+function configureAccessUI() {
+  document.querySelector("#currentUserPill").innerHTML = `${safe(currentUser?.name)} ${!canEditDashboard() && canViewDashboard() ? '<span class="badge ViewOnly">View Only</span>' : ""}`;
+  document.querySelector("#dashboardViewBtn").classList.toggle("hidden", !canViewDashboard());
+  document.querySelector("#adminViewBtn").classList.toggle("hidden", !canViewAdmin());
+  document.querySelector("#syncBtn").classList.toggle("hidden", !canEditDashboard());
+  document.querySelector("#importBtn").classList.toggle("hidden", !canEditDashboard());
+  document.querySelector("#usersPanel").classList.toggle("hidden", !canManageUsers());
+  document.querySelector("#adminTabUsersBtn").classList.toggle("hidden", !canManageUsers());
+}
+
+async function loadMe() {
+  const data = await api("/api/me");
+  currentUser = data.user;
+  if (!currentUser) {
+    showLogin();
+    return false;
+  }
+  showApp();
+  return true;
+}
+
+async function login() {
+  const email = document.querySelector("#loginEmail").value.trim();
+  if (!email) {
+    setMessage("#loginMessage", "Email is required.", "error");
+    return;
+  }
+  try {
+    const data = await api("/api/login", { method: "POST", body: JSON.stringify({ email }), skipAuthRedirect: true });
+    currentUser = data.user;
+    showApp();
+    await switchView(canViewDashboard() ? "dashboard" : "admin");
+  } catch (error) {
+    setMessage("#loginMessage", error.message || "Login failed.", "error");
+  }
+}
+
+async function logout() {
+  await api("/api/logout", { method: "POST", body: "{}" });
+  selectedId = null;
+  currentDetail = null;
+  showLogin("Logged out.");
+}
+
+async function uploadSelectedFiles() {
+  if (!canEditDashboard()) return;
+  if (!selectedUploadFiles.length) {
+    setUploadMessage("Select or drop at least one PDF, TXT, or EML file.", "error");
+    return;
+  }
+  const btn = document.querySelector("#uploadProcessBtn");
+  btn.disabled = true;
+  btn.textContent = "Uploading...";
+  setUploadMessage("Uploading and processing files...");
+  try {
+    const form = new FormData();
+    selectedUploadFiles.forEach((file) => form.append("files", file));
+    const res = await fetch("/api/upload-samples", { method: "POST", body: form });
+    const data = await res.json();
+    if (!res.ok || data.error) {
+      throw new Error(data.error || "Upload failed");
+    }
+    const rejected = data.rejected_files?.length ? ` Rejected: ${data.rejected_files.map((f) => f.filename).join(", ")}.` : "";
+    setUploadMessage(`Imported ${data.imported}, skipped ${data.skipped}, created ${data.purchase_orders} PO records.${rejected}`, data.rejected_files?.length ? "error" : "success");
+    await refresh();
+    if (!data.rejected_files?.length) {
+      closeUploadModal();
+    }
+  } catch (error) {
+    setUploadMessage(error.message || "Upload failed.", "error");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Upload & Process";
+  }
+}
+
+async function importExistingSampleFolder() {
+  if (!canEditDashboard()) return;
+  const btn = document.querySelector("#folderImportBtn");
+  btn.disabled = true;
+  btn.textContent = "Importing...";
+  setUploadMessage("Importing existing sample folder...");
+  try {
+    const data = await api("/api/import-samples", { method: "POST" });
+    setUploadMessage(`Imported ${data.imported}, skipped ${data.skipped}, created ${data.purchase_orders} PO records.`, "success");
+    await refresh();
+  } catch (error) {
+    setUploadMessage(error.message || "Import failed.", "error");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Import Existing Sample Folder";
+  }
+}
+
+document.querySelector("#importBtn").addEventListener("click", openUploadModal);
+document.querySelector("#loginBtn").addEventListener("click", login);
+document.querySelector("#loginEmail").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") login();
+});
+document.querySelector("#logoutBtn").addEventListener("click", logout);
+
+document.querySelector("#selectFileBtn").addEventListener("click", () => {
+  document.querySelector("#fileInput").click();
+});
+
+document.querySelector("#fileInput").addEventListener("change", (event) => {
+  setFiles(event.target.files);
+});
+
+document.querySelector("#uploadProcessBtn").addEventListener("click", uploadSelectedFiles);
+document.querySelector("#folderImportBtn").addEventListener("click", importExistingSampleFolder);
+document.querySelector("#cancelUploadBtn").addEventListener("click", closeUploadModal);
+document.querySelector("#closeUploadBtn").addEventListener("click", closeUploadModal);
+
+document.querySelector("#uploadModal").addEventListener("click", (event) => {
+  if (event.target.id === "uploadModal") {
+    closeUploadModal();
+  }
+});
+
+document.querySelector("#exportModal").addEventListener("click", (event) => {
+  if (event.target.id === "exportModal") {
+    closeExportModal();
+  }
+});
+
+document.querySelector("#customerCsvModal").addEventListener("click", (event) => {
+  if (event.target.id === "customerCsvModal") {
+    closeCustomerCsvModal();
+  }
+});
+
+const dropZone = document.querySelector("#dropZone");
+["dragenter", "dragover"].forEach((eventName) => {
+  dropZone.addEventListener(eventName, (event) => {
+    event.preventDefault();
+    dropZone.classList.add("dragover");
+  });
+});
+["dragleave", "drop"].forEach((eventName) => {
+  dropZone.addEventListener(eventName, (event) => {
+    event.preventDefault();
+    dropZone.classList.remove("dragover");
+  });
+});
+dropZone.addEventListener("drop", (event) => {
+  setFiles(event.dataTransfer.files);
+});
+
+document.querySelector("#syncBtn").addEventListener("click", () => {
+  alert("Gmail/Outlook sync is stubbed for the MVP. Use Import Samples to test the pipeline.");
+});
+
+document.querySelector("#exportBtn").addEventListener("click", openExportModal);
+document.querySelector("#exportHeaderBtn").addEventListener("click", () => exportPOs("header"));
+document.querySelector("#exportLinesBtn").addEventListener("click", () => exportPOs("lines"));
+document.querySelector("#cancelExportBtn").addEventListener("click", closeExportModal);
+document.querySelector("#closeExportBtn").addEventListener("click", closeExportModal);
+document.querySelector("#dashboardViewBtn").addEventListener("click", () => switchView("dashboard"));
+document.querySelector("#adminViewBtn").addEventListener("click", () => switchView("admin"));
+document.querySelector("#adminTabUsersBtn").addEventListener("click", () => switchAdminTab("users"));
+document.querySelector("#adminTabMasterBtn").addEventListener("click", () => switchAdminTab("master"));
+document.querySelector("#adminTabSetupBtn").addEventListener("click", () => switchAdminTab("setup"));
+document.querySelector("#adminTabTestingBtn").addEventListener("click", () => switchAdminTab("testing"));
+document.querySelector("#addOrderTypeBtn").addEventListener("click", addOrderType);
+document.querySelector("#addDepartmentBtn").addEventListener("click", addDepartment);
+document.querySelector("#addXrefBtn").addEventListener("click", addXref);
+document.querySelector("#inviteUserBtn").addEventListener("click", inviteUser);
+document.querySelector("#closeUserModalBtn").addEventListener("click", closeUserModal);
+document.querySelector("#cancelUserModalBtn").addEventListener("click", closeUserModal);
+document.querySelector("#saveUserModalBtn").addEventListener("click", () => saveUser());
+document.querySelector("#deactivateUserModalBtn").addEventListener("click", () => deactivateUser());
+document.querySelector("#addCustomerBtn").addEventListener("click", () => openCustomerModal());
+document.querySelector("#uploadCustomersCsvBtn").addEventListener("click", () => document.querySelector("#customerCsvInput").click());
+document.querySelector("#uploadCustomerContactsCsvBtn").addEventListener("click", () => document.querySelector("#customerContactCsvInput").click());
+document.querySelector("#downloadCustomersCsvBtn").addEventListener("click", openCustomerCsvModal);
+document.querySelector("#customerCsvInput").addEventListener("change", (event) => uploadCustomerCsv(event.target.files[0], false));
+document.querySelector("#customerContactCsvInput").addEventListener("change", (event) => uploadCustomerCsv(event.target.files[0], true));
+document.querySelector("#downloadCustomersOnlyBtn").addEventListener("click", () => downloadCustomerCsv("customers"));
+document.querySelector("#downloadCustomersAddressesBtn").addEventListener("click", () => downloadCustomerCsv("addresses"));
+document.querySelector("#downloadCustomerContactsBtn").addEventListener("click", () => downloadCustomerCsv("contacts"));
+document.querySelector("#cancelCustomerCsvBtn").addEventListener("click", closeCustomerCsvModal);
+document.querySelector("#closeCustomerCsvBtn").addEventListener("click", closeCustomerCsvModal);
+document.querySelector("#closeCustomerModalBtn").addEventListener("click", closeCustomerModal);
+document.querySelector("#cancelCustomerModalBtn").addEventListener("click", closeCustomerModal);
+document.querySelector("#saveCustomerBtn").addEventListener("click", saveCustomer);
+document.querySelector("#deleteCustomerBtn").addEventListener("click", deleteCustomer);
+document.querySelector("#addAddressBtn").addEventListener("click", addAddress);
+document.querySelector("#addContactBtn").addEventListener("click", () => openContactModal());
+document.querySelector("#closeContactModalBtn").addEventListener("click", closeContactModal);
+document.querySelector("#cancelContactModalBtn").addEventListener("click", closeContactModal);
+document.querySelector("#saveContactModalBtn").addEventListener("click", saveContactModal);
+document.querySelector("#deleteContactModalBtn").addEventListener("click", deleteContactModal);
+document.querySelector("#testDocUploadBtn").addEventListener("click", () => document.querySelector("#testDocInput").click());
+document.querySelector("#testDocInput").addEventListener("change", (event) => uploadTestDocuments(event.target.files));
+document.querySelector("#runEvaluationBtn").addEventListener("click", runEvaluation);
+document.querySelector("#addInboxAccountBtn").addEventListener("click", addInboxAccount);
+document.querySelector("#connectGmailBtn").addEventListener("click", connectGmail);
+document.querySelector("#saveGmailConfigBtn").addEventListener("click", saveGmailConfig);
+document.querySelector("#closeInboxConfigBtn").addEventListener("click", closeInboxConfig);
+document.querySelector("#cancelInboxConfigBtn").addEventListener("click", closeInboxConfig);
+document.querySelector("#refreshInboxLabelsBtn").addEventListener("click", refreshInboxLabels);
+document.querySelector("#saveInboxConfigBtn").addEventListener("click", saveInboxConfig);
+document.querySelector("#closeGoldenModalBtn").addEventListener("click", closeGoldenModal);
+document.querySelector("#cancelGoldenModalBtn").addEventListener("click", closeGoldenModal);
+document.querySelector("#saveGoldenHeaderBtn").addEventListener("click", saveGoldenHeader);
+document.querySelector("#addGoldenLineBtn").addEventListener("click", addGoldenLine);
+document.querySelector("#xrefCsvBtn").addEventListener("click", () => document.querySelector("#xrefCsvInput").click());
+document.querySelector("#xrefCsvDownloadBtn").addEventListener("click", () => {
+  window.location.href = "/api/customer-part-xrefs.csv";
+});
+document.querySelector("#xrefCsvInput").addEventListener("change", (event) => uploadXrefCsv(event.target.files[0]));
+
+document.querySelector("#statusFilter").addEventListener("change", loadPOs);
+document.querySelector("#searchInput").addEventListener("input", () => loadPOs());
+
+loadMe().then((ok) => {
+  if (!ok) return;
+  switchView(canViewDashboard() ? "dashboard" : "admin");
+});

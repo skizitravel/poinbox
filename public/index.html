@@ -1,0 +1,689 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>POInbox PO Intake</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <section class="login-screen" id="loginView">
+      <div class="login-card">
+        <h1>PO Intake Login</h1>
+        <p>Enter the email for an active user profile.</p>
+        <input id="loginEmail" type="email" placeholder="admin@example.com" />
+        <button id="loginBtn">Log In</button>
+        <div class="upload-message" id="loginMessage"></div>
+      </div>
+    </section>
+
+    <div class="app-shell hidden" id="appShell">
+    <header>
+      <div>
+        <h1>PO Intake Queue</h1>
+        <p>Shared inbox purchase order detection, extraction, and review.</p>
+      </div>
+      <div class="actions">
+        <span class="user-pill" id="currentUserPill"></span>
+        <button class="secondary" id="logoutBtn">Logout</button>
+        <div class="view-switcher" role="tablist" aria-label="App view">
+          <button class="secondary active-view" id="dashboardViewBtn">PO Dashboard</button>
+          <button class="secondary" id="adminViewBtn">Admin</button>
+        </div>
+        <button id="syncBtn" title="Connector stub for Gmail or Outlook">Sync Inbox</button>
+        <button id="importBtn">Import Samples</button>
+      </div>
+    </header>
+
+    <main id="dashboardView">
+      <section class="summary" id="summary"></section>
+
+      <section class="toolbar">
+        <select id="statusFilter">
+          <option value="">All statuses</option>
+          <option>Received</option>
+          <option>Needs Review</option>
+          <option>Booked</option>
+          <option>Rejected</option>
+        </select>
+        <input id="searchInput" placeholder="Search customer, PO number, sender" />
+        <button class="secondary" id="exportBtn">Export</button>
+      </section>
+
+      <section class="split">
+        <div class="list-panel">
+          <table>
+            <thead>
+              <tr>
+                <th>Status</th>
+                <th>Received</th>
+                <th>Customer</th>
+                <th>PO #</th>
+                <th>Rev</th>
+                <th>Order Type</th>
+                <th>Source</th>
+                <th>Sender</th>
+                <th>Lines</th>
+                <th>Total</th>
+                <th>Confidence</th>
+                <th>Updated</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="poRows"></tbody>
+          </table>
+        </div>
+
+        <aside class="detail-panel" id="detail">
+          <div class="empty-state">Select a purchase order to review extracted fields and source text.</div>
+        </aside>
+      </section>
+
+      <section class="logs">
+        <div class="section-title">Processing Log</div>
+        <div id="logs"></div>
+      </section>
+    </main>
+
+    <main class="hidden" id="adminView">
+      <nav class="admin-tabs" aria-label="Admin sections">
+        <button class="secondary active-admin-tab" id="adminTabUsersBtn">Users & Access</button>
+        <button class="secondary" id="adminTabMasterBtn">Master Data</button>
+        <button class="secondary" id="adminTabSetupBtn">Setup</button>
+        <button class="secondary" id="adminTabTestingBtn">Testing</button>
+      </nav>
+
+      <section class="admin-tab-pane" id="adminTabUsers">
+      <section class="admin-panel users-panel hidden" id="usersPanel">
+        <div class="admin-head">
+          <div>
+            <h2>Users & Access</h2>
+            <p>Invite users and control Admin and PO Dashboard access.</p>
+          </div>
+        </div>
+        <div class="upload-message" id="usersMessage"></div>
+        <div class="admin-form users-form">
+          <input id="inviteFirstName" placeholder="First name" />
+          <input id="inviteLastName" placeholder="Last name" />
+          <input id="inviteJobTitle" placeholder="Job title" />
+          <input id="inviteEmail" type="email" placeholder="Email" />
+          <button id="inviteUserBtn">Invite User</button>
+        </div>
+        <div class="admin-table-wrap users-table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>First</th>
+                <th>Last</th>
+                <th>Job Title</th>
+                <th>Email</th>
+                <th>Active</th>
+                <th>Admin</th>
+                <th>Admin Page</th>
+                <th>PO Dashboard</th>
+                <th>PO Access</th>
+                <th>Created</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="userRows"></tbody>
+          </table>
+        </div>
+      </section>
+      </section>
+
+      <section class="admin-tab-pane hidden" id="adminTabMaster">
+      <section class="admin-grid">
+        <div class="admin-panel">
+          <div class="admin-head">
+            <div>
+              <h2>Customers</h2>
+              <p>Customer profiles for future validation and matching.</p>
+            </div>
+            <div class="actions">
+              <input id="customerCsvInput" type="file" accept=".csv" hidden />
+              <input id="customerContactCsvInput" type="file" accept=".csv" hidden />
+              <button class="secondary" id="uploadCustomersCsvBtn">Upload Customers CSV</button>
+              <button class="secondary" id="uploadCustomerContactsCsvBtn">Upload Contacts CSV</button>
+              <button class="secondary" id="downloadCustomersCsvBtn">Download Customers CSV</button>
+              <button id="addCustomerBtn">Add Customer</button>
+            </div>
+          </div>
+          <div class="upload-message" id="customersMessage"></div>
+          <div class="admin-table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Customer</th>
+                  <th>Customer #</th>
+                  <th>Payment Terms</th>
+                  <th>Bill To</th>
+                  <th>Ship To</th>
+                  <th>Contacts</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="customerRows"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="admin-panel">
+          <div class="admin-head">
+            <div>
+              <h2>Customer Part Cross Reference</h2>
+              <p>Map customer part numbers to internal part numbers by customer.</p>
+            </div>
+            <div class="actions">
+              <input id="xrefCsvInput" type="file" accept=".csv" hidden />
+              <button class="secondary" id="xrefCsvBtn">Upload CSV</button>
+              <button class="secondary" id="xrefCsvDownloadBtn">Download CSV</button>
+            </div>
+          </div>
+          <div class="upload-message" id="xrefMessage"></div>
+          <div class="admin-form">
+            <input id="xrefCustomer" placeholder="Customer" />
+            <input id="xrefCustomerPart" placeholder="Customer part #" />
+            <input id="xrefInternalPart" placeholder="Internal part #" />
+            <button id="addXrefBtn">Add / Update</button>
+          </div>
+          <div class="admin-table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Customer</th>
+                  <th>Customer Part #</th>
+                  <th>Internal Part #</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="xrefRows"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+      </section>
+
+      <section class="admin-tab-pane hidden" id="adminTabSetup">
+      <section class="admin-grid single-admin-grid">
+        <div class="admin-panel">
+          <div class="admin-head">
+            <div>
+              <h2>Order Types</h2>
+              <p>Configure the order type dropdown used in PO review.</p>
+            </div>
+          </div>
+          <div class="admin-form order-form">
+            <input id="orderTypeName" placeholder="Order type name" />
+            <button id="addOrderTypeBtn">Add</button>
+          </div>
+          <div class="admin-table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Status</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="orderTypeRows"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="admin-panel">
+          <div class="admin-head">
+            <div>
+              <h2>Departments</h2>
+              <p>Maintain departments for future assignment and routing.</p>
+            </div>
+          </div>
+          <div class="admin-form order-form">
+            <input id="departmentName" placeholder="Department name" />
+            <button id="addDepartmentBtn">Add</button>
+          </div>
+          <div class="admin-table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Status</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="departmentRows"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+      </section>
+
+      <section class="admin-tab-pane hidden" id="adminTabTesting">
+      <section class="admin-grid">
+        <div class="admin-panel">
+          <div class="admin-head">
+            <div>
+              <h2>PO Test Corpus</h2>
+              <p>Upload and label PO and non-PO examples for extraction testing.</p>
+            </div>
+            <div class="actions">
+              <input id="testDocInput" type="file" accept=".pdf,.txt,.eml,.csv,.xlsx" multiple hidden />
+              <button class="secondary" id="testDocUploadBtn">Upload Documents</button>
+            </div>
+          </div>
+          <div class="upload-message" id="testingMessage"></div>
+          <div class="admin-table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>File</th>
+                  <th>Type</th>
+                  <th>Expected</th>
+                  <th>Golden</th>
+                  <th>Last Eval</th>
+                  <th>Notes</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="testDocumentRows"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="admin-panel">
+          <div class="admin-head">
+            <div>
+              <h2>Extraction Evaluation</h2>
+              <p>Run extraction against the corpus and compare to golden answers.</p>
+            </div>
+            <button id="runEvaluationBtn">Run Evaluation</button>
+          </div>
+          <div id="evaluationSummary" class="summary compact-summary"></div>
+          <div class="admin-table-wrap small-table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Document</th>
+                  <th>Expected</th>
+                  <th>Detected</th>
+                  <th>Correct</th>
+                  <th>Fields</th>
+                  <th>Lines</th>
+                  <th>Latency</th>
+                </tr>
+              </thead>
+              <tbody id="evaluationRows"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="admin-panel">
+          <div class="admin-head">
+            <div>
+              <h2>Inbox Connections</h2>
+              <p>Connect Gmail for manual sync testing. Outlook is planned next.</p>
+            </div>
+            <div class="actions">
+              <button class="secondary" id="connectGmailBtn">Connect Gmail</button>
+              <button class="secondary" disabled>Connect Outlook Later</button>
+            </div>
+          </div>
+          <div class="admin-form">
+            <input id="inboxDisplayName" placeholder="Display name" />
+            <input id="inboxMonitoredEmail" placeholder="Monitored email" />
+            <input id="inboxFolder" placeholder="Folder/label" value="INBOX" />
+            <button id="addInboxAccountBtn">Add Test Account</button>
+          </div>
+          <div class="admin-table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Provider</th>
+                  <th>Name</th>
+                  <th>Monitored</th>
+                  <th>Folder</th>
+                  <th>Enabled</th>
+                  <th>Status</th>
+                  <th>Last Sync</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="inboxAccountRows"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="admin-panel">
+          <div class="admin-head">
+            <div>
+              <h2>Gmail OAuth App Configuration</h2>
+              <p>Local MVP settings for the Google OAuth app used by all Gmail inbox connections.</p>
+            </div>
+          </div>
+          <div class="upload-message" id="gmailConfigMessage"></div>
+          <div class="grid">
+            <div class="field wide"><label>Client ID</label><input id="gmailClientId" placeholder="Google OAuth client ID" /></div>
+            <div class="field wide"><label>Client Secret</label><input id="gmailClientSecret" type="password" placeholder="Leave blank to keep existing secret" /></div>
+            <div class="field wide"><label>Redirect URI</label><input id="gmailRedirectUri" /></div>
+            <div class="field wide"><label>Scopes</label><input id="gmailScopes" /></div>
+          </div>
+          <div class="modal-actions">
+            <button id="saveGmailConfigBtn">Save Gmail Config</button>
+          </div>
+        </div>
+
+        <div class="admin-panel">
+          <div class="admin-head">
+            <div>
+              <h2>Inbox Detection Testing</h2>
+              <p>Recent sync runs and detection metrics for live inbox testing.</p>
+            </div>
+          </div>
+          <div class="admin-table-wrap small-table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Timestamp</th>
+                  <th>Provider</th>
+                  <th>Status</th>
+                  <th>Seen</th>
+                  <th>Imported</th>
+                  <th>Skipped</th>
+                  <th>POs</th>
+                  <th>Errors</th>
+                </tr>
+              </thead>
+              <tbody id="syncRunRows"></tbody>
+            </table>
+          </div>
+          <div class="section-title">Detection Results</div>
+          <div class="admin-table-wrap small-table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Timestamp</th>
+                  <th>Message ID</th>
+                  <th>Detected</th>
+                  <th>Confidence</th>
+                  <th>Attachments</th>
+                  <th>Duplicate</th>
+                  <th>PO</th>
+                  <th>Latency</th>
+                  <th>Error</th>
+                </tr>
+              </thead>
+              <tbody id="detectionResultRows"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+      </section>
+    </main>
+
+    <div class="modal-backdrop hidden" id="uploadModal" aria-hidden="true">
+      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="uploadTitle">
+        <div class="modal-head">
+          <div>
+            <h2 id="uploadTitle">Import Samples</h2>
+            <p>Upload PO samples or import files already in the sample inbox folder.</p>
+          </div>
+          <button class="icon-btn" id="closeUploadBtn" title="Close">×</button>
+        </div>
+
+        <div class="drop-zone" id="dropZone">
+          <input id="fileInput" type="file" accept=".pdf,.txt,.eml" multiple hidden />
+          <div class="drop-title">Drop files here</div>
+          <div class="drop-copy">PDF, TXT, or EML files. Multiple files are supported.</div>
+          <button class="secondary" id="selectFileBtn">Select File</button>
+        </div>
+
+        <div class="selected-files" id="selectedFiles">No files selected.</div>
+        <div class="upload-message" id="uploadMessage"></div>
+
+        <div class="modal-actions">
+          <button id="uploadProcessBtn">Upload & Process</button>
+          <button class="secondary" id="folderImportBtn">Import Existing Sample Folder</button>
+          <button class="secondary" id="cancelUploadBtn">Cancel</button>
+        </div>
+      </section>
+    </div>
+
+    <div class="modal-backdrop hidden" id="exportModal" aria-hidden="true">
+      <section class="modal compact-modal" role="dialog" aria-modal="true" aria-labelledby="exportTitle">
+        <div class="modal-head">
+          <div>
+            <h2 id="exportTitle">Export PO Data</h2>
+            <p>Download CSV data using the current dashboard filters.</p>
+          </div>
+          <button class="icon-btn" id="closeExportBtn" title="Close">x</button>
+        </div>
+        <div class="modal-actions">
+          <button id="exportHeaderBtn">Header Only</button>
+          <button id="exportLinesBtn">Header + Lines</button>
+          <button class="secondary" id="cancelExportBtn">Cancel</button>
+        </div>
+      </section>
+    </div>
+
+    <div class="modal-backdrop hidden" id="customerCsvModal" aria-hidden="true">
+      <section class="modal compact-modal" role="dialog" aria-modal="true" aria-labelledby="customerCsvTitle">
+        <div class="modal-head">
+          <div>
+            <h2 id="customerCsvTitle">Download Customer Data</h2>
+            <p>Choose the customer master data export format.</p>
+          </div>
+          <button class="icon-btn" id="closeCustomerCsvBtn" title="Close">x</button>
+        </div>
+        <div class="modal-actions vertical-actions">
+          <button id="downloadCustomersOnlyBtn">Customers Only</button>
+          <button id="downloadCustomersAddressesBtn">Customers With Addresses</button>
+          <button id="downloadCustomerContactsBtn">Customer Contacts</button>
+          <button class="secondary" id="cancelCustomerCsvBtn">Cancel</button>
+        </div>
+      </section>
+    </div>
+
+    <div class="modal-backdrop hidden" id="userModal" aria-hidden="true">
+      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="userModalTitle">
+        <div class="modal-head">
+          <div>
+            <h2 id="userModalTitle">Edit User</h2>
+            <p>Update profile details and access parameters.</p>
+          </div>
+          <button class="icon-btn" id="closeUserModalBtn" title="Close">x</button>
+        </div>
+        <div class="grid">
+          <div class="field"><label>First Name</label><input id="editUserFirstName" /></div>
+          <div class="field"><label>Last Name</label><input id="editUserLastName" /></div>
+          <div class="field"><label>Job Title</label><input id="editUserJobTitle" /></div>
+          <div class="field"><label>Email</label><input id="editUserEmail" type="email" /></div>
+          <label class="check-field"><input id="editUserActive" type="checkbox" /> Active</label>
+          <label class="check-field"><input id="editUserAdmin" type="checkbox" /> Admin</label>
+          <label class="check-field"><input id="editUserAdminAccess" type="checkbox" /> Admin Page</label>
+          <label class="check-field"><input id="editUserDashboardAccess" type="checkbox" /> PO Dashboard</label>
+          <div class="field"><label>PO Access</label>
+            <select id="editUserPoLevel">
+              <option value="none">None</option>
+              <option value="view_only">View Only</option>
+              <option value="edit">Edit</option>
+            </select>
+          </div>
+        </div>
+        <div class="upload-message" id="userModalMessage"></div>
+        <div class="modal-actions">
+          <button id="saveUserModalBtn">Save</button>
+          <button class="danger" id="deactivateUserModalBtn">Deactivate</button>
+          <button class="secondary" id="cancelUserModalBtn">Cancel</button>
+        </div>
+      </section>
+    </div>
+
+    <div class="modal-backdrop hidden" id="customerModal" aria-hidden="true">
+      <section class="modal wide-modal" role="dialog" aria-modal="true" aria-labelledby="customerModalTitle">
+        <div class="modal-head">
+          <div>
+            <h2 id="customerModalTitle">Customer Profile</h2>
+            <p>Store profile details, addresses, and contacts for future matching.</p>
+          </div>
+          <button class="icon-btn" id="closeCustomerModalBtn" title="Close">x</button>
+        </div>
+        <div class="grid">
+          <div class="field"><label>Customer Name</label><input id="customerName" /></div>
+          <div class="field"><label>Customer Number</label><input id="customerNumber" /></div>
+          <div class="field"><label>Payment Terms</label><input id="customerPaymentTerms" /></div>
+        </div>
+        <div class="upload-message" id="customerModalMessage"></div>
+        <div class="modal-actions">
+          <button id="saveCustomerBtn">Save Customer</button>
+          <button class="danger" id="deleteCustomerBtn">Delete Customer</button>
+          <button class="secondary" id="cancelCustomerModalBtn">Cancel</button>
+        </div>
+
+        <div class="modal-subgrid customer-child-stack" id="customerChildEditors">
+          <section>
+            <div class="section-title">Addresses</div>
+            <div class="admin-form address-form">
+              <select id="addressType"><option value="bill_to">Bill To</option><option value="ship_to">Ship To</option></select>
+              <input id="addressLabel" placeholder="Label" />
+              <input id="addressLine1" placeholder="Address line 1" />
+              <input id="addressLine2" placeholder="Address line 2" />
+              <input id="addressLine3" placeholder="Address line 3" />
+              <input id="addressCity" placeholder="City" />
+              <input id="addressState" placeholder="State" />
+              <input id="addressCountry" placeholder="Country" />
+              <input id="addressZip" placeholder="Zip code" />
+              <label class="check-field"><input id="addressDefault" type="checkbox" /> Default</label>
+              <button id="addAddressBtn">Add Address</button>
+            </div>
+            <div class="admin-table-wrap small-table-wrap"><table><tbody id="addressRows"></tbody></table></div>
+          </section>
+          <section>
+            <div class="section-title section-title-row">
+              <span>Contacts</span>
+              <button class="secondary table-action" id="addContactBtn">Add Contact</button>
+            </div>
+            <div class="admin-table-wrap small-table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>First</th>
+                    <th>Last</th>
+                    <th>Title</th>
+                    <th>Phone</th>
+                    <th>Email</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody id="contactRows"></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      </section>
+    </div>
+
+    <div class="modal-backdrop hidden nested-modal" id="contactModal" aria-hidden="true">
+      <section class="modal compact-modal" role="dialog" aria-modal="true" aria-labelledby="contactModalTitle">
+        <div class="modal-head">
+          <div>
+            <h2 id="contactModalTitle">Contact</h2>
+            <p>Add or update a customer contact.</p>
+          </div>
+          <button class="icon-btn" id="closeContactModalBtn" title="Close">x</button>
+        </div>
+        <div class="grid">
+          <div class="field"><label>First Name</label><input id="modalContactFirstName" /></div>
+          <div class="field"><label>Last Name</label><input id="modalContactLastName" /></div>
+          <div class="field"><label>Job Title</label><input id="modalContactJobTitle" /></div>
+          <div class="field"><label>Phone</label><input id="modalContactPhone" /></div>
+          <div class="field wide"><label>Email</label><input id="modalContactEmail" type="email" /></div>
+        </div>
+        <div class="upload-message" id="contactModalMessage"></div>
+        <div class="modal-actions">
+          <button id="saveContactModalBtn">Save</button>
+          <button class="danger hidden" id="deleteContactModalBtn">Delete</button>
+          <button class="secondary" id="cancelContactModalBtn">Cancel</button>
+        </div>
+      </section>
+    </div>
+
+    <div class="modal-backdrop hidden" id="goldenModal" aria-hidden="true">
+      <section class="modal wide-modal" role="dialog" aria-modal="true" aria-labelledby="goldenModalTitle">
+        <div class="modal-head">
+          <div>
+            <h2 id="goldenModalTitle">Golden Answer</h2>
+            <p>Enter expected extraction results for evaluation.</p>
+          </div>
+          <button class="icon-btn" id="closeGoldenModalBtn" title="Close">x</button>
+        </div>
+        <label class="check-field"><input id="goldenExpectedIsPo" type="checkbox" checked /> Expected PO</label>
+        <div class="grid">
+          <div class="field"><label>Customer</label><input id="goldenCustomer" /></div>
+          <div class="field"><label>Contact</label><input id="goldenContact" /></div>
+          <div class="field"><label>PO Number</label><input id="goldenPoNumber" /></div>
+          <div class="field"><label>Quote Number</label><input id="goldenQuoteNumber" /></div>
+          <div class="field"><label>Date Received</label><input id="goldenDateReceived" type="date" /></div>
+          <div class="field"><label>Total Value</label><input id="goldenTotalValue" type="number" step="0.01" /></div>
+          <div class="field"><label>Currency</label><input id="goldenCurrency" /></div>
+          <div class="field"><label>Payment Terms</label><input id="goldenPaymentTerms" /></div>
+          <div class="field"><label>Freight Terms</label><input id="goldenFreightTerms" /></div>
+          <div class="field wide"><label>Bill To</label><textarea id="goldenBillTo"></textarea></div>
+          <div class="field wide"><label>Ship To</label><textarea id="goldenShipTo"></textarea></div>
+          <div class="field wide"><label>Notes</label><textarea id="goldenNotes"></textarea></div>
+        </div>
+        <div class="modal-actions">
+          <button id="saveGoldenHeaderBtn">Save Header</button>
+          <button class="secondary" id="cancelGoldenModalBtn">Cancel</button>
+        </div>
+        <div class="section-title">Golden Lines</div>
+        <div class="admin-form line-golden-form">
+          <input id="goldenLineNumber" placeholder="Line" />
+          <input id="goldenCustomerPart" placeholder="Customer part" />
+          <input id="goldenInternalPart" placeholder="Internal part" />
+          <input id="goldenDescription" placeholder="Description" />
+          <input id="goldenQuantity" type="number" step="0.01" placeholder="Qty" />
+          <input id="goldenUom" placeholder="UOM" />
+          <input id="goldenUnitPrice" type="number" step="0.01" placeholder="Unit price" />
+          <input id="goldenRequestedDate" type="date" />
+          <button id="addGoldenLineBtn">Add Line</button>
+        </div>
+        <div class="admin-table-wrap small-table-wrap"><table><tbody id="goldenLineRows"></tbody></table></div>
+      </section>
+    </div>
+
+    <div class="modal-backdrop hidden" id="inboxConfigModal" aria-hidden="true">
+      <section class="modal wide-modal" role="dialog" aria-modal="true" aria-labelledby="inboxConfigTitle">
+        <div class="modal-head">
+          <div>
+            <h2 id="inboxConfigTitle">Configure Inbox</h2>
+            <p>Choose Gmail labels, attachment filtering, and sync schedule for this connection.</p>
+          </div>
+          <button class="icon-btn" id="closeInboxConfigBtn" title="Close">x</button>
+        </div>
+        <div class="upload-message" id="inboxConfigMessage"></div>
+        <div class="grid">
+          <div class="field"><label>Display Name</label><input id="configInboxName" /></div>
+          <div class="field"><label>Connected Email</label><input id="configConnectedEmail" disabled /></div>
+          <div class="field"><label>Monitored Email</label><input id="configMonitoredEmail" /></div>
+          <div class="field"><label>Folder/Label Fallback</label><input id="configFolder" /></div>
+          <label class="check-field"><input id="configInboxEnabled" type="checkbox" /> Active</label>
+          <label class="check-field"><input id="configEvalNoAttachments" type="checkbox" /> Evaluate emails without attachments</label>
+          <div class="field"><label>Sync Every Hours</label><input id="configSyncInterval" type="number" min="1" step="1" /></div>
+          <div class="field"><label>Starting At</label><input id="configSyncStart" type="time" /></div>
+          <div class="field wide"><label>Next Scheduled Sync</label><div class="readonly-value" id="configNextSync"></div></div>
+        </div>
+        <div class="section-title section-title-row">
+          <span>Gmail Labels</span>
+          <button class="secondary table-action" id="refreshInboxLabelsBtn">Refresh Labels</button>
+        </div>
+        <div class="label-list" id="inboxLabelList"></div>
+        <div class="modal-actions">
+          <button id="saveInboxConfigBtn">Save Configuration</button>
+          <button class="secondary" id="cancelInboxConfigBtn">Cancel</button>
+        </div>
+      </section>
+    </div>
+
+    <script src="/app.js"></script>
+    </div>
+  </body>
+</html>
