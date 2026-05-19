@@ -141,7 +141,7 @@ def process_email(conn: sqlite3.Connection, email_id: int, attachments: list[dic
         source_text,
         email_dict,
         source_attachment["filename"] if source_attachment else None,
-        "ai_with_examples" if prior_examples else None,
+        None,
         prior_examples,
     )
     extraction_run_id = log_document_extraction_run(

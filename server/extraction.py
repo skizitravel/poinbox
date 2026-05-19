@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from server.config import OPENAI_MODEL, USE_OPENAI_EXTRACTION
+from server.openai_settings import get_openai_runtime_config
 
 
 PO_EXTRACTION_PROMPT_VERSION = "po-extraction-v2-feedback"
@@ -61,11 +61,12 @@ def extract_purchase_order(
     mode: str | None = None,
     prior_examples: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    requested_mode = mode or ("ai_text" if USE_OPENAI_EXTRACTION else "rule_based")
-    use_ai = requested_mode in {"ai_text", "ai_with_examples"} or (requested_mode is None and USE_OPENAI_EXTRACTION)
-    if use_ai and os.getenv("OPENAI_API_KEY"):
+    config = get_openai_runtime_config()
+    requested_mode = mode or ("ai_with_examples" if config.use_ai_extraction and prior_examples else "ai_text" if config.use_ai_extraction else "rule_based")
+    use_ai = requested_mode in {"ai_text", "ai_with_examples"}
+    if use_ai and config.api_key_configured:
         try:
-            return extract_with_openai(text, email, attachment_filename, prior_examples if requested_mode == "ai_with_examples" else None)
+            return extract_with_openai(text, email, attachment_filename, prior_examples if requested_mode == "ai_with_examples" else None, config.api_key, config.model)
         except Exception as exc:
             fallback = extract_with_rules(text, email, attachment_filename)
             fallback["extraction_notes"] = f"OpenAI extraction failed; used rule fallback. {exc}"
@@ -76,6 +77,9 @@ def extract_purchase_order(
     extraction = extract_with_rules(text, email, attachment_filename)
     extraction["_extraction_method"] = "rule_based"
     extraction["_prompt_version"] = PO_EXTRACTION_PROMPT_VERSION
+    if use_ai and not config.api_key_configured:
+        extraction["extraction_notes"] = "AI extraction was requested but no OpenAI API key is configured; used rule-based extraction."
+        extraction["_error_message"] = "AI extraction requested without configured OpenAI API key."
     return extraction
 
 
@@ -217,6 +221,8 @@ def extract_with_openai(
     email: dict[str, Any],
     attachment_filename: str | None,
     prior_examples: list[dict[str, Any]] | None = None,
+    api_key: str | None = None,
+    model: str | None = None,
 ) -> dict[str, Any]:
     prompt = {
         "task": "Extract customer purchase order data. Return only JSON. Use null for missing values. Do not invent data.",
@@ -267,7 +273,7 @@ def extract_with_openai(
         "document_text": text[:45000],
     }
     payload = {
-        "model": OPENAI_MODEL,
+        "model": model or "gpt-4.1-mini",
         "input": [
             {
                 "role": "user",
@@ -280,7 +286,7 @@ def extract_with_openai(
         "https://api.openai.com/v1/responses",
         data=json.dumps(payload).encode("utf-8"),
         headers={
-            "Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}",
+            "Authorization": f"Bearer {api_key or os.environ['OPENAI_API_KEY']}",
             "Content-Type": "application/json",
         },
         method="POST",
@@ -291,7 +297,7 @@ def extract_with_openai(
     parsed = json.loads(content)
     validate_extraction(parsed)
     parsed["_extraction_method"] = "ai_with_examples" if prior_examples else "ai_text"
-    parsed["_model_name"] = OPENAI_MODEL
+    parsed["_model_name"] = model or "gpt-4.1-mini"
     parsed["_prompt_version"] = PO_EXTRACTION_PROMPT_VERSION
     parsed["_raw_output_json"] = content
     parsed["_prior_examples_used"] = bool(prior_examples)

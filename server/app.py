@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import sys
 import uuid
@@ -51,6 +50,7 @@ from server.processing import (
 )
 from server.extraction import classify_purchase_order, extract_purchase_order, normalize_date
 from server.master_data import format_structured_address, list_reviews, parse_structured_address, resolve_review, run_master_data_reviews
+from server.openai_settings import get_openai_extraction_config, get_openai_runtime_config, save_openai_extraction_config
 
 
 class AppHandler(SimpleHTTPRequestHandler):
@@ -132,6 +132,10 @@ class AppHandler(SimpleHTTPRequestHandler):
             if not self.require_permission("admin:view"):
                 return
             return self.respond_json(get_gmail_oauth_config())
+        if parsed.path == "/api/openai-extraction-config":
+            if not self.require_permission("admin:view"):
+                return
+            return self.respond_json(get_openai_extraction_config())
         if parsed.path == "/api/inbox-detection-results":
             if not self.require_permission("admin:view"):
                 return
@@ -230,6 +234,10 @@ class AppHandler(SimpleHTTPRequestHandler):
             if not self.require_permission("admin:view"):
                 return
             return self.respond_json(save_gmail_oauth_config(self.read_json()))
+        if parsed.path == "/api/openai-extraction-config":
+            if not self.require_permission("admin:view"):
+                return
+            return self.respond_json(save_openai_extraction_config(self.read_json()))
         if parsed.path.startswith("/api/inbox-accounts/") and parsed.path.endswith("/sync"):
             if not self.require_permission("admin:view"):
                 return
@@ -1771,7 +1779,7 @@ def run_extraction_evaluation(payload: dict) -> dict:
     started = now_iso()
     run_name = (payload.get("run_name") or f"Evaluation {started}").strip()
     mode = payload.get("extraction_mode") if payload.get("extraction_mode") in {"rule_based", "ai_text", "ai_with_examples"} else "rule_based"
-    if mode in {"ai_text", "ai_with_examples"} and not os.getenv("OPENAI_API_KEY"):
+    if mode in {"ai_text", "ai_with_examples"} and not get_openai_runtime_config().api_key_configured:
         return {"error": "AI extraction is not configured. Add OPENAI_API_KEY before running this mode.", **list_evaluation_runs()}
     with db() as conn:
         cur = conn.execute(

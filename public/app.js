@@ -12,6 +12,7 @@ let inboxAccounts = [];
 let inboxSyncRuns = [];
 let inboxDetectionResults = [];
 let gmailConfig = {};
+let openaiConfig = {};
 let currentInboxConfig = null;
 let configuringInboxId = null;
 let extractionLearning = { summary: {}, recent_feedback: [], recent_failures: [], corrected_fields: [], corrections_by_customer: [] };
@@ -578,11 +579,12 @@ function renderDepartments() {
 
 async function loadTestingData() {
   if (!canViewAdmin()) return;
-  const [documentsData, evaluationsData, inboxData, gmailData, detectionData, learningData] = await Promise.all([
+  const [documentsData, evaluationsData, inboxData, gmailData, openaiData, detectionData, learningData] = await Promise.all([
     api("/api/testing/documents"),
     api("/api/testing/evaluations"),
     api("/api/inbox-accounts"),
     api("/api/gmail-oauth-config"),
+    api("/api/openai-extraction-config"),
     api("/api/inbox-detection-results"),
     api("/api/extraction-learning"),
   ]);
@@ -591,10 +593,12 @@ async function loadTestingData() {
   inboxAccounts = inboxData.accounts || [];
   inboxSyncRuns = inboxData.sync_runs || [];
   gmailConfig = gmailData || {};
+  openaiConfig = openaiData || {};
   inboxDetectionResults = detectionData.results || [];
   extractionLearning = learningData || extractionLearning;
   renderTestDocuments();
   renderEvaluation();
+  renderOpenAIConfig();
   renderGmailConfig();
   renderInboxAccounts(inboxData.gmail_configured);
   renderSyncRuns();
@@ -732,6 +736,17 @@ async function runEvaluation() {
   setMessage("#testingMessage", "Evaluation complete.", "success");
   renderEvaluation();
   await loadTestingData();
+}
+
+function renderOpenAIConfig() {
+  document.querySelector("#openaiConfigStatus").innerHTML = `
+    ${metric("API Key", openaiConfig.api_key_configured ? "Configured" : "Not configured")}
+    ${metric("Model", safe(openaiConfig.model || "gpt-4.1-mini"))}
+    ${metric("AI Extraction", openaiConfig.use_ai_extraction ? "On" : "Off")}
+  `;
+  document.querySelector("#openaiModel").value = openaiConfig.model || "gpt-4.1-mini";
+  document.querySelector("#useAiExtraction").checked = Boolean(openaiConfig.use_ai_extraction);
+  document.querySelector("#openaiApiKey").placeholder = openaiConfig.api_key_configured ? "API key configured - leave blank to keep it" : "Paste OpenAI API key";
 }
 
 async function loadExtractionLearning() {
@@ -1022,6 +1037,23 @@ async function saveGmailConfig() {
   setMessage("#gmailConfigMessage", data.client_secret_configured ? "Gmail config saved. Secret is configured." : "Gmail config saved. Client secret is not configured.", data.client_secret_configured ? "success" : "error");
   renderGmailConfig();
   await loadTestingData();
+}
+
+async function saveOpenAIConfig() {
+  const payload = {
+    api_key: document.querySelector("#openaiApiKey").value.trim(),
+    model: document.querySelector("#openaiModel").value.trim(),
+    use_ai_extraction: document.querySelector("#useAiExtraction").checked,
+  };
+  const data = await api("/api/openai-extraction-config", { method: "POST", body: JSON.stringify(payload) });
+  if (data.error) {
+    setMessage("#openaiConfigMessage", data.error, "error");
+    return;
+  }
+  openaiConfig = data;
+  document.querySelector("#openaiApiKey").value = "";
+  renderOpenAIConfig();
+  setMessage("#openaiConfigMessage", data.api_key_configured ? "OpenAI config saved. API key is configured." : "OpenAI config saved. No API key configured.", data.api_key_configured ? "success" : "error");
 }
 
 async function syncInboxAccount(id) {
@@ -2012,6 +2044,7 @@ document.querySelector("#refreshLearningBtn").addEventListener("click", loadExtr
 document.querySelector("#addInboxAccountBtn").addEventListener("click", addInboxAccount);
 document.querySelector("#connectGmailBtn").addEventListener("click", connectGmail);
 document.querySelector("#saveGmailConfigBtn").addEventListener("click", saveGmailConfig);
+document.querySelector("#saveOpenAIConfigBtn").addEventListener("click", saveOpenAIConfig);
 document.querySelector("#closeInboxConfigBtn").addEventListener("click", closeInboxConfig);
 document.querySelector("#cancelInboxConfigBtn").addEventListener("click", closeInboxConfig);
 document.querySelector("#refreshInboxLabelsBtn").addEventListener("click", refreshInboxLabels);

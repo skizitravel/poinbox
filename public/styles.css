@@ -330,6 +330,11 @@ tbody tr.active {
   text-transform: uppercase;
 }
 
+.field small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .field textarea {
   min-height: 74px;
   resize: vertical;
@@ -358,6 +363,15 @@ tbody tr.active {
 
 .wide {
   grid-column: 1 / -1;
+}
+
+.check-row {
+  align-items: center;
+  color: #334155;
+  display: flex;
+  font-weight: 650;
+  gap: 8px;
+  min-height: 37px;
 }
 
 .section-title {

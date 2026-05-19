@@ -25,7 +25,7 @@ Create your local environment file:
 Copy-Item .env.example .env.local
 ```
 
-For deterministic local testing, leave `USE_OPENAI_EXTRACTION=0`. To test AI extraction, add your `OPENAI_API_KEY` to `.env.local` and set `USE_OPENAI_EXTRACTION=1`.
+For deterministic local testing, leave AI extraction off. To test AI extraction, open **Admin > Testing > OpenAI Extraction Configuration**, paste an OpenAI API key, choose a model, and turn on **Use AI extraction**.
 
 Start the app:
 
@@ -76,9 +76,10 @@ The MVP defaults to deterministic extraction so it runs locally without spending
 USE_OPENAI_EXTRACTION=0
 ```
 
-To use the OpenAI extractor, set:
+You can also use `.env.local` as a developer fallback:
 
 ```text
+OPENAI_API_KEY=
 USE_OPENAI_EXTRACTION=1
 OPENAI_MODEL=gpt-4.1-mini
 ```
@@ -191,7 +192,16 @@ Admin > Testing includes an **Extraction Learning** dashboard with extraction ru
 
 When AI extraction is enabled, the extractor can retrieve recent reviewed/corrected examples and include them in the prompt as layout guidance. Prior examples are not treated as source data: the prompt instructs the model to prefer the current document, never copy PO numbers/prices/dates from examples, and return `null` when a value is missing.
 
-To enable AI extraction, set these in `.env.local`:
+To enable AI extraction from the app, use **Admin > Testing > OpenAI Extraction Configuration**:
+
+- paste the OpenAI API key into the password field
+- set the model, such as `gpt-4.1-mini`
+- turn **Use AI extraction** on
+- save the configuration
+
+The API key is stored locally for this MVP and is never returned to the browser after saving. The panel only shows whether a key is configured. Leave the API key field blank when saving if you want to keep the existing key.
+
+`.env.local` still works as a fallback for developers:
 
 ```text
 OPENAI_API_KEY=
@@ -212,6 +222,15 @@ Recommended workflow for your first 35 PDFs:
 9. Expand the golden-answer set until the corpus reflects the real customer mix.
 
 Scanned/image-only PDFs still need OCR or vision extraction. If PDF text extraction returns little or no text, the test harness marks the document as needing OCR instead of crashing. The placeholder `extract_pdf_with_vision_or_ocr()` is intentionally not wired to a production OCR provider yet.
+
+AI extraction behavior:
+
+- normal PO processing uses rule-based extraction when **Use AI extraction** is off
+- normal PO processing uses OpenAI extraction when **Use AI extraction** is on and a key is configured
+- if AI is enabled but no key is configured, the app falls back to rule-based extraction and records a note
+- **AI Text** evaluation uses the saved OpenAI configuration
+- **AI With Prior Examples** evaluation also includes reviewed corrections from the feedback loop as guidance
+- production deployments should replace local SQLite/API-key storage with encrypted managed secret storage
 
 ## Gmail Inbox Testing
 

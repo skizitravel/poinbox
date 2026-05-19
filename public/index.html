@@ -326,6 +326,35 @@
         <div class="admin-panel">
           <div class="admin-head">
             <div>
+              <h2>OpenAI Extraction Configuration</h2>
+              <p>Local AI extraction settings. The API key is never shown after saving.</p>
+            </div>
+          </div>
+          <div class="upload-message" id="openaiConfigMessage"></div>
+          <div id="openaiConfigStatus" class="summary compact-summary"></div>
+          <div class="grid">
+            <div class="field wide">
+              <label>OpenAI API Key</label>
+              <input id="openaiApiKey" type="password" placeholder="Leave blank to keep existing key" autocomplete="off" />
+              <small>Leave blank to keep the existing key.</small>
+            </div>
+            <div class="field">
+              <label>Model</label>
+              <input id="openaiModel" placeholder="gpt-4.1-mini" />
+            </div>
+            <label class="check-row">
+              <input id="useAiExtraction" type="checkbox" />
+              Use AI extraction
+            </label>
+          </div>
+          <div class="modal-actions">
+            <button id="saveOpenAIConfigBtn">Save OpenAI Config</button>
+          </div>
+        </div>
+
+        <div class="admin-panel">
+          <div class="admin-head">
+            <div>
               <h2>Extraction Learning</h2>
               <p>Track extraction runs, user corrections, and fields that need better parsing.</p>
             </div>
