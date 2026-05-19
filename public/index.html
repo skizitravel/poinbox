@@ -295,7 +295,14 @@
               <h2>Extraction Evaluation</h2>
               <p>Run extraction against the corpus and compare to golden answers.</p>
             </div>
-            <button id="runEvaluationBtn">Run Evaluation</button>
+            <div class="actions">
+              <select id="evaluationMode">
+                <option value="rule_based">Rule Based</option>
+                <option value="ai_text">AI Text</option>
+                <option value="ai_with_examples">AI With Prior Examples</option>
+              </select>
+              <button id="runEvaluationBtn">Run Evaluation</button>
+            </div>
           </div>
           <div id="evaluationSummary" class="summary compact-summary"></div>
           <div class="admin-table-wrap small-table-wrap">
@@ -312,6 +319,57 @@
                 </tr>
               </thead>
               <tbody id="evaluationRows"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="admin-panel">
+          <div class="admin-head">
+            <div>
+              <h2>Extraction Learning</h2>
+              <p>Track extraction runs, user corrections, and fields that need better parsing.</p>
+            </div>
+          </div>
+          <div id="learningSummary" class="summary compact-summary"></div>
+          <div class="admin-form">
+            <input id="learningCustomerFilter" placeholder="Filter customer" />
+            <input id="learningFieldFilter" placeholder="Filter field" />
+            <button class="secondary" id="refreshLearningBtn">Refresh Learning</button>
+          </div>
+          <div class="section-title">Most Corrected Fields</div>
+          <div id="learningFieldRows" class="mini-list"></div>
+          <div class="section-title">Corrections By Customer</div>
+          <div id="learningCustomerRows" class="mini-list"></div>
+          <div class="section-title">Recent Corrections</div>
+          <div class="admin-table-wrap small-table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Created</th>
+                  <th>Customer</th>
+                  <th>PO</th>
+                  <th>Field</th>
+                  <th>Extracted</th>
+                  <th>Corrected</th>
+                  <th>User</th>
+                  <th>Source</th>
+                </tr>
+              </thead>
+              <tbody id="learningFeedbackRows"></tbody>
+            </table>
+          </div>
+          <div class="section-title">Recent Extraction Failures</div>
+          <div class="admin-table-wrap small-table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Created</th>
+                  <th>Method</th>
+                  <th>Model</th>
+                  <th>Error</th>
+                </tr>
+              </thead>
+              <tbody id="learningFailureRows"></tbody>
             </table>
           </div>
         </div>

@@ -251,6 +251,7 @@ def initialize(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS extraction_evaluation_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             run_name TEXT,
+            extraction_mode TEXT DEFAULT 'rule_based',
             started_at TEXT,
             finished_at TEXT,
             document_count INTEGER DEFAULT 0,
@@ -279,6 +280,40 @@ def initialize(conn: sqlite3.Connection) -> None:
             hallucinated_fields_json TEXT,
             confidence_json TEXT,
             processing_latency_ms INTEGER,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS document_extraction_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email_id INTEGER REFERENCES emails(id) ON DELETE SET NULL,
+            attachment_id INTEGER REFERENCES attachments(id) ON DELETE SET NULL,
+            purchase_order_id INTEGER REFERENCES purchase_orders(id) ON DELETE SET NULL,
+            test_document_id INTEGER REFERENCES test_documents(id) ON DELETE SET NULL,
+            extraction_method TEXT,
+            model_name TEXT,
+            prompt_version TEXT,
+            raw_input_text TEXT,
+            raw_output_json TEXT,
+            parsed_output_json TEXT,
+            success INTEGER DEFAULT 1,
+            error_message TEXT,
+            latency_ms INTEGER,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS extraction_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            purchase_order_id INTEGER NOT NULL REFERENCES purchase_orders(id) ON DELETE CASCADE,
+            entity_type TEXT NOT NULL,
+            entity_id INTEGER NOT NULL,
+            field_name TEXT NOT NULL,
+            extracted_value TEXT,
+            corrected_value TEXT,
+            confidence REAL,
+            source_text_snippet TEXT,
+            customer_company_name TEXT,
+            source_attachment_filename TEXT,
+            created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
 
@@ -378,7 +413,11 @@ def initialize(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "purchase_orders", "bill_to_address_structured_json", "TEXT")
     ensure_column(conn, "purchase_orders", "ship_to_address_structured_json", "TEXT")
     ensure_column(conn, "purchase_orders", "source_type", "TEXT")
+    ensure_column(conn, "purchase_orders", "extraction_reviewed_at", "TEXT")
+    ensure_column(conn, "purchase_orders", "extraction_reviewed_by_user_id", "INTEGER REFERENCES users(id) ON DELETE SET NULL")
+    ensure_column(conn, "purchase_orders", "extraction_feedback_count", "INTEGER DEFAULT 0")
     ensure_column(conn, "purchase_order_lines", "field_confidence_json", "TEXT")
+    ensure_column(conn, "extraction_evaluation_runs", "extraction_mode", "TEXT DEFAULT 'rule_based'")
     ensure_column(conn, "users", "first_name", "TEXT")
     ensure_column(conn, "users", "last_name", "TEXT")
     ensure_column(conn, "users", "job_title", "TEXT")

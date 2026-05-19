@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -98,6 +99,10 @@ def extract_pdf_text(path: Path) -> tuple[str, int | None]:
         return "", None
 
 
+def extract_pdf_with_vision_or_ocr(path: Path) -> tuple[str, str]:
+    return "", "OCR/vision extraction is not configured for this MVP."
+
+
 def process_email(conn: sqlite3.Connection, email_id: int, attachments: list[dict[str, Any]]) -> int:
     email = conn.execute("SELECT * FROM emails WHERE id = ?", (email_id,)).fetchone()
     email_dict = dict(email)
@@ -130,7 +135,24 @@ def process_email(conn: sqlite3.Connection, email_id: int, attachments: list[dic
 
     source_text = attachment_text.strip() or email_dict.get("body_text") or ""
     source_attachment = attachments[0] if attachments else None
-    extraction = extract_purchase_order(source_text, email_dict, source_attachment["filename"] if source_attachment else None)
+    prior_examples = find_similar_extraction_examples(conn, None, source_text)
+    started = time.perf_counter()
+    extraction = extract_purchase_order(
+        source_text,
+        email_dict,
+        source_attachment["filename"] if source_attachment else None,
+        "ai_with_examples" if prior_examples else None,
+        prior_examples,
+    )
+    extraction_run_id = log_document_extraction_run(
+        conn,
+        email_id=email_id,
+        attachment_id=source_attachment["id"] if source_attachment else None,
+        raw_input_text=source_text,
+        extraction=extraction,
+        latency_ms=elapsed_ms(started),
+        success=True,
+    )
     apply_cross_references(conn, extraction)
     duplicate = find_duplicate_purchase_order(conn, extraction)
     if duplicate:
@@ -148,12 +170,68 @@ def process_email(conn: sqlite3.Connection, email_id: int, attachments: list[dic
         )
         return 0
     po_id = insert_purchase_order(conn, email_id, source_attachment["id"] if source_attachment else None, extraction)
+    link_extraction_run(conn, extraction_run_id, po_id)
     for line in extraction.get("lines", []):
         insert_po_line(conn, po_id, extraction.get("po_number"), line)
     recalculate_po_total(conn, po_id, extracted_total=extraction.get("total_value"))
     run_master_data_reviews(conn, po_id)
     log(conn, "info", "Purchase order created for review.", email_id, source_attachment["id"] if source_attachment else None, {"po_id": po_id})
     return 1
+
+
+def log_document_extraction_run(
+    conn: sqlite3.Connection,
+    *,
+    email_id: int | None = None,
+    attachment_id: int | None = None,
+    purchase_order_id: int | None = None,
+    test_document_id: int | None = None,
+    raw_input_text: str = "",
+    extraction: dict[str, Any] | None = None,
+    latency_ms: int | None = None,
+    success: bool = True,
+    error_message: str | None = None,
+) -> int:
+    extraction = extraction or {}
+    parsed = {key: value for key, value in extraction.items() if not key.startswith("_")}
+    cur = conn.execute(
+        """
+        INSERT INTO document_extraction_runs (
+            email_id, attachment_id, purchase_order_id, test_document_id, extraction_method,
+            model_name, prompt_version, raw_input_text, raw_output_json, parsed_output_json,
+            success, error_message, latency_ms
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            email_id,
+            attachment_id,
+            purchase_order_id,
+            test_document_id,
+            extraction.get("_extraction_method") or "rule_based",
+            extraction.get("_model_name"),
+            extraction.get("_prompt_version"),
+            raw_input_text,
+            extraction.get("_raw_output_json"),
+            json.dumps(parsed),
+            1 if success else 0,
+            error_message or extraction.get("_error_message"),
+            latency_ms,
+        ),
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def link_extraction_run(conn: sqlite3.Connection, run_id: int | None, po_id: int) -> None:
+    if not run_id:
+        return
+    conn.execute("UPDATE document_extraction_runs SET purchase_order_id = ? WHERE id = ?", (po_id, run_id))
+    conn.commit()
+
+
+def elapsed_ms(started: float) -> int:
+    return int((time.perf_counter() - started) * 1000)
 
 
 def insert_purchase_order(conn: sqlite3.Connection, email_id: int, attachment_id: int | None, data: dict[str, Any]) -> int:
@@ -241,6 +319,66 @@ def find_duplicate_purchase_order(conn: sqlite3.Connection, data: dict[str, Any]
                 return row
         return None
     return rows[0]
+
+
+def find_similar_extraction_examples(
+    conn: sqlite3.Connection,
+    customer_company_name: str | None,
+    source_text: str | None,
+    limit: int = 3,
+) -> list[dict[str, Any]]:
+    customer = (customer_company_name or "").strip().lower()
+    rows = conn.execute(
+        """
+        SELECT po.id, po.customer_company_name, po.po_number, po.source_attachment_filename,
+               po.extraction_notes, po.updated_at
+        FROM purchase_orders po
+        WHERE po.extraction_feedback_count > 0 OR po.extraction_reviewed_at IS NOT NULL
+        ORDER BY
+            CASE WHEN LOWER(TRIM(COALESCE(po.customer_company_name, ''))) = ? THEN 0 ELSE 1 END,
+            po.updated_at DESC
+        LIMIT ?
+        """,
+        (customer, limit),
+    ).fetchall()
+    examples = []
+    for row in rows:
+        feedback = conn.execute(
+            """
+            SELECT entity_type, field_name, extracted_value, corrected_value, confidence
+            FROM extraction_feedback
+            WHERE purchase_order_id = ?
+            ORDER BY created_at DESC LIMIT 20
+            """,
+            (row["id"],),
+        ).fetchall()
+        header = conn.execute(
+            """
+            SELECT customer_company_name, customer_contact_name, bill_to_address, ship_to_address,
+                   po_number, po_revision, quote_number, payment_terms, freight_terms, total_value, currency
+            FROM purchase_orders WHERE id = ?
+            """,
+            (row["id"],),
+        ).fetchone()
+        lines = conn.execute(
+            """
+            SELECT line_number, customer_part_number, internal_part_number, description, quantity,
+                   unit_of_measure, unit_price, line_total, requested_date
+            FROM purchase_order_lines WHERE purchase_order_id = ? ORDER BY id LIMIT 5
+            """,
+            (row["id"],),
+        ).fetchall()
+        examples.append(
+            {
+                "customer_company_name": row["customer_company_name"],
+                "source_attachment_filename": row["source_attachment_filename"],
+                "corrected_header_fields": dict(header) if header else {},
+                "corrected_line_examples": [dict(line) for line in lines],
+                "feedback_rows": [dict(item) for item in feedback],
+                "extraction_notes": row["extraction_notes"],
+            }
+        )
+    return examples
 
 
 def insert_po_line(conn: sqlite3.Connection, purchase_order_id: int, po_number: str | None, line: dict[str, Any]) -> int:

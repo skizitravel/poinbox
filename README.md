@@ -160,7 +160,11 @@ Use the **Golden** button on a corpus row to enter the expected PO header and li
 
 ### Extraction Evaluation
 
-Click **Run Evaluation** to process the corpus without adding records to the main PO Dashboard. The evaluation compares detected/extracted values against golden answers and reports:
+Click **Run Evaluation** to process the corpus without adding records to the main PO Dashboard. Choose an extraction mode before running:
+
+- **Rule Based** - deterministic parser baseline
+- **AI Text** - OpenAI text extraction when configured
+- **AI With Prior Examples** - OpenAI extraction with reviewed corrections from similar prior POs included as guidance
 
 - true positives, false positives, true negatives, and false negatives
 - field match rate
@@ -171,6 +175,43 @@ Click **Run Evaluation** to process the corpus without adding records to the mai
 String comparisons are normalized for case and whitespace. Dates are normalized to `YYYY-MM-DD`, and numeric values are compared with a small tolerance.
 
 This harness is intended to help you grow from a handful of examples to a 30-100 document test set and track extraction quality over time.
+
+### Extraction Learning
+
+The app now records an extraction learning loop:
+
+- every extraction attempt is logged in `document_extraction_runs`
+- raw input text, parsed output, extraction method, model name, prompt version, errors, and latency are stored for local testing
+- when a user edits a PO header or PO line, changed fields are captured in `extraction_feedback`
+- feedback stores the extracted value, corrected value, field confidence, customer, source attachment, and reviewing user when available
+- PO detail shows the feedback count and reviewed status
+- **Mark Extraction Reviewed** records that a human has finished reviewing the extraction
+
+Admin > Testing includes an **Extraction Learning** dashboard with extraction run counts, failures, most-corrected fields, corrections by customer, and recent feedback rows.
+
+When AI extraction is enabled, the extractor can retrieve recent reviewed/corrected examples and include them in the prompt as layout guidance. Prior examples are not treated as source data: the prompt instructs the model to prefer the current document, never copy PO numbers/prices/dates from examples, and return `null` when a value is missing.
+
+To enable AI extraction, set these in `.env.local`:
+
+```text
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-4.1-mini
+USE_OPENAI_EXTRACTION=1
+```
+
+Recommended workflow for your first 35 PDFs:
+
+1. Upload the PDFs to **Admin > Testing > PO Test Corpus**.
+2. Enter golden answers for a representative subset first, such as 5-10 documents.
+3. Run **Rule Based** evaluation to establish a baseline.
+4. Enable AI extraction and run **AI Text** evaluation.
+5. Import/process the same kinds of POs into the dashboard.
+6. Correct extracted fields and line items in PO detail.
+7. Click **Mark Extraction Reviewed** after each corrected PO.
+8. Run **AI With Prior Examples** evaluation and compare the accuracy trend.
+9. Expand the golden-answer set until the corpus reflects the real customer mix.
+
+Scanned/image-only PDFs still need OCR or vision extraction. If PDF text extraction returns little or no text, the test harness marks the document as needing OCR instead of crashing. The placeholder `extract_pdf_with_vision_or_ocr()` is intentionally not wired to a production OCR provider yet.
 
 ## Gmail Inbox Testing
 

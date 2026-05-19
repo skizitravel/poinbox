@@ -11,6 +11,9 @@ from typing import Any
 from server.config import OPENAI_MODEL, USE_OPENAI_EXTRACTION
 
 
+PO_EXTRACTION_PROMPT_VERSION = "po-extraction-v2-feedback"
+
+
 PO_KEYWORDS = [
     "purchase order",
     "po number",
@@ -51,16 +54,29 @@ def classify_purchase_order(subject: str, body: str, attachment_text: str, filen
     return Classification(label, round(score, 2), explanation)
 
 
-def extract_purchase_order(text: str, email: dict[str, Any], attachment_filename: str | None) -> dict[str, Any]:
-    if USE_OPENAI_EXTRACTION and os.getenv("OPENAI_API_KEY"):
+def extract_purchase_order(
+    text: str,
+    email: dict[str, Any],
+    attachment_filename: str | None,
+    mode: str | None = None,
+    prior_examples: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    requested_mode = mode or ("ai_text" if USE_OPENAI_EXTRACTION else "rule_based")
+    use_ai = requested_mode in {"ai_text", "ai_with_examples"} or (requested_mode is None and USE_OPENAI_EXTRACTION)
+    if use_ai and os.getenv("OPENAI_API_KEY"):
         try:
-            return extract_with_openai(text, email, attachment_filename)
+            return extract_with_openai(text, email, attachment_filename, prior_examples if requested_mode == "ai_with_examples" else None)
         except Exception as exc:
             fallback = extract_with_rules(text, email, attachment_filename)
             fallback["extraction_notes"] = f"OpenAI extraction failed; used rule fallback. {exc}"
             fallback["extraction_confidence"] = min(fallback["extraction_confidence"], 0.55)
+            fallback["_extraction_method"] = "fallback_rule_based"
+            fallback["_error_message"] = str(exc)
             return fallback
-    return extract_with_rules(text, email, attachment_filename)
+    extraction = extract_with_rules(text, email, attachment_filename)
+    extraction["_extraction_method"] = "rule_based"
+    extraction["_prompt_version"] = PO_EXTRACTION_PROMPT_VERSION
+    return extraction
 
 
 def extract_with_rules(text: str, email: dict[str, Any], attachment_filename: str | None) -> dict[str, Any]:
@@ -196,9 +212,20 @@ def parse_line_items(lines: list[str], po_number: str | None) -> list[dict[str, 
     return items
 
 
-def extract_with_openai(text: str, email: dict[str, Any], attachment_filename: str | None) -> dict[str, Any]:
+def extract_with_openai(
+    text: str,
+    email: dict[str, Any],
+    attachment_filename: str | None,
+    prior_examples: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     prompt = {
         "task": "Extract customer purchase order data. Return only JSON. Use null for missing values. Do not invent data.",
+        "prompt_version": PO_EXTRACTION_PROMPT_VERSION,
+        "prior_corrected_examples_instruction": (
+            "Use prior examples only as layout and labeling guidance. Do not copy PO numbers, quantities, prices, dates, "
+            "or customer-specific values unless they are present in the current document. Prefer current document evidence."
+        ),
+        "prior_corrected_examples": prior_examples or [],
         "schema": {
             "customer_company_name": None,
             "customer_contact_name": None,
@@ -263,6 +290,11 @@ def extract_with_openai(text: str, email: dict[str, Any], attachment_filename: s
     content = data["output"][0]["content"][0]["text"]
     parsed = json.loads(content)
     validate_extraction(parsed)
+    parsed["_extraction_method"] = "ai_with_examples" if prior_examples else "ai_text"
+    parsed["_model_name"] = OPENAI_MODEL
+    parsed["_prompt_version"] = PO_EXTRACTION_PROMPT_VERSION
+    parsed["_raw_output_json"] = content
+    parsed["_prior_examples_used"] = bool(prior_examples)
     return parsed
 
 

@@ -14,6 +14,7 @@ let inboxDetectionResults = [];
 let gmailConfig = {};
 let currentInboxConfig = null;
 let configuringInboxId = null;
+let extractionLearning = { summary: {}, recent_feedback: [], recent_failures: [], corrected_fields: [], corrections_by_customer: [] };
 let currentUser = null;
 let activeAdminTab = "users";
 let editingUserId = null;
@@ -164,6 +165,7 @@ function renderDetail() {
   const source = currentDetail.attachment?.extracted_text || currentDetail.email?.body_text || "";
   const editActions = canEditDashboard()
     ? `<button class="secondary" onclick="savePO()">Save Header</button>
+      <button class="secondary" onclick="markExtractionReviewed()">Mark Extraction Reviewed</button>
       <button onclick="quickStatus('Booked')">Mark Booked</button>
       <button class="danger" onclick="quickStatus('Rejected')">Reject</button>`
     : '<span class="view-only-note">View Only</span>';
@@ -177,6 +179,7 @@ function renderDetail() {
       <div class="detail-status">${!canEditDashboard() ? '<span class="badge ViewOnly">View Only</span>' : ""}${badge(po.status)}</div>
     </div>
     <div class="grid">${headerFields.map((field) => renderField(po, field, "po")).join("")}</div>
+    <div class="muted-panel">Corrections captured for learning: ${po.extraction_feedback_count || 0}. Reviewed: ${po.extraction_reviewed_at ? safe(po.extraction_reviewed_at) : "Not reviewed"}.</div>
     <div class="line-actions">
       ${renderViewPoButton()}
       ${editActions}
@@ -410,6 +413,12 @@ async function savePO() {
   await refresh();
 }
 
+async function markExtractionReviewed() {
+  if (!canEditDashboard()) return;
+  await api(`/api/purchase-orders/${selectedId}/mark-reviewed`, { method: "PUT", body: "{}" });
+  await refresh();
+}
+
 async function quickStatus(status) {
   if (!canEditDashboard()) return;
   await api(`/api/purchase-orders/${selectedId}`, { method: "PUT", body: JSON.stringify({ status }) });
@@ -569,12 +578,13 @@ function renderDepartments() {
 
 async function loadTestingData() {
   if (!canViewAdmin()) return;
-  const [documentsData, evaluationsData, inboxData, gmailData, detectionData] = await Promise.all([
+  const [documentsData, evaluationsData, inboxData, gmailData, detectionData, learningData] = await Promise.all([
     api("/api/testing/documents"),
     api("/api/testing/evaluations"),
     api("/api/inbox-accounts"),
     api("/api/gmail-oauth-config"),
     api("/api/inbox-detection-results"),
+    api("/api/extraction-learning"),
   ]);
   testDocuments = documentsData.documents || [];
   evaluationData = evaluationsData.latest || { run: null, results: [] };
@@ -582,12 +592,14 @@ async function loadTestingData() {
   inboxSyncRuns = inboxData.sync_runs || [];
   gmailConfig = gmailData || {};
   inboxDetectionResults = detectionData.results || [];
+  extractionLearning = learningData || extractionLearning;
   renderTestDocuments();
   renderEvaluation();
   renderGmailConfig();
   renderInboxAccounts(inboxData.gmail_configured);
   renderSyncRuns();
   renderDetectionResults();
+  renderExtractionLearning();
 }
 
 function renderTestDocuments() {
@@ -660,6 +672,7 @@ function renderEvaluation() {
   document.querySelector("#evaluationSummary").innerHTML = run
     ? `
       ${metric("Docs", run.document_count)}
+      ${metric("Mode", safe(run.extraction_mode || "rule_based"))}
       ${metric("TP", run.true_positives)}
       ${metric("FP", run.false_positives)}
       ${metric("TN", run.true_negatives)}
@@ -710,11 +723,67 @@ function lineRateText(lines) {
 
 async function runEvaluation() {
   setMessage("#testingMessage", "Running extraction evaluation...");
-  const data = await api("/api/testing/evaluations/run", { method: "POST", body: JSON.stringify({}) });
+  const data = await api("/api/testing/evaluations/run", { method: "POST", body: JSON.stringify({ extraction_mode: document.querySelector("#evaluationMode").value }) });
+  if (data.error) {
+    setMessage("#testingMessage", data.error, "error");
+    return;
+  }
   evaluationData = data;
   setMessage("#testingMessage", "Evaluation complete.", "success");
   renderEvaluation();
   await loadTestingData();
+}
+
+async function loadExtractionLearning() {
+  const customer = encodeURIComponent(document.querySelector("#learningCustomerFilter").value.trim());
+  const field = encodeURIComponent(document.querySelector("#learningFieldFilter").value.trim());
+  extractionLearning = await api(`/api/extraction-learning?customer=${customer}&field=${field}`);
+  renderExtractionLearning();
+}
+
+function renderExtractionLearning() {
+  const summary = extractionLearning.summary || {};
+  document.querySelector("#learningSummary").innerHTML = `
+    ${metric("Runs", summary.total_runs || 0)}
+    ${metric("Successful", summary.successful_runs || 0)}
+    ${metric("Failed", summary.failed_runs || 0)}
+    ${metric("Corrections", summary.total_feedback || 0)}
+  `;
+  document.querySelector("#learningFieldRows").innerHTML = miniList(extractionLearning.corrected_fields || [], "field_name");
+  document.querySelector("#learningCustomerRows").innerHTML = miniList(extractionLearning.corrections_by_customer || [], "customer_company_name");
+  document.querySelector("#learningFeedbackRows").innerHTML = (extractionLearning.recent_feedback || [])
+    .map(
+      (row) => `
+      <tr>
+        <td>${safe(row.created_at)}</td>
+        <td>${safe(row.customer_company_name)}</td>
+        <td>${safe(row.po_number)}</td>
+        <td>${safe(row.field_name)}</td>
+        <td>${safe(row.extracted_value)}</td>
+        <td>${safe(row.corrected_value)}</td>
+        <td>${safe(row.user_email)}</td>
+        <td>${safe(row.source_attachment_filename)}</td>
+      </tr>
+    `,
+    )
+    .join("");
+  document.querySelector("#learningFailureRows").innerHTML = (extractionLearning.recent_failures || [])
+    .map(
+      (row) => `
+      <tr>
+        <td>${safe(row.created_at)}</td>
+        <td>${safe(row.extraction_method)}</td>
+        <td>${safe(row.model_name)}</td>
+        <td>${safe(row.error_message)}</td>
+      </tr>
+    `,
+    )
+    .join("");
+}
+
+function miniList(rows, labelKey) {
+  if (!rows.length) return '<div class="muted-panel">No data yet.</div>';
+  return rows.map((row) => `<span class="mini-pill">${safe(row[labelKey])}: ${row.count}</span>`).join("");
 }
 
 function renderInboxAccounts(gmailConfigured = false) {
@@ -1939,6 +2008,7 @@ document.querySelector("#deleteContactModalBtn").addEventListener("click", delet
 document.querySelector("#testDocUploadBtn").addEventListener("click", () => document.querySelector("#testDocInput").click());
 document.querySelector("#testDocInput").addEventListener("change", (event) => uploadTestDocuments(event.target.files));
 document.querySelector("#runEvaluationBtn").addEventListener("click", runEvaluation);
+document.querySelector("#refreshLearningBtn").addEventListener("click", loadExtractionLearning);
 document.querySelector("#addInboxAccountBtn").addEventListener("click", addInboxAccount);
 document.querySelector("#connectGmailBtn").addEventListener("click", connectGmail);
 document.querySelector("#saveGmailConfigBtn").addEventListener("click", saveGmailConfig);

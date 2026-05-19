@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import uuid
@@ -38,7 +39,16 @@ from server.config import (
 )
 from server.db import connect, initialize, row_to_dict, rows_to_dicts
 from server.connectors import IncomingAttachment, IncomingEmail
-from server.processing import extract_pdf_text, import_samples, insert_attachment, insert_email, process_email, recalculate_po_total
+from server.processing import (
+    extract_pdf_text,
+    find_similar_extraction_examples,
+    import_samples,
+    insert_attachment,
+    insert_email,
+    log_document_extraction_run,
+    process_email,
+    recalculate_po_total,
+)
 from server.extraction import classify_purchase_order, extract_purchase_order, normalize_date
 from server.master_data import format_structured_address, list_reviews, parse_structured_address, resolve_review, run_master_data_reviews
 
@@ -126,6 +136,10 @@ class AppHandler(SimpleHTTPRequestHandler):
             if not self.require_permission("admin:view"):
                 return
             return self.respond_json(list_inbox_detection_results())
+        if parsed.path == "/api/extraction-learning":
+            if not self.require_permission("admin:view"):
+                return
+            return self.respond_json(extraction_learning_dashboard(params))
         if parsed.path == "/api/oauth/gmail/callback":
             body, status = gmail_oauth_callback(parsed.query)
             return self.respond_html(body, status)
@@ -336,15 +350,23 @@ class AppHandler(SimpleHTTPRequestHandler):
             account_id = int(parsed.path.rsplit("/", 1)[-1])
             return self.respond_json(update_inbox_account(account_id, self.read_json()))
         if parsed.path.startswith("/api/purchase-orders/") and "/lines/" in parsed.path:
-            if not self.require_permission("po_dashboard:edit"):
+            actor = self.require_permission("po_dashboard:edit")
+            if not actor:
                 return
             line_id = int(parsed.path.rsplit("/", 1)[-1])
-            return self.respond_json(update_line(line_id, self.read_json()))
+            return self.respond_json(update_line(line_id, self.read_json(), actor))
+        if parsed.path.startswith("/api/purchase-orders/") and parsed.path.endswith("/mark-reviewed"):
+            actor = self.require_permission("po_dashboard:edit")
+            if not actor:
+                return
+            po_id = int(parsed.path.split("/")[-2])
+            return self.respond_json(mark_extraction_reviewed(po_id, actor))
         if parsed.path.startswith("/api/purchase-orders/"):
-            if not self.require_permission("po_dashboard:edit"):
+            actor = self.require_permission("po_dashboard:edit")
+            if not actor:
                 return
             po_id = int(parsed.path.rsplit("/", 1)[-1])
-            return self.respond_json(update_purchase_order(po_id, self.read_json()))
+            return self.respond_json(update_purchase_order(po_id, self.read_json(), actor))
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_DELETE(self) -> None:
@@ -1097,7 +1119,7 @@ def source_display(po: dict, email: dict | None = None) -> str:
     return "Unknown"
 
 
-def update_purchase_order(po_id: int, payload: dict) -> dict:
+def update_purchase_order(po_id: int, payload: dict, actor: dict | None = None) -> dict:
     allowed = [
         "status",
         "customer_company_name",
@@ -1119,6 +1141,7 @@ def update_purchase_order(po_id: int, payload: dict) -> dict:
         payload["date_received"] = normalize_date(payload.get("date_received"))
     if "request_date" in payload:
         payload["request_date"] = normalize_date(payload.get("request_date"))
+    capture_feedback_before_update("purchase_orders", po_id, "header", po_id, payload, allowed, actor)
     update_fields("purchase_orders", po_id, payload, allowed)
     if "bill_to_address" in payload or "ship_to_address" in payload:
         with db() as conn:
@@ -1172,7 +1195,7 @@ def add_line(po_id: int, payload: dict) -> dict:
     return get_purchase_order(po_id)
 
 
-def update_line(line_id: int, payload: dict) -> dict:
+def update_line(line_id: int, payload: dict, actor: dict | None = None) -> dict:
     allowed = [
         "line_number",
         "customer_part_number",
@@ -1187,6 +1210,7 @@ def update_line(line_id: int, payload: dict) -> dict:
     payload.pop("line_total", None)
     if "requested_date" in payload:
         payload["requested_date"] = normalize_date(payload.get("requested_date"))
+    capture_feedback_before_update("purchase_order_lines", line_id, "line", line_id, payload, allowed, actor)
     update_fields("purchase_order_lines", line_id, payload, allowed)
     mark_fields_reviewed("purchase_order_lines", line_id, payload.keys())
     with db() as conn:
@@ -1195,6 +1219,129 @@ def update_line(line_id: int, payload: dict) -> dict:
         calculated = line_total_from_payload(dict(row))
         conn.execute("UPDATE purchase_order_lines SET line_total = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (calculated, line_id))
         recalculate_po_total(conn, po_id)
+    return get_purchase_order(po_id)
+
+
+def capture_feedback_before_update(
+    table: str,
+    row_id: int,
+    entity_type: str,
+    entity_id: int,
+    payload: dict,
+    allowed: list[str],
+    actor: dict | None,
+) -> None:
+    fields = [field for field in allowed if field in payload and field not in {"extraction_notes", "status"}]
+    if not fields:
+        return
+    try:
+        with db() as conn:
+            current = row_to_dict(conn.execute(f"SELECT * FROM {table} WHERE id = ?", (row_id,)).fetchone())
+            if not current:
+                return
+            po_id = row_id if table == "purchase_orders" else current["purchase_order_id"]
+            po = row_to_dict(
+                conn.execute(
+                    """
+                    SELECT po.*, a.extracted_text
+                    FROM purchase_orders po
+                    LEFT JOIN attachments a ON a.id = po.attachment_id
+                    WHERE po.id = ?
+                    """,
+                    (po_id,),
+                ).fetchone()
+            )
+            confidence_map = parse_json_dict(current.get("field_confidence_json"))
+            inserted = 0
+            for field in fields:
+                old_value = current.get(field)
+                new_value = payload.get(field)
+                if normalize_feedback_value(old_value) == normalize_feedback_value(new_value):
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO extraction_feedback (
+                        purchase_order_id, entity_type, entity_id, field_name, extracted_value,
+                        corrected_value, confidence, source_text_snippet, customer_company_name,
+                        source_attachment_filename, created_by_user_id
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        po_id,
+                        entity_type,
+                        entity_id,
+                        field,
+                        "" if old_value is None else str(old_value),
+                        "" if new_value is None else str(new_value),
+                        confidence_map.get(field),
+                        source_snippet(po.get("extracted_text") if po else "", old_value),
+                        po.get("customer_company_name") if po else None,
+                        po.get("source_attachment_filename") if po else None,
+                        actor.get("id") if actor else None,
+                    ),
+                )
+                inserted += 1
+            if inserted:
+                conn.execute(
+                    """
+                    UPDATE purchase_orders
+                    SET extraction_feedback_count = (
+                        SELECT COUNT(*) FROM extraction_feedback WHERE purchase_order_id = ?
+                    ), updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (po_id, po_id),
+                )
+            conn.commit()
+    except Exception as exc:
+        with db() as conn:
+            conn.execute(
+                "INSERT INTO processing_logs (level, message, metadata_json) VALUES ('error', ?, ?)",
+                ("Extraction feedback logging failed.", json.dumps({"error": str(exc), "table": table, "row_id": row_id})),
+            )
+            conn.commit()
+
+
+def normalize_feedback_value(value: object) -> str:
+    return "" if value is None else str(value).strip()
+
+
+def source_snippet(text: str | None, value: object) -> str | None:
+    source = text or ""
+    needle = normalize_feedback_value(value)
+    if not source:
+        return None
+    if needle:
+        index = source.lower().find(needle.lower())
+        if index >= 0:
+            return source[max(0, index - 160) : index + len(needle) + 160]
+    return source[:320]
+
+
+def parse_json_dict(value: str | None) -> dict:
+    try:
+        parsed = json.loads(value or "{}")
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def mark_extraction_reviewed(po_id: int, actor: dict) -> dict:
+    with db() as conn:
+        conn.execute(
+            """
+            UPDATE purchase_orders
+            SET extraction_reviewed_at = ?, extraction_reviewed_by_user_id = ?,
+                extraction_feedback_count = (
+                    SELECT COUNT(*) FROM extraction_feedback WHERE purchase_order_id = ?
+                ),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (now_iso(), actor.get("id"), po_id, po_id),
+        )
+        conn.commit()
     return get_purchase_order(po_id)
 
 
@@ -1623,14 +1770,20 @@ LINE_COMPARE_FIELDS = [
 def run_extraction_evaluation(payload: dict) -> dict:
     started = now_iso()
     run_name = (payload.get("run_name") or f"Evaluation {started}").strip()
+    mode = payload.get("extraction_mode") if payload.get("extraction_mode") in {"rule_based", "ai_text", "ai_with_examples"} else "rule_based"
+    if mode in {"ai_text", "ai_with_examples"} and not os.getenv("OPENAI_API_KEY"):
+        return {"error": "AI extraction is not configured. Add OPENAI_API_KEY before running this mode.", **list_evaluation_runs()}
     with db() as conn:
-        cur = conn.execute("INSERT INTO extraction_evaluation_runs (run_name, started_at, notes) VALUES (?, ?, ?)", (run_name, started, ""))
+        cur = conn.execute(
+            "INSERT INTO extraction_evaluation_runs (run_name, extraction_mode, started_at, notes) VALUES (?, ?, ?, ?)",
+            (run_name, mode, started, ""),
+        )
         run_id = int(cur.lastrowid)
         documents = rows_to_dicts(conn.execute("SELECT * FROM test_documents ORDER BY id").fetchall())
         conn.commit()
     totals = {"tp": 0, "fp": 0, "tn": 0, "fn": 0, "field_rates": [], "line_rates": [], "confidences": []}
     for document in documents:
-        result = evaluate_document(document, run_id)
+        result = evaluate_document(document, run_id, mode)
         totals[result["bucket"]] += 1
         if result["field_match_rate"] is not None:
             totals["field_rates"].append(result["field_match_rate"])
@@ -1689,7 +1842,7 @@ def run_extraction_evaluation(payload: dict) -> dict:
     return get_evaluation_run(run_id)
 
 
-def evaluate_document(document: dict, run_id: int) -> dict:
+def evaluate_document(document: dict, run_id: int, mode: str = "rule_based") -> dict:
     start = time.perf_counter()
     text, method = test_document_text(document)
     email = {
@@ -1704,7 +1857,18 @@ def evaluate_document(document: dict, run_id: int) -> dict:
     classification = classify_purchase_order(email["subject"], email["body_text"], "" if method == "body" else text, [document["filename"]])
     extraction = {}
     if classification.label in {"possible_po", "purchase_order"}:
-        extraction = extract_purchase_order(text, email, document["filename"])
+        with db() as conn:
+            examples = find_similar_extraction_examples(conn, None, text) if mode == "ai_with_examples" else []
+        extraction = extract_purchase_order(text, email, document["filename"], mode, examples)
+        with db() as conn:
+            log_document_extraction_run(
+                conn,
+                test_document_id=document["id"],
+                raw_input_text=text,
+                extraction=extraction,
+                latency_ms=int((time.perf_counter() - start) * 1000),
+                success=True,
+            )
     with db() as conn:
         golden = row_to_dict(conn.execute("SELECT * FROM golden_po_headers WHERE test_document_id = ?", (document["id"],)).fetchone())
         golden_lines = []
@@ -1739,6 +1903,8 @@ def test_document_text(document: dict) -> tuple[str, str]:
     suffix = path.suffix.lower()
     if suffix == ".pdf":
         text, _pages = extract_pdf_text(path)
+        if len(text.strip()) < 50:
+            return text, "needs_ocr"
         return text, "pdf_text"
     if suffix in {".txt", ".eml", ".csv"}:
         return path.read_text(encoding="utf-8", errors="replace"), "body"
@@ -1817,6 +1983,91 @@ def list_evaluation_runs() -> dict:
         runs = rows_to_dicts(conn.execute("SELECT * FROM extraction_evaluation_runs ORDER BY created_at DESC LIMIT 20").fetchall())
         latest = get_evaluation_run(runs[0]["id"]) if runs else {"run": None, "results": []}
     return {"runs": runs, "latest": latest}
+
+
+def extraction_learning_dashboard(params: dict[str, list[str]]) -> dict:
+    customer_filter = (params.get("customer", [""])[0] or "").strip().lower()
+    field_filter = (params.get("field", [""])[0] or "").strip().lower()
+    clauses = []
+    args: list[object] = []
+    if customer_filter:
+        clauses.append("LOWER(COALESCE(ef.customer_company_name, '')) LIKE ?")
+        args.append(f"%{customer_filter}%")
+    if field_filter:
+        clauses.append("LOWER(ef.field_name) LIKE ?")
+        args.append(f"%{field_filter}%")
+    where = "WHERE " + " AND ".join(clauses) if clauses else ""
+    with db() as conn:
+        run_counts = row_to_dict(
+            conn.execute(
+                """
+                SELECT COUNT(*) AS total_runs,
+                       SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS successful_runs,
+                       SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failed_runs
+                FROM document_extraction_runs
+                """
+            ).fetchone()
+        )
+        total_feedback = conn.execute("SELECT COUNT(*) AS count FROM extraction_feedback").fetchone()["count"]
+        corrected_fields = rows_to_dicts(
+            conn.execute(
+                """
+                SELECT field_name, COUNT(*) AS count
+                FROM extraction_feedback
+                GROUP BY field_name
+                ORDER BY count DESC, field_name
+                LIMIT 10
+                """
+            ).fetchall()
+        )
+        corrections_by_customer = rows_to_dicts(
+            conn.execute(
+                """
+                SELECT COALESCE(customer_company_name, 'Unknown') AS customer_company_name, COUNT(*) AS count
+                FROM extraction_feedback
+                GROUP BY COALESCE(customer_company_name, 'Unknown')
+                ORDER BY count DESC
+                LIMIT 10
+                """
+            ).fetchall()
+        )
+        failures = rows_to_dicts(
+            conn.execute(
+                """
+                SELECT *
+                FROM document_extraction_runs
+                WHERE success = 0 OR COALESCE(error_message, '') != ''
+                ORDER BY created_at DESC
+                LIMIT 10
+                """
+            ).fetchall()
+        )
+        feedback = rows_to_dicts(
+            conn.execute(
+                f"""
+                SELECT ef.*, po.po_number, u.email AS user_email
+                FROM extraction_feedback ef
+                LEFT JOIN purchase_orders po ON po.id = ef.purchase_order_id
+                LEFT JOIN users u ON u.id = ef.created_by_user_id
+                {where}
+                ORDER BY ef.created_at DESC
+                LIMIT 50
+                """,
+                args,
+            ).fetchall()
+        )
+    return {
+        "summary": {
+            "total_runs": run_counts.get("total_runs") or 0,
+            "successful_runs": run_counts.get("successful_runs") or 0,
+            "failed_runs": run_counts.get("failed_runs") or 0,
+            "total_feedback": total_feedback,
+        },
+        "corrected_fields": corrected_fields,
+        "corrections_by_customer": corrections_by_customer,
+        "recent_failures": failures,
+        "recent_feedback": feedback,
+    }
 
 
 def get_evaluation_run(run_id: int) -> dict:
