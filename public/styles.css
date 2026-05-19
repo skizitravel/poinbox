@@ -317,6 +317,12 @@ tbody tr.active {
   gap: 10px;
 }
 
+.address-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
 .field {
   display: flex;
   flex-direction: column;
@@ -378,6 +384,19 @@ tbody tr.active {
   margin: 16px 0 8px;
   color: #2d3b4f;
   font-weight: 700;
+}
+
+.inline-master-action {
+  align-items: center;
+  background: #fff7ed;
+  border: 1px solid #fed7aa;
+  border-radius: 6px;
+  color: #7c2d12;
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+  margin: 6px 0 10px;
+  padding: 7px 9px;
 }
 
 .line-card {
@@ -842,6 +861,10 @@ tbody tr.active {
   }
 
   .modal-subgrid {
+    grid-template-columns: 1fr;
+  }
+
+  .address-grid {
     grid-template-columns: 1fr;
   }
 

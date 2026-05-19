@@ -41,15 +41,15 @@ const headerFields = [
   ["freight_terms", "Freight Terms"],
   ["total_value", "Total Value", "readonly"],
   ["currency", "Currency"],
-  ["bill_to_address", "Bill To Address", "textarea", "wide"],
-  ["ship_to_address", "Ship To Address", "textarea", "wide"],
   ["extraction_notes", "Extraction Notes", "textarea", "wide"],
 ];
 
 const lineFields = [
   ["line_number", "Line"],
   ["customer_part_number", "Customer Part #"],
+  ["customer_part_revision", "Customer Part Rev"],
   ["internal_part_number", "Internal Part #"],
+  ["internal_part_revision", "Internal Part Rev"],
   ["description", "Description"],
   ["quantity", "Qty", "number"],
   ["unit_of_measure", "UOM"],
@@ -58,6 +58,18 @@ const lineFields = [
   ["requested_date", "Requested Date", "date"],
   ["extraction_notes", "Notes"],
 ];
+
+const openAIModelOptions = ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini", "gpt-4o"];
+const addressKeys = ["address_line_1", "address_line_2", "address_line_3", "city", "state", "country", "zip_code"];
+const addressLabels = {
+  address_line_1: "Line 1",
+  address_line_2: "Line 2",
+  address_line_3: "Line 3",
+  city: "City",
+  state: "State",
+  country: "Country",
+  zip_code: "Zip Code",
+};
 
 async function api(path, options = {}) {
   const { skipAuthRedirect = false, ...fetchOptions } = options;
@@ -180,6 +192,9 @@ function renderDetail() {
       <div class="detail-status">${!canEditDashboard() ? '<span class="badge ViewOnly">View Only</span>' : ""}${badge(po.status)}</div>
     </div>
     <div class="grid">${headerFields.map((field) => renderField(po, field, "po")).join("")}</div>
+    ${renderInlineMasterDataAction("customer")}
+    ${renderStructuredAddressSection("bill_to", "Bill-To Address", "bill_to_address_structured_json", "bill_to_address")}
+    ${renderStructuredAddressSection("ship_to", "Ship-To Address", "ship_to_address_structured_json", "ship_to_address")}
     <div class="muted-panel">Corrections captured for learning: ${po.extraction_feedback_count || 0}. Reviewed: ${po.extraction_reviewed_at ? safe(po.extraction_reviewed_at) : "Not reviewed"}.</div>
     <div class="line-actions">
       ${renderViewPoButton()}
@@ -240,6 +255,61 @@ function renderReadonlyField(record, key, label, size, review, reviewNote) {
   return `<div class="field ${size} ${review}"><label>${label}</label><div class="readonly-value">${value}</div>${reviewNote}</div>`;
 }
 
+function renderStructuredAddressSection(prefix, title, jsonKey, textKey) {
+  const po = currentDetail.purchase_order;
+  const structured = structuredAddressFor(po, jsonKey, textKey);
+  return `
+    <div class="section-title">${title}</div>
+    <div class="address-grid">
+      ${addressKeys
+        .map((key) => {
+          const id = `po_${prefix}_${key}`;
+          if (!canEditDashboard()) {
+            return `<div class="field"><label>${addressLabels[key]}</label><div class="readonly-value">${safe(structured[key])}</div></div>`;
+          }
+          return `<div class="field"><label>${addressLabels[key]}</label><input id="${id}" value="${safe(structured[key])}" /></div>`;
+        })
+        .join("")}
+    </div>
+    ${renderInlineMasterDataAction(`${prefix}_address`)}
+  `;
+}
+
+function structuredAddressFor(po, jsonKey, textKey) {
+  const parsed = parseJson(po[jsonKey]);
+  const structured = {};
+  for (const key of addressKeys) structured[key] = parsed[key] || "";
+  if (!Object.values(structured).some(Boolean) && po[textKey]) {
+    structured.address_line_1 = po[textKey] || "";
+  }
+  return structured;
+}
+
+function readStructuredAddress(prefix) {
+  const output = {};
+  for (const key of addressKeys) {
+    output[key] = document.querySelector(`#po_${prefix}_${key}`)?.value.trim() || "";
+  }
+  return output;
+}
+
+function renderInlineMasterDataAction(type) {
+  const reviewType = type === "bill_to_address" ? "bill_to_address" : type === "ship_to_address" ? "ship_to_address" : type;
+  const review = (currentDetail.master_data_reviews || []).find((item) => item.review_type === reviewType && item.status === "open");
+  if (!review) return "";
+  const action = reviewActionLabel(review.review_type);
+  const blocked = actionBlockedByMissingCustomer(review);
+  const canAct = canViewAdmin() && !blocked;
+  return `
+    <div class="inline-master-action">
+      <span>${safe(review.message)}</span>
+      ${canAct ? `<button class="secondary table-action" onclick="startMasterDataReviewAction(${review.id})">${action}</button>` : ""}
+      ${!canViewAdmin() ? '<span class="view-only-note">Master data review needed</span>' : ""}
+      ${blocked ? '<span class="review-note">Add Customer first</span>' : ""}
+    </div>
+  `;
+}
+
 function inputValue(value, type) {
   if (value == null) return "";
   if (type === "date") return String(value).slice(0, 10);
@@ -253,7 +323,7 @@ function confidenceFor(record, key) {
   } catch {
     return 0.5;
   }
-  const important = ["customer_company_name", "po_number", "po_revision", "bill_to_address", "ship_to_address", "quote_number", "payment_terms", "freight_terms", "customer_part_number", "quantity", "unit_price", "line_total", "order_type_id"];
+  const important = ["customer_company_name", "po_number", "po_revision", "bill_to_address", "ship_to_address", "quote_number", "payment_terms", "freight_terms", "customer_part_number", "customer_part_revision", "internal_part_revision", "quantity", "unit_price", "line_total", "order_type_id"];
   return important.includes(key) && !record[key] ? 0.2 : 0.9;
 }
 
@@ -410,6 +480,8 @@ async function resolveMasterDataReview(reviewId, payload = {}) {
 async function savePO() {
   if (!canEditDashboard()) return;
   const payload = readFields(headerFields, "po");
+  payload.bill_to_address_structured_json = readStructuredAddress("bill_to");
+  payload.ship_to_address_structured_json = readStructuredAddress("ship_to");
   await api(`/api/purchase-orders/${selectedId}`, { method: "PUT", body: JSON.stringify(payload) });
   await refresh();
 }
@@ -739,12 +811,16 @@ async function runEvaluation() {
 }
 
 function renderOpenAIConfig() {
+  const savedModel = openaiConfig.model || "gpt-4.1-mini";
+  const options = openAIModelOptions.includes(savedModel) ? openAIModelOptions : [savedModel, ...openAIModelOptions];
   document.querySelector("#openaiConfigStatus").innerHTML = `
     ${metric("API Key", openaiConfig.api_key_configured ? "Configured" : "Not configured")}
-    ${metric("Model", safe(openaiConfig.model || "gpt-4.1-mini"))}
+    ${metric("Model", safe(savedModel))}
     ${metric("AI Extraction", openaiConfig.use_ai_extraction ? "On" : "Off")}
   `;
-  document.querySelector("#openaiModel").value = openaiConfig.model || "gpt-4.1-mini";
+  document.querySelector("#openaiModel").innerHTML = options
+    .map((model) => `<option value="${safe(model)}" ${model === savedModel ? "selected" : ""}>${openAIModelOptions.includes(model) ? safe(model) : `Current: ${safe(model)}`}</option>`)
+    .join("");
   document.querySelector("#useAiExtraction").checked = Boolean(openaiConfig.use_ai_extraction);
   document.querySelector("#openaiApiKey").placeholder = openaiConfig.api_key_configured ? "API key configured - leave blank to keep it" : "Paste OpenAI API key";
 }

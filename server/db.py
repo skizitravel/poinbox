@@ -79,7 +79,9 @@ def initialize(conn: sqlite3.Connection) -> None:
             po_number TEXT,
             line_number TEXT,
             customer_part_number TEXT,
+            customer_part_revision TEXT,
             internal_part_number TEXT,
+            internal_part_revision TEXT,
             description TEXT,
             quantity REAL,
             unit_of_measure TEXT,
@@ -417,6 +419,8 @@ def initialize(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "purchase_orders", "extraction_reviewed_by_user_id", "INTEGER REFERENCES users(id) ON DELETE SET NULL")
     ensure_column(conn, "purchase_orders", "extraction_feedback_count", "INTEGER DEFAULT 0")
     ensure_column(conn, "purchase_order_lines", "field_confidence_json", "TEXT")
+    ensure_column(conn, "purchase_order_lines", "customer_part_revision", "TEXT")
+    ensure_column(conn, "purchase_order_lines", "internal_part_revision", "TEXT")
     ensure_column(conn, "extraction_evaluation_runs", "extraction_mode", "TEXT DEFAULT 'rule_based'")
     ensure_column(conn, "users", "first_name", "TEXT")
     ensure_column(conn, "users", "last_name", "TEXT")

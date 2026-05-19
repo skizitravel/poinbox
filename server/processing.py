@@ -12,7 +12,7 @@ from pypdf import PdfReader
 from server.connectors import IncomingAttachment, IncomingEmail, SampleInboxConnector
 from server.db import log
 from server.extraction import classify_purchase_order, extract_purchase_order, normalize_date
-from server.master_data import parse_structured_address, run_master_data_reviews
+from server.master_data import format_structured_address, parse_structured_address, run_master_data_reviews
 
 
 def import_samples(conn: sqlite3.Connection, sample_dir: Path, storage_dir: Path) -> dict[str, Any]:
@@ -237,8 +237,10 @@ def elapsed_ms(started: float) -> int:
 def insert_purchase_order(conn: sqlite3.Connection, email_id: int, attachment_id: int | None, data: dict[str, Any]) -> int:
     order_type_id = default_order_type_id(conn)
     source_type = source_type_for_email(conn, email_id)
-    bill_to_structured = parse_structured_address(data.get("bill_to_address"))
-    ship_to_structured = parse_structured_address(data.get("ship_to_address"))
+    bill_to_structured = normalized_structured_address(data.get("bill_to_address_structured"), data.get("bill_to_address"))
+    ship_to_structured = normalized_structured_address(data.get("ship_to_address_structured"), data.get("ship_to_address"))
+    bill_to_address = data.get("bill_to_address") or format_structured_address(bill_to_structured)
+    ship_to_address = data.get("ship_to_address") or format_structured_address(ship_to_structured)
     cur = conn.execute(
         """
         INSERT INTO purchase_orders (
@@ -256,8 +258,8 @@ def insert_purchase_order(conn: sqlite3.Connection, email_id: int, attachment_id
             "Received",
             data.get("customer_company_name"),
             data.get("customer_contact_name"),
-            data.get("bill_to_address"),
-            data.get("ship_to_address"),
+            bill_to_address,
+            ship_to_address,
             json.dumps(bill_to_structured),
             json.dumps(ship_to_structured),
             data.get("po_number"),
@@ -291,6 +293,15 @@ def source_type_for_email(conn: sqlite3.Connection, email_id: int) -> str:
     if provider == "sample":
         return "sample_import"
     return "manual" if provider == "manual" else "unknown"
+
+
+def normalized_structured_address(value: Any, fallback_text: str | None = None) -> dict[str, str]:
+    keys = ["address_line_1", "address_line_2", "address_line_3", "city", "state", "country", "zip_code"]
+    if isinstance(value, dict):
+        result = {key: str(value.get(key) or "").strip() for key in keys}
+        if any(result.values()):
+            return result
+    return parse_structured_address(fallback_text)
 
 
 def find_duplicate_purchase_order(conn: sqlite3.Connection, data: dict[str, Any]) -> sqlite3.Row | None:
@@ -362,8 +373,9 @@ def find_similar_extraction_examples(
         ).fetchone()
         lines = conn.execute(
             """
-            SELECT line_number, customer_part_number, internal_part_number, description, quantity,
-                   unit_of_measure, unit_price, line_total, requested_date
+            SELECT line_number, customer_part_number, customer_part_revision, internal_part_number,
+                   internal_part_revision, description, quantity, unit_of_measure, unit_price,
+                   line_total, requested_date
             FROM purchase_order_lines WHERE purchase_order_id = ? ORDER BY id LIMIT 5
             """,
             (row["id"],),
@@ -386,18 +398,21 @@ def insert_po_line(conn: sqlite3.Connection, purchase_order_id: int, po_number: 
     cur = conn.execute(
         """
         INSERT INTO purchase_order_lines (
-            purchase_order_id, po_number, line_number, customer_part_number, internal_part_number, description,
+            purchase_order_id, po_number, line_number, customer_part_number, customer_part_revision,
+            internal_part_number, internal_part_revision, description,
             quantity, unit_of_measure, unit_price, line_total, requested_date, extraction_confidence, extraction_notes,
             field_confidence_json
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             purchase_order_id,
             line.get("po_number") or po_number,
             line.get("line_number"),
             line.get("customer_part_number"),
+            line.get("customer_part_revision"),
             line.get("internal_part_number"),
+            line.get("internal_part_revision"),
             line.get("description"),
             line.get("quantity"),
             line.get("unit_of_measure"),

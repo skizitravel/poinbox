@@ -1104,6 +1104,7 @@ def get_purchase_order(po_id: int) -> dict:
         if po.get("order_type_id"):
             order_type = row_to_dict(conn.execute("SELECT * FROM order_types WHERE id = ?", (po["order_type_id"],)).fetchone())
             po["order_type_name"] = order_type["name"] if order_type else None
+        run_master_data_reviews(conn, po_id)
         reviews = list_reviews(conn, po_id)
         return {
             "purchase_order": po,
@@ -1134,6 +1135,8 @@ def update_purchase_order(po_id: int, payload: dict, actor: dict | None = None) 
         "customer_contact_name",
         "bill_to_address",
         "ship_to_address",
+        "bill_to_address_structured_json",
+        "ship_to_address_structured_json",
         "po_number",
         "po_revision",
         "quote_number",
@@ -1149,16 +1152,18 @@ def update_purchase_order(po_id: int, payload: dict, actor: dict | None = None) 
         payload["date_received"] = normalize_date(payload.get("date_received"))
     if "request_date" in payload:
         payload["request_date"] = normalize_date(payload.get("request_date"))
+    apply_structured_address_payload(payload, "bill_to_address", "bill_to_address_structured_json")
+    apply_structured_address_payload(payload, "ship_to_address", "ship_to_address_structured_json")
     capture_feedback_before_update("purchase_orders", po_id, "header", po_id, payload, allowed, actor)
     update_fields("purchase_orders", po_id, payload, allowed)
     if "bill_to_address" in payload or "ship_to_address" in payload:
         with db() as conn:
-            if "bill_to_address" in payload:
+            if "bill_to_address" in payload and "bill_to_address_structured_json" not in payload:
                 conn.execute(
                     "UPDATE purchase_orders SET bill_to_address_structured_json = ? WHERE id = ?",
                     (json.dumps(parse_structured_address(payload.get("bill_to_address"))), po_id),
                 )
-            if "ship_to_address" in payload:
+            if "ship_to_address" in payload and "ship_to_address_structured_json" not in payload:
                 conn.execute(
                     "UPDATE purchase_orders SET ship_to_address_structured_json = ? WHERE id = ?",
                     (json.dumps(parse_structured_address(payload.get("ship_to_address"))), po_id),
@@ -1170,6 +1175,26 @@ def update_purchase_order(po_id: int, payload: dict, actor: dict | None = None) 
     return get_purchase_order(po_id)
 
 
+def apply_structured_address_payload(payload: dict, text_key: str, json_key: str) -> None:
+    if json_key not in payload:
+        return
+    structured = normalize_structured_address_payload(payload.get(json_key))
+    payload[json_key] = json.dumps(structured)
+    payload[text_key] = format_structured_address(structured)
+
+
+def normalize_structured_address_payload(value: object) -> dict[str, str]:
+    keys = ["address_line_1", "address_line_2", "address_line_3", "city", "state", "country", "zip_code"]
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return parse_structured_address(value)
+    if isinstance(value, dict):
+        return {key: str(value.get(key) or "").strip() for key in keys}
+    return {key: "" for key in keys}
+
+
 def add_line(po_id: int, payload: dict) -> dict:
     with db() as conn:
         po_number = conn.execute("SELECT po_number FROM purchase_orders WHERE id = ?", (po_id,)).fetchone()["po_number"]
@@ -1177,17 +1202,20 @@ def add_line(po_id: int, payload: dict) -> dict:
         conn.execute(
             """
             INSERT INTO purchase_order_lines (
-                purchase_order_id, po_number, line_number, customer_part_number, internal_part_number, description,
+                purchase_order_id, po_number, line_number, customer_part_number, customer_part_revision,
+                internal_part_number, internal_part_revision, description,
                 quantity, unit_of_measure, unit_price, line_total, requested_date, extraction_confidence, extraction_notes,
                 field_confidence_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0.5, 'Manually added', ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0.5, 'Manually added', ?)
             """,
             (
                 po_id,
                 po_number,
                 payload.get("line_number"),
                 payload.get("customer_part_number"),
+                payload.get("customer_part_revision"),
                 payload.get("internal_part_number"),
+                payload.get("internal_part_revision"),
                 payload.get("description"),
                 payload.get("quantity"),
                 payload.get("unit_of_measure"),
@@ -1207,7 +1235,9 @@ def update_line(line_id: int, payload: dict, actor: dict | None = None) -> dict:
     allowed = [
         "line_number",
         "customer_part_number",
+        "customer_part_revision",
         "internal_part_number",
+        "internal_part_revision",
         "description",
         "quantity",
         "unit_of_measure",
@@ -1239,7 +1269,7 @@ def capture_feedback_before_update(
     allowed: list[str],
     actor: dict | None,
 ) -> None:
-    fields = [field for field in allowed if field in payload and field not in {"extraction_notes", "status"}]
+    fields = [field for field in allowed if field in payload and field not in {"extraction_notes", "status", "bill_to_address_structured_json", "ship_to_address_structured_json"}]
     if not fields:
         return
     try:
@@ -1765,7 +1795,9 @@ HEADER_COMPARE_FIELDS = [
 LINE_COMPARE_FIELDS = [
     "line_number",
     "customer_part_number",
+    "customer_part_revision",
     "internal_part_number",
+    "internal_part_revision",
     "description",
     "quantity",
     "unit_of_measure",
@@ -2967,7 +2999,9 @@ LINE_EXPORT_FIELDS = [
     "line_id",
     "line_number",
     "customer_part_number",
+    "customer_part_revision",
     "internal_part_number",
+    "internal_part_revision",
     "description",
     "quantity",
     "unit_of_measure",
@@ -3038,7 +3072,9 @@ def export_line_row(line: dict) -> dict:
         "line_id": line.get("id"),
         "line_number": line.get("line_number"),
         "customer_part_number": line.get("customer_part_number"),
+        "customer_part_revision": line.get("customer_part_revision"),
         "internal_part_number": line.get("internal_part_number"),
+        "internal_part_revision": line.get("internal_part_revision"),
         "description": line.get("description"),
         "quantity": line.get("quantity"),
         "unit_of_measure": line.get("unit_of_measure"),

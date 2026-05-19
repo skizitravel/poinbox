@@ -135,9 +135,11 @@ Customer master data can be exported from the Customers section as:
 
 Customer CSV uploads can create or update customers and structured addresses. Contact CSV uploads match contacts to existing customers by customer name or customer number.
 
-PO detail now includes a **Master Data Review** section. After a PO is processed, the app compares extracted customer, bill-to address, ship-to address, and contact values against customer master data. Missing matches are advisory review items with actions such as **Add Customer**, **Add Bill-To Address**, **Add Ship-To Address**, and **Add Contact**. These review items do not block booking yet.
+PO detail now includes a **Master Data Review** section. After a PO is processed, the app compares extracted customer, bill-to address, ship-to address, and contact values against customer master data. Missing matches are advisory review items with actions such as **Add Customer**, **Add Bill-To Address**, **Add Ship-To Address**, and **Add Contact**. These same actions are also surfaced inline near the Customer Company, Bill-To Address, and Ship-To Address fields when review is needed. These review items do not block booking yet.
 
-PO extraction also stores a best-effort structured version of extracted bill-to and ship-to addresses so future validation can compare against the same address fields used by customer master data.
+PO extraction also stores and displays a best-effort structured version of extracted bill-to and ship-to addresses so future validation can compare against the same address fields used by customer master data. PO detail uses address line 1, address line 2, address line 3, city, state, country, and zip code while keeping the formatted text address for compatibility and exports.
+
+PO line items include customer and internal part revision fields. These are stored separately from the part numbers, can be corrected in the PO detail line editor, are captured by extraction feedback, and are included in the header-plus-lines CSV export.
 
 The **Setup** tab also includes a departments list seeded with Sales, Customer Service, Operations, and Accounting. Departments are stored for future routing and are not yet applied to POs.
 
@@ -195,7 +197,7 @@ When AI extraction is enabled, the extractor can retrieve recent reviewed/correc
 To enable AI extraction from the app, use **Admin > Testing > OpenAI Extraction Configuration**:
 
 - paste the OpenAI API key into the password field
-- set the model, such as `gpt-4.1-mini`
+- select the model from the dropdown, such as `gpt-4.1-mini`
 - turn **Use AI extraction** on
 - save the configuration
 

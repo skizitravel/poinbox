@@ -225,7 +225,11 @@ def extract_with_openai(
     model: str | None = None,
 ) -> dict[str, Any]:
     prompt = {
-        "task": "Extract customer purchase order data. Return only JSON. Use null for missing values. Do not invent data.",
+        "task": (
+            "Extract customer purchase order data. Return only JSON. Use null for missing values. Do not invent data. "
+            "A quote, quotation, proposal, estimate, invoice, or order confirmation number is not a purchase order number. "
+            "If the document is not actually a customer purchase order, return null for po_number and explain the uncertainty in extraction_notes."
+        ),
         "prompt_version": PO_EXTRACTION_PROMPT_VERSION,
         "prior_corrected_examples_instruction": (
             "Use prior examples only as layout and labeling guidance. Do not copy PO numbers, quantities, prices, dates, "
@@ -237,6 +241,24 @@ def extract_with_openai(
             "customer_contact_name": None,
             "bill_to_address": None,
             "ship_to_address": None,
+            "bill_to_address_structured": {
+                "address_line_1": None,
+                "address_line_2": None,
+                "address_line_3": None,
+                "city": None,
+                "state": None,
+                "country": None,
+                "zip_code": None,
+            },
+            "ship_to_address_structured": {
+                "address_line_1": None,
+                "address_line_2": None,
+                "address_line_3": None,
+                "city": None,
+                "state": None,
+                "country": None,
+                "zip_code": None,
+            },
             "po_number": None,
             "po_revision": None,
             "quote_number": None,
@@ -256,7 +278,9 @@ def extract_with_openai(
                     "po_number": None,
                     "line_number": None,
                     "customer_part_number": None,
+                    "customer_part_revision": None,
                     "internal_part_number": None,
+                    "internal_part_revision": None,
                     "description": None,
                     "quantity": None,
                     "unit_of_measure": None,
@@ -267,6 +291,12 @@ def extract_with_openai(
                     "extraction_notes": "",
                 }
             ],
+        },
+        "field_guidance": {
+            "bill_to_address_structured": "Use address_line_1, address_line_2, address_line_3, city, state, country, zip_code. Leave uncertain fields null.",
+            "ship_to_address_structured": "Use address_line_1, address_line_2, address_line_3, city, state, country, zip_code. Leave uncertain fields null.",
+            "part_revisions": "Extract customer/internal part revisions separately from part numbers. Common labels include Rev, Revision, Part Rev, Customer Rev, Drawing Rev, Internal Rev. Do not invent revisions.",
+            "po_number": "Only extract a true customer purchase order number. Do not use quote/proposal/quotation numbers as the PO number.",
         },
         "email": email,
         "attachment_filename": attachment_filename,
