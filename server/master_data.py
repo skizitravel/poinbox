@@ -11,6 +11,20 @@ def normalize_match_text(value: Any) -> str:
     return re.sub(r"\s+", " ", text)
 
 
+def normalize_address_for_match(value: Any) -> str:
+    if isinstance(value, str):
+        text = value
+    elif isinstance(value, dict):
+        text = format_structured_address(value)
+    elif isinstance(value, sqlite3.Row):
+        text = format_structured_address(value)
+    else:
+        text = str(value or "")
+    text = text.replace(",", " ")
+    text = re.sub(r"[^a-zA-Z0-9]+", " ", text).strip().lower()
+    return re.sub(r"\s+", " ", text)
+
+
 def format_structured_address(row: sqlite3.Row | dict | None) -> str:
     if not row:
         return ""
@@ -27,6 +41,29 @@ def format_structured_address(row: sqlite3.Row | dict | None) -> str:
         line_parts.append(getter("country"))
     structured = "\n".join(part.strip() for part in line_parts if part and part.strip())
     return structured or (getter("address_text") or "")
+
+
+def address_match_values(value: Any) -> set[str]:
+    values: set[str] = set()
+    if not value:
+        return values
+    values.add(normalize_address_for_match(value))
+    if isinstance(value, str):
+        parsed = parse_structured_address(value)
+        values.add(normalize_address_for_match(parsed))
+    elif isinstance(value, dict):
+        values.add(normalize_address_for_match(value.get("address_text")))
+    elif isinstance(value, sqlite3.Row):
+        values.add(normalize_address_for_match(value["address_text"] if "address_text" in value.keys() else ""))
+    return {item for item in values if item}
+
+
+def addresses_match(extracted_address: Any, customer_address: Any) -> bool:
+    extracted_values = address_match_values(extracted_address)
+    customer_values = address_match_values(customer_address)
+    if not extracted_values or not customer_values:
+        return False
+    return bool(extracted_values & customer_values)
 
 
 def parse_structured_address(address_text: str | None) -> dict[str, str]:
@@ -79,18 +116,16 @@ def find_matching_customer(conn: sqlite3.Connection, customer_name: str | None) 
 
 
 def find_matching_address(
-    conn: sqlite3.Connection, customer_id: int | None, address_type: str, extracted_address: str | None
+    conn: sqlite3.Connection, customer_id: int | None, address_type: str, extracted_address: Any
 ) -> sqlite3.Row | None:
-    needle = normalize_match_text(extracted_address)
-    if not customer_id or not needle:
+    if not customer_id or not address_match_values(extracted_address):
         return None
     rows = conn.execute(
         "SELECT * FROM customer_addresses WHERE customer_id = ? AND address_type = ?",
         (customer_id, address_type),
     ).fetchall()
     for row in rows:
-        formatted = format_structured_address(row)
-        if normalize_match_text(formatted) == needle or normalize_match_text(row["address_text"]) == needle:
+        if addresses_match(extracted_address, row):
             return row
     return None
 
@@ -139,7 +174,7 @@ def run_master_data_reviews(conn: sqlite3.Connection, po_id: int) -> list[dict[s
                 structured = json.loads(po[structured_column])
             except json.JSONDecodeError:
                 structured = {}
-        match = find_matching_address(conn, customer_id, address_type, value)
+        match = find_matching_address(conn, customer_id, address_type, structured or value)
         if match:
             resolve_open_review(conn, po_id, review_type, customer_id, match["id"])
         else:
@@ -179,6 +214,23 @@ def create_open_review(
     suggested_value: dict[str, Any],
     matched_customer_id: int | None = None,
 ) -> None:
+    resolved = conn.execute(
+        """
+        SELECT suggested_value_json FROM po_master_data_reviews
+        WHERE purchase_order_id = ? AND review_type = ? AND status = 'resolved'
+        ORDER BY updated_at DESC, id DESC LIMIT 1
+        """,
+        (po_id, review_type),
+    ).fetchone()
+    if resolved:
+        try:
+            previous_value = json.loads(resolved["suggested_value_json"] or "{}")
+        except json.JSONDecodeError:
+            previous_value = {}
+        if review_type in {"bill_to_address", "ship_to_address"} and addresses_match(suggested_value, previous_value):
+            return
+        if review_type not in {"bill_to_address", "ship_to_address"} and normalize_match_text(suggested_value) == normalize_match_text(previous_value):
+            return
     existing = conn.execute(
         """
         SELECT id FROM po_master_data_reviews

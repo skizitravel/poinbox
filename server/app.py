@@ -49,7 +49,7 @@ from server.processing import (
     recalculate_po_total,
 )
 from server.extraction import classify_purchase_order, extract_purchase_order, normalize_date
-from server.master_data import format_structured_address, list_reviews, parse_structured_address, resolve_review, run_master_data_reviews
+from server.master_data import addresses_match, format_structured_address, list_reviews, parse_structured_address, resolve_review, run_master_data_reviews
 from server.openai_settings import get_openai_extraction_config, get_openai_runtime_config, save_openai_extraction_config
 
 
@@ -864,7 +864,7 @@ def create_customer_address(customer_id: int, payload: dict) -> dict:
     address_type = payload.get("address_type") if payload.get("address_type") in {"bill_to", "ship_to"} else "bill_to"
     address = clean_address_payload(payload)
     with db() as conn:
-        conn.execute(
+        cur = conn.execute(
             """
             INSERT INTO customer_addresses (
                 customer_id, address_type, label, address_text, address_line_1, address_line_2,
@@ -887,6 +887,7 @@ def create_customer_address(customer_id: int, payload: dict) -> dict:
                 bool_int(payload.get("is_default")),
             ),
         )
+        resolve_matching_address_reviews_for_customer(conn, customer_id, address_type, int(cur.lastrowid))
         conn.commit()
     return get_customer(customer_id)
 
@@ -921,6 +922,7 @@ def update_customer_address(address_id: int, payload: dict) -> dict:
                 address_id,
             ),
         )
+        resolve_matching_address_reviews_for_customer(conn, row["customer_id"], address_type, address_id)
         conn.commit()
         return get_customer(row["customer_id"])
 
@@ -938,6 +940,50 @@ def clean_address_payload(payload: dict) -> dict:
     }
     address["address_text"] = (payload.get("address_text") or "").strip() or format_structured_address(address)
     return address
+
+
+def resolve_matching_address_reviews_for_customer(conn, customer_id: int, address_type: str, address_id: int) -> None:
+    review_type = "ship_to_address" if address_type == "ship_to" else "bill_to_address"
+    address = conn.execute("SELECT * FROM customer_addresses WHERE id = ?", (address_id,)).fetchone()
+    if not address:
+        return
+    rows = conn.execute(
+        """
+        SELECT r.*, po.bill_to_address, po.ship_to_address, po.bill_to_address_structured_json,
+               po.ship_to_address_structured_json
+        FROM po_master_data_reviews r
+        JOIN purchase_orders po ON po.id = r.purchase_order_id
+        WHERE r.review_type = ? AND r.status = 'open'
+          AND (r.matched_customer_id = ? OR r.matched_customer_id IS NULL)
+        """,
+        (review_type, customer_id),
+    ).fetchall()
+    for row in rows:
+        text_value = row["ship_to_address"] if review_type == "ship_to_address" else row["bill_to_address"]
+        json_value = row["ship_to_address_structured_json"] if review_type == "ship_to_address" else row["bill_to_address_structured_json"]
+        structured = {}
+        if json_value:
+            try:
+                structured = json.loads(json_value)
+            except json.JSONDecodeError:
+                structured = {}
+        suggested = {}
+        try:
+            suggested = json.loads(row["suggested_value_json"] or "{}")
+        except json.JSONDecodeError:
+            suggested = {}
+        if addresses_match(structured or text_value or suggested, address) or addresses_match(suggested, address):
+            resolve_review(conn, row["id"], customer_id, address_id)
+            conn.execute(
+                """
+                INSERT INTO processing_logs (level, message, metadata_json)
+                VALUES ('info', ?, ?)
+                """,
+                (
+                    "Master-data address review resolved by adding customer address.",
+                    json.dumps({"purchase_order_id": row["purchase_order_id"], "review_id": row["id"], "customer_id": customer_id, "address_id": address_id, "review_type": review_type}),
+                ),
+            )
 
 
 def delete_customer_address(address_id: int) -> dict:
@@ -2773,11 +2819,6 @@ def sync_gmail_messages(conn, account_id: int, run_id: int, start_at: datetime |
         if not message_id:
             continue
         provider_message_id = f"gmail:{message_id}"
-        existing = conn.execute("SELECT id FROM emails WHERE provider = 'gmail' AND provider_message_id = ?", (provider_message_id,)).fetchone()
-        if existing:
-            result["messages_skipped"] += 1
-            write_detection_result(conn, run_id, None, provider_message_id, None, None, 0, 0, None, elapsed_ms(started), True, "")
-            continue
         try:
             message = gmail_api_get(f"/gmail/v1/users/me/messages/{message_id}", access_token, {"format": "full"})
             headers = extract_gmail_headers(message.get("payload") or {})
@@ -2787,13 +2828,49 @@ def sync_gmail_messages(conn, account_id: int, run_id: int, start_at: datetime |
                 write_detection_result(conn, run_id, None, provider_message_id, "skipped_outside_sync_range", None, 0, 0, None, elapsed_ms(started), False, "Skipped because message was outside selected sync range.")
                 continue
             body_text = extract_gmail_body(message.get("payload") or {})
-            attachments, attachment_errors = download_gmail_attachments(message, access_token, STORAGE_DIR / "gmail" / message_id)
-            if not attachments and not account.get("evaluate_without_attachments"):
+            existing = row_to_dict(conn.execute("SELECT * FROM emails WHERE provider = 'gmail' AND provider_message_id = ?", (provider_message_id,)).fetchone())
+            existing_attachment_rows: list[dict] = []
+            if existing:
+                existing_attachment_rows = rows_to_dicts(
+                    conn.execute(
+                        """
+                        SELECT id, filename, extracted_text, extraction_method
+                        FROM attachments
+                        WHERE email_id = ?
+                        ORDER BY id
+                        """,
+                        (existing["id"],),
+                    ).fetchall()
+                )
+                existing_attachment_count = len(existing_attachment_rows)
+                po_row = conn.execute("SELECT id FROM purchase_orders WHERE email_id = ? ORDER BY id DESC LIMIT 1", (existing["id"],)).fetchone()
+                if po_row:
+                    result["messages_skipped"] += 1
+                    write_detection_result(
+                        conn,
+                        run_id,
+                        existing["id"],
+                        provider_message_id,
+                        existing.get("classification"),
+                        existing.get("classification_confidence"),
+                        1,
+                        existing_attachment_count,
+                        po_row["id"],
+                        elapsed_ms(started),
+                        True,
+                        "Skipped duplicate Gmail message that already has a purchase order.",
+                    )
+                    continue
+            attachments: list[IncomingAttachment] = []
+            attachment_errors: list[str] = []
+            if not existing_attachment_rows:
+                attachments, attachment_errors = download_gmail_attachments(message, access_token, STORAGE_DIR / "gmail" / message_id)
+            if not attachments and not existing_attachment_rows and not account.get("evaluate_without_attachments"):
                 result["messages_skipped"] += 1
                 write_detection_result(
                     conn,
                     run_id,
-                    None,
+                    existing["id"] if existing else None,
                     provider_message_id,
                     "skipped_no_supported_attachment",
                     None,
@@ -2816,12 +2893,23 @@ def sync_gmail_messages(conn, account_id: int, run_id: int, start_at: datetime |
                 attachments=attachments,
             )
             attachment_text = ""
-            attachment_rows = []
-            email_id = insert_email(conn, incoming)
+            attachment_rows = list(existing_attachment_rows)
+            if existing:
+                email_id = existing["id"]
+                conn.execute(
+                    """
+                    UPDATE emails
+                    SET sender = ?, recipients = ?, subject = ?, received_at = ?, body_text = ?
+                    WHERE id = ?
+                    """,
+                    (incoming.sender, incoming.recipients, incoming.subject, incoming.received_at, incoming.body_text, email_id),
+                )
+                conn.commit()
+            else:
+                email_id = insert_email(conn, incoming)
             for attachment in incoming.attachments:
                 row = insert_attachment(conn, email_id, attachment)
                 attachment_rows.append(row)
-                attachment_text += "\n\n" + (row.get("extracted_text") or "")
             created = process_email(conn, email_id, attachment_rows)
             email_row = conn.execute("SELECT classification, classification_confidence FROM emails WHERE id = ?", (email_id,)).fetchone()
             po_row = conn.execute("SELECT id FROM purchase_orders WHERE email_id = ? ORDER BY id DESC LIMIT 1", (email_id,)).fetchone()
@@ -2839,8 +2927,8 @@ def sync_gmail_messages(conn, account_id: int, run_id: int, start_at: datetime |
                 provider_message_id,
                 email_row["classification"] if email_row else None,
                 email_row["classification_confidence"] if email_row else None,
-                1 if attachments else 0,
-                len(attachments),
+                1 if attachment_rows else 0,
+                len(attachment_rows),
                 po_row["id"] if po_row else None,
                 elapsed_ms(started),
                 po_duplicate_skipped,

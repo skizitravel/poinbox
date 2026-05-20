@@ -125,6 +125,8 @@ Customer profiles currently include:
 
 Address records use address line 1, address line 2, address line 3, city, state, country, and zip code. Existing freeform addresses are preserved and shown when structured fields are blank.
 
+Customer addresses are shown as a compact list in the customer profile. Use **Add Address** or a row **Edit** button to open the address popup, where the structured address fields can be added, updated, or deleted without crowding the profile screen.
+
 Contacts are shown as a compact list below the addresses inside the customer profile. Use **Add Contact** or a row **Edit** button to open the contact popup.
 
 Customer master data can be exported from the Customers section as:
@@ -136,6 +138,8 @@ Customer master data can be exported from the Customers section as:
 Customer CSV uploads can create or update customers and structured addresses. Contact CSV uploads match contacts to existing customers by customer name or customer number.
 
 PO detail now includes a **Master Data Review** section. After a PO is processed, the app compares extracted customer, bill-to address, ship-to address, and contact values against customer master data. Missing matches are advisory review items with actions such as **Add Customer**, **Add Bill-To Address**, **Add Ship-To Address**, and **Add Contact**. These same actions are also surfaced inline near the Customer Company, Customer Contact, Bill-To Address, and Ship-To Address fields when review is needed. These review items do not block booking yet.
+
+When a bill-to or ship-to address is added from a PO review action, the app saves it as a structured customer address, compares it with normalized address matching, resolves the corresponding master-data review item, and refreshes the PO detail so the add-address prompt disappears once the address matches.
 
 PO extraction also stores and displays a best-effort structured version of extracted bill-to and ship-to addresses so future validation can compare against the same address fields used by customer master data. PO detail uses address line 1, address line 2, address line 3, city, state, country, and zip code while keeping the formatted text address for compatibility and exports.
 

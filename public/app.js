@@ -462,21 +462,22 @@ async function startMasterDataReviewAction(reviewId) {
   }
   const addressType = review.review_type === "ship_to_address" ? "ship_to" : "bill_to";
   pendingReviewAction.type = addressType;
-  prefillAddressFromReview(addressType, suggested);
+  openAddressModal(null, addressPrefillFromReview(addressType, suggested));
 }
 
-function prefillAddressFromReview(addressType, suggested) {
+function addressPrefillFromReview(addressType, suggested) {
   const addressText = typeof suggested === "string" ? suggested : suggested.address_text || "";
-  clearAddressForm();
-  document.querySelector("#addressType").value = addressType;
-  document.querySelector("#addressLabel").value = addressType === "ship_to" ? "PO Ship To" : "PO Bill To";
-  document.querySelector("#addressLine1").value = suggested.address_line_1 || addressText;
-  document.querySelector("#addressLine2").value = suggested.address_line_2 || "";
-  document.querySelector("#addressLine3").value = suggested.address_line_3 || "";
-  document.querySelector("#addressCity").value = suggested.city || "";
-  document.querySelector("#addressState").value = suggested.state || "";
-  document.querySelector("#addressCountry").value = suggested.country || "";
-  document.querySelector("#addressZip").value = suggested.zip_code || "";
+  return {
+    address_type: addressType,
+    label: addressType === "ship_to" ? "PO Ship To" : "PO Bill To",
+    address_line_1: suggested.address_line_1 || addressText,
+    address_line_2: suggested.address_line_2 || "",
+    address_line_3: suggested.address_line_3 || "",
+    city: suggested.city || "",
+    state: suggested.state || "",
+    country: suggested.country || "",
+    zip_code: suggested.zip_code || "",
+  };
 }
 
 async function resolveMasterDataReview(reviewId, payload = {}) {
@@ -1190,15 +1191,19 @@ function datetimeLocalValue(date) {
 
 async function runManualSync() {
   if (!manualSyncInboxId) return;
-  const startAt = document.querySelector("#manualSyncStart").value;
-  const endAt = document.querySelector("#manualSyncEnd").value;
-  if (!startAt || !endAt || new Date(endAt) < new Date(startAt)) {
+  const startAtLocal = document.querySelector("#manualSyncStart").value;
+  const endAtLocal = document.querySelector("#manualSyncEnd").value;
+  const startDate = new Date(startAtLocal);
+  const endDate = new Date(endAtLocal);
+  if (!startAtLocal || !endAtLocal || Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime()) || endDate < startDate) {
     setMessage("#manualSyncMessage", "Enter a valid date/time range.", "error");
     return;
   }
+  const startAt = startDate.toISOString();
+  const endAt = endDate.toISOString();
   const button = document.querySelector("#runManualSyncBtn");
   button.disabled = true;
-  setMessage("#manualSyncMessage", `Syncing Gmail from ${startAt} to ${endAt}...`);
+  setMessage("#manualSyncMessage", `Syncing Gmail from ${startAtLocal} to ${endAtLocal}...`);
   const data = await api(`/api/inbox-accounts/${manualSyncInboxId}/sync`, { method: "POST", body: JSON.stringify({ start_at: startAt, end_at: endAt }) });
   inboxAccounts = data.accounts || [];
   inboxSyncRuns = data.sync_runs || [];
@@ -1275,7 +1280,6 @@ async function openCustomerModal(id = null) {
   document.querySelector("#customerNumber").value = "";
   document.querySelector("#customerPaymentTerms").value = "";
   renderCustomerPaymentTermOptions();
-  clearAddressForm();
   document.querySelector("#addressRows").innerHTML = "";
   document.querySelector("#contactRows").innerHTML = "";
   document.querySelector("#customerChildEditors").classList.toggle("hidden", !id);
@@ -1298,6 +1302,7 @@ function closeCustomerModal() {
   currentCustomerDetail = null;
   pendingReviewAction = null;
   document.querySelector("#customerModal").classList.add("hidden");
+  closeAddressModal();
 }
 
 function renderCustomerPaymentTermOptions(selectedId = null, fallbackText = "") {
@@ -1361,7 +1366,7 @@ function renderCustomerChildren() {
         <td>${safe(row.label)}</td>
         <td><pre class="inline-pre">${safe(formatAddress(row))}</pre></td>
         <td>${row.is_default ? "Default" : ""}</td>
-        <td><button class="secondary table-action" onclick="editAddress(${row.id})">Edit</button><button class="danger table-action" onclick="deleteAddress(${row.id})">Delete</button></td>
+        <td><button class="secondary table-action" onclick="editAddress(${row.id})">Edit</button></td>
       </tr>
     `,
     )
@@ -1383,8 +1388,40 @@ function renderCustomerChildren() {
 }
 
 async function addAddress() {
+  openAddressModal();
+}
+
+function openAddressModal(id = null, prefill = {}) {
   if (!editingCustomerId) {
     setMessage("#customerModalMessage", "Save the customer before adding addresses.", "error");
+    return;
+  }
+  editingAddressId = id;
+  const row = id ? currentCustomerDetail.addresses.find((address) => Number(address.id) === Number(id)) || {} : prefill;
+  document.querySelector("#addressModalTitle").textContent = id ? "Edit Address" : "Add Address";
+  document.querySelector("#addressType").value = row.address_type || "bill_to";
+  document.querySelector("#addressLabel").value = row.label || "";
+  document.querySelector("#addressLine1").value = row.address_line_1 || "";
+  document.querySelector("#addressLine2").value = row.address_line_2 || "";
+  document.querySelector("#addressLine3").value = row.address_line_3 || "";
+  document.querySelector("#addressCity").value = row.city || "";
+  document.querySelector("#addressState").value = row.state || "";
+  document.querySelector("#addressCountry").value = row.country || "";
+  document.querySelector("#addressZip").value = row.zip_code || "";
+  document.querySelector("#addressDefault").checked = Boolean(row.is_default);
+  document.querySelector("#deleteAddressModalBtn").classList.toggle("hidden", !id);
+  setMessage("#addressModalMessage", "");
+  document.querySelector("#addressModal").classList.remove("hidden");
+}
+
+function closeAddressModal() {
+  editingAddressId = null;
+  document.querySelector("#addressModal").classList.add("hidden");
+}
+
+async function saveAddressModal() {
+  if (!editingCustomerId) {
+    setMessage("#addressModalMessage", "Save the customer before adding addresses.", "error");
     return;
   }
   const payload = addressPayloadFromForm();
@@ -1396,32 +1433,26 @@ async function addAddress() {
     await resolveMasterDataReview(pendingReviewAction.reviewId, { matched_customer_id: editingCustomerId, matched_record_id: savedAddressId });
     pendingReviewAction = null;
   }
-  clearAddressForm();
+  closeAddressModal();
   renderCustomerChildren();
   await reloadCustomers();
 }
 
 async function deleteAddress(id) {
+  if (!confirm("Delete this address?")) return;
   currentCustomerDetail = await api(`/api/customer-addresses/${id}`, { method: "DELETE" });
   renderCustomerChildren();
   await reloadCustomers();
 }
 
 function editAddress(id) {
-  const row = currentCustomerDetail.addresses.find((address) => Number(address.id) === Number(id));
-  if (!row) return;
-  editingAddressId = id;
-  document.querySelector("#addressType").value = row.address_type || "bill_to";
-  document.querySelector("#addressLabel").value = row.label || "";
-  document.querySelector("#addressLine1").value = row.address_line_1 || "";
-  document.querySelector("#addressLine2").value = row.address_line_2 || "";
-  document.querySelector("#addressLine3").value = row.address_line_3 || "";
-  document.querySelector("#addressCity").value = row.city || "";
-  document.querySelector("#addressState").value = row.state || "";
-  document.querySelector("#addressCountry").value = row.country || "";
-  document.querySelector("#addressZip").value = row.zip_code || "";
-  document.querySelector("#addressDefault").checked = Boolean(row.is_default);
-  document.querySelector("#addAddressBtn").textContent = "Save Address";
+  openAddressModal(id);
+}
+
+async function deleteAddressModal() {
+  if (!editingAddressId) return;
+  await deleteAddress(editingAddressId);
+  closeAddressModal();
 }
 
 function addressPayloadFromForm() {
@@ -1446,7 +1477,6 @@ function clearAddressForm() {
   }
   document.querySelector("#addressType").value = "bill_to";
   document.querySelector("#addressDefault").checked = false;
-  document.querySelector("#addAddressBtn").textContent = "Add Address";
 }
 
 function formatAddress(row) {
@@ -2219,6 +2249,10 @@ document.querySelector("#cancelCustomerModalBtn").addEventListener("click", clos
 document.querySelector("#saveCustomerBtn").addEventListener("click", saveCustomer);
 document.querySelector("#deleteCustomerBtn").addEventListener("click", deleteCustomer);
 document.querySelector("#addAddressBtn").addEventListener("click", addAddress);
+document.querySelector("#closeAddressModalBtn").addEventListener("click", closeAddressModal);
+document.querySelector("#cancelAddressModalBtn").addEventListener("click", closeAddressModal);
+document.querySelector("#saveAddressModalBtn").addEventListener("click", saveAddressModal);
+document.querySelector("#deleteAddressModalBtn").addEventListener("click", deleteAddressModal);
 document.querySelector("#addContactBtn").addEventListener("click", () => openContactModal());
 document.querySelector("#closeContactModalBtn").addEventListener("click", closeContactModal);
 document.querySelector("#cancelContactModalBtn").addEventListener("click", closeContactModal);

@@ -674,21 +674,24 @@
 
         <div class="modal-subgrid customer-child-stack" id="customerChildEditors">
           <section>
-            <div class="section-title">Addresses</div>
-            <div class="admin-form address-form">
-              <select id="addressType"><option value="bill_to">Bill To</option><option value="ship_to">Ship To</option></select>
-              <input id="addressLabel" placeholder="Label" />
-              <input id="addressLine1" placeholder="Address line 1" />
-              <input id="addressLine2" placeholder="Address line 2" />
-              <input id="addressLine3" placeholder="Address line 3" />
-              <input id="addressCity" placeholder="City" />
-              <input id="addressState" placeholder="State" />
-              <input id="addressCountry" placeholder="Country" />
-              <input id="addressZip" placeholder="Zip code" />
-              <label class="check-field"><input id="addressDefault" type="checkbox" /> Default</label>
-              <button id="addAddressBtn">Add Address</button>
+            <div class="section-title section-title-row">
+              <span>Addresses</span>
+              <button class="secondary table-action" id="addAddressBtn">Add Address</button>
             </div>
-            <div class="admin-table-wrap small-table-wrap"><table><tbody id="addressRows"></tbody></table></div>
+            <div class="admin-table-wrap small-table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Type</th>
+                    <th>Label</th>
+                    <th>Address</th>
+                    <th>Default</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody id="addressRows"></tbody>
+              </table>
+            </div>
           </section>
           <section>
             <div class="section-title section-title-row">
@@ -711,6 +714,36 @@
               </table>
             </div>
           </section>
+        </div>
+      </section>
+    </div>
+
+    <div class="modal-backdrop hidden nested-modal" id="addressModal" aria-hidden="true">
+      <section class="modal compact-modal" role="dialog" aria-modal="true" aria-labelledby="addressModalTitle">
+        <div class="modal-head">
+          <div>
+            <h2 id="addressModalTitle">Address</h2>
+            <p>Add or update a structured customer address.</p>
+          </div>
+          <button class="icon-btn" id="closeAddressModalBtn" title="Close">x</button>
+        </div>
+        <div class="grid">
+          <div class="field"><label>Address Type</label><select id="addressType"><option value="bill_to">Bill To</option><option value="ship_to">Ship To</option></select></div>
+          <div class="field"><label>Label</label><input id="addressLabel" /></div>
+          <div class="field"><label>Default</label><label class="check-field"><input id="addressDefault" type="checkbox" /> Default address</label></div>
+          <div class="field"><label>Address Line 1</label><input id="addressLine1" /></div>
+          <div class="field"><label>Address Line 2</label><input id="addressLine2" /></div>
+          <div class="field"><label>Address Line 3</label><input id="addressLine3" /></div>
+          <div class="field"><label>City</label><input id="addressCity" /></div>
+          <div class="field"><label>State</label><input id="addressState" /></div>
+          <div class="field"><label>Country</label><input id="addressCountry" /></div>
+          <div class="field"><label>Zip Code</label><input id="addressZip" /></div>
+        </div>
+        <div class="upload-message" id="addressModalMessage"></div>
+        <div class="modal-actions">
+          <button id="saveAddressModalBtn">Save</button>
+          <button class="danger" id="deleteAddressModalBtn">Delete</button>
+          <button class="secondary" id="cancelAddressModalBtn">Cancel</button>
         </div>
       </section>
     </div>
