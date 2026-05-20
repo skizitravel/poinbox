@@ -186,6 +186,14 @@ def initialize(conn: sqlite3.Connection) -> None:
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
 
+        CREATE TABLE IF NOT EXISTS payment_terms (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
         CREATE TABLE IF NOT EXISTS po_master_data_reviews (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             purchase_order_id INTEGER NOT NULL REFERENCES purchase_orders(id) ON DELETE CASCADE,
@@ -363,6 +371,8 @@ def initialize(conn: sqlite3.Connection) -> None:
             started_at TEXT,
             finished_at TEXT,
             status TEXT,
+            start_at TEXT,
+            end_at TEXT,
             messages_seen INTEGER DEFAULT 0,
             messages_imported INTEGER DEFAULT 0,
             messages_skipped INTEGER DEFAULT 0,
@@ -418,6 +428,9 @@ def initialize(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "purchase_orders", "extraction_reviewed_at", "TEXT")
     ensure_column(conn, "purchase_orders", "extraction_reviewed_by_user_id", "INTEGER REFERENCES users(id) ON DELETE SET NULL")
     ensure_column(conn, "purchase_orders", "extraction_feedback_count", "INTEGER DEFAULT 0")
+    ensure_column(conn, "customers", "payment_terms_id", "INTEGER REFERENCES payment_terms(id) ON DELETE SET NULL")
+    ensure_column(conn, "inbox_sync_runs", "start_at", "TEXT")
+    ensure_column(conn, "inbox_sync_runs", "end_at", "TEXT")
     ensure_column(conn, "purchase_order_lines", "field_confidence_json", "TEXT")
     ensure_column(conn, "purchase_order_lines", "customer_part_revision", "TEXT")
     ensure_column(conn, "purchase_order_lines", "internal_part_revision", "TEXT")
@@ -439,6 +452,7 @@ def initialize(conn: sqlite3.Connection) -> None:
     backfill_user_profile_names(conn)
     seed_order_types(conn)
     seed_departments(conn)
+    seed_payment_terms(conn)
     seed_initial_admin(conn)
     standard = conn.execute("SELECT id FROM order_types WHERE name = 'Standard'").fetchone()
     if standard:
@@ -466,6 +480,14 @@ def seed_departments(conn: sqlite3.Connection) -> None:
         return
     for name in ("Sales", "Customer Service", "Operations", "Accounting"):
         conn.execute("INSERT INTO departments (name, is_active) VALUES (?, 1)", (name,))
+
+
+def seed_payment_terms(conn: sqlite3.Connection) -> None:
+    count = conn.execute("SELECT COUNT(*) AS count FROM payment_terms").fetchone()["count"]
+    if count:
+        return
+    for name in ("Net 30", "Net 90", "Prepay"):
+        conn.execute("INSERT INTO payment_terms (name, is_active) VALUES (?, 1)", (name,))
 
 
 def seed_initial_admin(conn: sqlite3.Connection) -> None:

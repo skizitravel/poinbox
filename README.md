@@ -135,13 +135,18 @@ Customer master data can be exported from the Customers section as:
 
 Customer CSV uploads can create or update customers and structured addresses. Contact CSV uploads match contacts to existing customers by customer name or customer number.
 
-PO detail now includes a **Master Data Review** section. After a PO is processed, the app compares extracted customer, bill-to address, ship-to address, and contact values against customer master data. Missing matches are advisory review items with actions such as **Add Customer**, **Add Bill-To Address**, **Add Ship-To Address**, and **Add Contact**. These same actions are also surfaced inline near the Customer Company, Bill-To Address, and Ship-To Address fields when review is needed. These review items do not block booking yet.
+PO detail now includes a **Master Data Review** section. After a PO is processed, the app compares extracted customer, bill-to address, ship-to address, and contact values against customer master data. Missing matches are advisory review items with actions such as **Add Customer**, **Add Bill-To Address**, **Add Ship-To Address**, and **Add Contact**. These same actions are also surfaced inline near the Customer Company, Customer Contact, Bill-To Address, and Ship-To Address fields when review is needed. These review items do not block booking yet.
 
 PO extraction also stores and displays a best-effort structured version of extracted bill-to and ship-to addresses so future validation can compare against the same address fields used by customer master data. PO detail uses address line 1, address line 2, address line 3, city, state, country, and zip code while keeping the formatted text address for compatibility and exports.
 
 PO line items include customer and internal part revision fields. These are stored separately from the part numbers, can be corrected in the PO detail line editor, are captured by extraction feedback, and are included in the header-plus-lines CSV export.
 
-The **Setup** tab also includes a departments list seeded with Sales, Customer Service, Operations, and Accounting. Departments are stored for future routing and are not yet applied to POs.
+The **Setup** tab also includes:
+
+- departments, seeded with Sales, Customer Service, Operations, and Accounting
+- payment terms, seeded with Net 30, Net 90, and Prepay
+
+Customer profiles can reference the payment terms setup list through a dropdown. The original free-text `payment_terms` value is still preserved for compatibility and CSV export.
 
 ## Testing PO Extraction
 
@@ -255,6 +260,8 @@ Gmail folders are labels. After a Gmail account connects, the app fetches labels
 In the Configure modal, choose which labels should be monitored. Sync checks the selected labels, merges duplicate message IDs across labels, and then processes each unique message once.
 
 The **Evaluate emails without attachments** setting is off by default. When it is off, Gmail sync skips body-only emails or emails without supported attachments and records them in inbox detection metrics as `skipped_no_supported_attachment`. Turn it on when you want the app to evaluate email-body purchase orders too.
+
+Use **Sync Now** on a Gmail inbox connection to run a manual date/time-range sync. The modal asks for a start and end datetime, then scans configured Gmail labels for messages received in that range. Gmail's search date operators are coarse by day, so the app also filters exact received datetime after fetching each message.
 
 Per-inbox schedule settings are stored for future automation:
 

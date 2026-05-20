@@ -101,6 +101,10 @@ class AppHandler(SimpleHTTPRequestHandler):
             if not self.require_permission("admin:view"):
                 return
             return self.respond_json(list_departments())
+        if parsed.path == "/api/payment-terms":
+            if not self.require_permission("admin:view"):
+                return
+            return self.respond_json(list_payment_terms())
         if parsed.path == "/api/testing/documents":
             if not self.require_permission("admin:view"):
                 return
@@ -212,6 +216,10 @@ class AppHandler(SimpleHTTPRequestHandler):
             if not self.require_permission("admin:view"):
                 return
             return self.respond_json(create_department(self.read_json()))
+        if parsed.path == "/api/payment-terms":
+            if not self.require_permission("admin:view"):
+                return
+            return self.respond_json(create_payment_term(self.read_json()))
         if parsed.path == "/api/testing/documents/upload":
             if not self.require_permission("admin:view"):
                 return
@@ -242,7 +250,7 @@ class AppHandler(SimpleHTTPRequestHandler):
             if not self.require_permission("admin:view"):
                 return
             account_id = int(parsed.path.split("/")[-2])
-            return self.respond_json(sync_inbox_account(account_id))
+            return self.respond_json(sync_inbox_account(account_id, self.read_json()))
         if parsed.path.startswith("/api/inbox-accounts/") and parsed.path.endswith("/labels/refresh"):
             if not self.require_permission("admin:view"):
                 return
@@ -334,6 +342,11 @@ class AppHandler(SimpleHTTPRequestHandler):
                 return
             department_id = int(parsed.path.rsplit("/", 1)[-1])
             return self.respond_json(update_department(department_id, self.read_json()))
+        if parsed.path.startswith("/api/payment-terms/"):
+            if not self.require_permission("admin:view"):
+                return
+            payment_term_id = int(parsed.path.rsplit("/", 1)[-1])
+            return self.respond_json(update_payment_term(payment_term_id, self.read_json()))
         if parsed.path.startswith("/api/testing/documents/") and parsed.path.endswith("/golden-answer"):
             if not self.require_permission("admin:view"):
                 return
@@ -415,6 +428,11 @@ class AppHandler(SimpleHTTPRequestHandler):
                 return
             department_id = int(parsed.path.rsplit("/", 1)[-1])
             return self.respond_json(delete_department(department_id))
+        if parsed.path.startswith("/api/payment-terms/"):
+            if not self.require_permission("admin:view"):
+                return
+            payment_term_id = int(parsed.path.rsplit("/", 1)[-1])
+            return self.respond_json(delete_payment_term(payment_term_id))
         if parsed.path.startswith("/api/testing/documents/"):
             if not self.require_permission("admin:view"):
                 return
@@ -749,12 +767,14 @@ def list_customers() -> list[dict]:
             conn.execute(
                 """
                 SELECT c.*,
+                    COALESCE(pt.name, c.payment_terms) AS payment_terms_display,
                     COUNT(DISTINCT CASE WHEN ca.address_type = 'bill_to' THEN ca.id END) AS bill_to_count,
                     COUNT(DISTINCT CASE WHEN ca.address_type = 'ship_to' THEN ca.id END) AS ship_to_count,
                     COUNT(DISTINCT cc.id) AS contact_count
                 FROM customers c
                 LEFT JOIN customer_addresses ca ON ca.customer_id = c.id
                 LEFT JOIN customer_contacts cc ON cc.customer_id = c.id
+                LEFT JOIN payment_terms pt ON pt.id = c.payment_terms_id
                 GROUP BY c.id
                 ORDER BY c.customer_name
                 """
@@ -764,7 +784,17 @@ def list_customers() -> list[dict]:
 
 def get_customer(customer_id: int) -> dict:
     with db() as conn:
-        customer = row_to_dict(conn.execute("SELECT * FROM customers WHERE id = ?", (customer_id,)).fetchone())
+        customer = row_to_dict(
+            conn.execute(
+                """
+                SELECT c.*, COALESCE(pt.name, c.payment_terms) AS payment_terms_display
+                FROM customers c
+                LEFT JOIN payment_terms pt ON pt.id = c.payment_terms_id
+                WHERE c.id = ?
+                """,
+                (customer_id,),
+            ).fetchone()
+        )
         if not customer:
             return {"error": "not_found"}
         addresses = rows_to_dicts(
@@ -780,10 +810,11 @@ def create_customer(payload: dict) -> dict:
     name = (payload.get("customer_name") or "").strip()
     if not name:
         return {"error": "customer_name_required", "customers": list_customers()}
+    payment_terms_id, payment_terms = resolve_payment_term_payload(payload)
     with db() as conn:
         cur = conn.execute(
-            "INSERT INTO customers (customer_name, customer_number, payment_terms) VALUES (?, ?, ?)",
-            (name, (payload.get("customer_number") or "").strip(), (payload.get("payment_terms") or "").strip()),
+            "INSERT INTO customers (customer_name, customer_number, payment_terms, payment_terms_id) VALUES (?, ?, ?, ?)",
+            (name, (payload.get("customer_number") or "").strip(), payment_terms, payment_terms_id),
         )
         conn.commit()
         return get_customer(int(cur.lastrowid))
@@ -793,17 +824,33 @@ def update_customer(customer_id: int, payload: dict) -> dict:
     name = (payload.get("customer_name") or "").strip()
     if not name:
         return {"error": "customer_name_required"}
+    payment_terms_id, payment_terms = resolve_payment_term_payload(payload)
     with db() as conn:
         conn.execute(
             """
             UPDATE customers
-            SET customer_name = ?, customer_number = ?, payment_terms = ?, updated_at = CURRENT_TIMESTAMP
+            SET customer_name = ?, customer_number = ?, payment_terms = ?, payment_terms_id = ?, updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
-            (name, (payload.get("customer_number") or "").strip(), (payload.get("payment_terms") or "").strip(), customer_id),
+            (name, (payload.get("customer_number") or "").strip(), payment_terms, payment_terms_id, customer_id),
         )
         conn.commit()
     return get_customer(customer_id)
+
+
+def resolve_payment_term_payload(payload: dict) -> tuple[int | None, str]:
+    payment_terms_id = int(payload.get("payment_terms_id") or 0) or None
+    payment_terms = (payload.get("payment_terms") or "").strip()
+    with db() as conn:
+        if payment_terms_id:
+            row = conn.execute("SELECT name FROM payment_terms WHERE id = ?", (payment_terms_id,)).fetchone()
+            if row:
+                return payment_terms_id, row["name"]
+        if payment_terms:
+            row = conn.execute("SELECT id, name FROM payment_terms WHERE LOWER(TRIM(name)) = LOWER(TRIM(?))", (payment_terms,)).fetchone()
+            if row:
+                return row["id"], row["name"]
+    return None, payment_terms
 
 
 def delete_customer(customer_id: int) -> dict:
@@ -1517,6 +1564,56 @@ def delete_department(department_id: int) -> dict:
         conn.execute("DELETE FROM departments WHERE id = ?", (department_id,))
         conn.commit()
     return {"departments": list_departments()}
+
+
+def list_payment_terms() -> list[dict]:
+    with db() as conn:
+        return rows_to_dicts(conn.execute("SELECT * FROM payment_terms ORDER BY is_active DESC, name").fetchall())
+
+
+def create_payment_term(payload: dict) -> dict:
+    name = (payload.get("name") or "").strip()
+    if not name:
+        return {"error": "name_required", "payment_terms": list_payment_terms()}
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO payment_terms (name, is_active)
+            VALUES (?, 1)
+            ON CONFLICT(name) DO UPDATE SET is_active = 1, updated_at = CURRENT_TIMESTAMP
+            """,
+            (name,),
+        )
+        conn.commit()
+    return {"payment_terms": list_payment_terms()}
+
+
+def update_payment_term(payment_term_id: int, payload: dict) -> dict:
+    name = (payload.get("name") or "").strip()
+    is_active = 1 if payload.get("is_active", True) else 0
+    with db() as conn:
+        if name:
+            conn.execute(
+                "UPDATE payment_terms SET name = ?, is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (name, is_active, payment_term_id),
+            )
+            conn.execute("UPDATE customers SET payment_terms = ? WHERE payment_terms_id = ?", (name, payment_term_id))
+        else:
+            conn.execute("UPDATE payment_terms SET is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (is_active, payment_term_id))
+        conn.commit()
+    return {"payment_terms": list_payment_terms()}
+
+
+def delete_payment_term(payment_term_id: int) -> dict:
+    with db() as conn:
+        used = conn.execute("SELECT COUNT(*) AS count FROM customers WHERE payment_terms_id = ?", (payment_term_id,)).fetchone()["count"]
+        if used:
+            conn.execute("UPDATE payment_terms SET is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (payment_term_id,))
+            conn.commit()
+            return {"payment_terms": list_payment_terms(), "message": "Payment term is used by customers, so it was deactivated instead of deleted."}
+        conn.execute("DELETE FROM payment_terms WHERE id = ?", (payment_term_id,))
+        conn.commit()
+    return {"payment_terms": list_payment_terms()}
 
 
 TEST_DOCUMENT_TYPES = {"po_pdf", "po_email_body", "scanned_po_pdf", "quote", "order_confirmation", "invoice", "rfq", "random_email", "other"}
@@ -2549,8 +2646,17 @@ def delete_inbox_account(account_id: int) -> dict:
     return list_inbox_accounts()
 
 
-def sync_inbox_account(account_id: int) -> dict:
+def sync_inbox_account(account_id: int, payload: dict | None = None) -> dict:
     started = now_iso()
+    payload = payload or {}
+    start_at = parse_local_datetime(payload.get("start_at"))
+    end_at = parse_local_datetime(payload.get("end_at"))
+    if payload.get("start_at") and not start_at:
+        return {"error": "Invalid sync start date/time.", **list_inbox_accounts()}
+    if payload.get("end_at") and not end_at:
+        return {"error": "Invalid sync end date/time.", **list_inbox_accounts()}
+    if start_at and end_at and end_at < start_at:
+        return {"error": "End date/time must be after start date/time.", **list_inbox_accounts()}
     errors: list[str] = []
     messages_seen = 0
     messages_imported = 0
@@ -2564,15 +2670,15 @@ def sync_inbox_account(account_id: int) -> dict:
             return {"error": "Inbox connection is deactivated. Reactivate it before syncing.", **list_inbox_accounts()}
         cur = conn.execute(
             """
-            INSERT INTO inbox_sync_runs (inbox_account_id, started_at, status, errors_json)
-            VALUES (?, ?, 'failed', '[]')
+            INSERT INTO inbox_sync_runs (inbox_account_id, started_at, start_at, end_at, status, errors_json)
+            VALUES (?, ?, ?, ?, 'failed', '[]')
             """,
-            (account_id, started),
+            (account_id, started, start_at.isoformat() if start_at else None, end_at.isoformat() if end_at else None),
         )
         run_id = int(cur.lastrowid)
         if account["provider"] == "gmail":
             try:
-                sync_result = sync_gmail_messages(conn, account_id, run_id)
+                sync_result = sync_gmail_messages(conn, account_id, run_id, start_at, end_at)
                 messages_seen = sync_result["messages_seen"]
                 messages_imported = sync_result["messages_imported"]
                 messages_skipped = sync_result["messages_skipped"]
@@ -2610,12 +2716,28 @@ def sync_inbox_account(account_id: int) -> dict:
     return {"sync_run": get_inbox_sync_run(run_id), **list_inbox_accounts()}
 
 
+def parse_local_datetime(value: object) -> datetime | None:
+    if not value:
+        return None
+    text = str(value).strip()
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
 def get_inbox_sync_run(run_id: int) -> dict | None:
     with db() as conn:
         return row_to_dict(conn.execute("SELECT * FROM inbox_sync_runs WHERE id = ?", (run_id,)).fetchone())
 
 
-def sync_gmail_messages(conn, account_id: int, run_id: int) -> dict:
+def sync_gmail_messages(conn, account_id: int, run_id: int, start_at: datetime | None = None, end_at: datetime | None = None) -> dict:
     account = row_to_dict(conn.execute("SELECT * FROM inbox_accounts WHERE id = ?", (account_id,)).fetchone())
     if not account:
         raise ValueError("Inbox account not found.")
@@ -2634,7 +2756,11 @@ def sync_gmail_messages(conn, account_id: int, run_id: int) -> dict:
     errors: list[str] = []
     for label_id in selected_labels:
         try:
-            messages_payload = gmail_api_get("/gmail/v1/users/me/messages", access_token, {"maxResults": "25", "labelIds": label_id})
+            params = {"maxResults": "100", "labelIds": label_id}
+            query = gmail_query_for_date_range(start_at, end_at)
+            if query:
+                params["q"] = query
+            messages_payload = gmail_api_get("/gmail/v1/users/me/messages", access_token, params)
             for item in messages_payload.get("messages") or []:
                 if item.get("id"):
                     messages_by_id[item["id"]] = item
@@ -2655,6 +2781,11 @@ def sync_gmail_messages(conn, account_id: int, run_id: int) -> dict:
         try:
             message = gmail_api_get(f"/gmail/v1/users/me/messages/{message_id}", access_token, {"format": "full"})
             headers = extract_gmail_headers(message.get("payload") or {})
+            received_at = parse_gmail_received_datetime(headers.get("date"), message.get("internalDate"))
+            if not message_received_in_range(received_at, start_at, end_at):
+                result["messages_skipped"] += 1
+                write_detection_result(conn, run_id, None, provider_message_id, "skipped_outside_sync_range", None, 0, 0, None, elapsed_ms(started), False, "Skipped because message was outside selected sync range.")
+                continue
             body_text = extract_gmail_body(message.get("payload") or {})
             attachments, attachment_errors = download_gmail_attachments(message, access_token, STORAGE_DIR / "gmail" / message_id)
             if not attachments and not account.get("evaluate_without_attachments"):
@@ -2680,7 +2811,7 @@ def sync_gmail_messages(conn, account_id: int, run_id: int) -> dict:
                 sender=headers.get("from", ""),
                 recipients=headers.get("to", ""),
                 subject=headers.get("subject", ""),
-                received_at=normalize_date(headers.get("date")) or headers.get("date", ""),
+                received_at=received_at.isoformat() if received_at else normalize_date(headers.get("date")) or headers.get("date", ""),
                 body_text=body_text,
                 attachments=attachments,
             )
@@ -2720,6 +2851,44 @@ def sync_gmail_messages(conn, account_id: int, run_id: int) -> dict:
             write_detection_result(conn, run_id, None, provider_message_id, None, None, 0, 0, None, elapsed_ms(started), False, str(exc))
     conn.commit()
     return result
+
+
+def gmail_query_for_date_range(start_at: datetime | None, end_at: datetime | None) -> str:
+    parts = []
+    if start_at:
+        parts.append(f"after:{start_at.date().isoformat()}")
+    if end_at:
+        parts.append(f"before:{(end_at.date() + timedelta(days=1)).isoformat()}")
+    return " ".join(parts)
+
+
+def parse_gmail_received_datetime(date_header: str | None, internal_date: object = None) -> datetime | None:
+    if internal_date:
+        try:
+            return datetime.fromtimestamp(int(internal_date) / 1000, tz=timezone.utc)
+        except (TypeError, ValueError):
+            pass
+    if date_header:
+        try:
+            from email.utils import parsedate_to_datetime
+
+            parsed = parsedate_to_datetime(date_header)
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+    return None
+
+
+def message_received_in_range(received_at: datetime | None, start_at: datetime | None, end_at: datetime | None) -> bool:
+    if not received_at:
+        return True
+    if received_at.tzinfo is None:
+        received_at = received_at.replace(tzinfo=timezone.utc)
+    if start_at and received_at < start_at:
+        return False
+    if end_at and received_at > end_at:
+        return False
+    return True
 
 
 def get_gmail_access_token(conn, inbox_account_id: int) -> str:
@@ -3344,6 +3513,12 @@ def csv_value(row: dict, resolved: dict[str, str], key: str) -> str:
 def upsert_customer_from_csv(conn, customer_name: str, customer_number: str, payment_terms: str) -> int | None:
     if not customer_name and not customer_number:
         return None
+    payment_terms_id = None
+    if payment_terms:
+        term = conn.execute("SELECT id, name FROM payment_terms WHERE LOWER(TRIM(name)) = LOWER(TRIM(?))", (payment_terms,)).fetchone()
+        if term:
+            payment_terms_id = term["id"]
+            payment_terms = term["name"]
     existing = find_customer_for_csv(conn, customer_name, customer_number)
     if existing:
         conn.execute(
@@ -3352,15 +3527,16 @@ def upsert_customer_from_csv(conn, customer_name: str, customer_number: str, pay
             SET customer_name = COALESCE(NULLIF(?, ''), customer_name),
                 customer_number = COALESCE(NULLIF(?, ''), customer_number),
                 payment_terms = COALESCE(NULLIF(?, ''), payment_terms),
+                payment_terms_id = COALESCE(?, payment_terms_id),
                 updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
-            (customer_name, customer_number, payment_terms, existing["id"]),
+            (customer_name, customer_number, payment_terms, payment_terms_id, existing["id"]),
         )
         return existing["id"]
     cur = conn.execute(
-        "INSERT INTO customers (customer_name, customer_number, payment_terms) VALUES (?, ?, ?)",
-        (customer_name or customer_number, customer_number, payment_terms),
+        "INSERT INTO customers (customer_name, customer_number, payment_terms, payment_terms_id) VALUES (?, ?, ?, ?)",
+        (customer_name or customer_number, customer_number, payment_terms, payment_terms_id),
     )
     return int(cur.lastrowid)
 

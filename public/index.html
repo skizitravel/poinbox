@@ -254,6 +254,30 @@
             </table>
           </div>
         </div>
+        <div class="admin-panel">
+          <div class="admin-head">
+            <div>
+              <h2>Payment Terms</h2>
+              <p>Maintain payment terms used in customer profiles.</p>
+            </div>
+          </div>
+          <div class="admin-form order-form">
+            <input id="paymentTermName" placeholder="Payment term name" />
+            <button id="addPaymentTermBtn">Add</button>
+          </div>
+          <div class="admin-table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Status</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="paymentTermRows"></tbody>
+            </table>
+          </div>
+        </div>
       </section>
       </section>
 
@@ -471,6 +495,7 @@
                 <tr>
                   <th>Timestamp</th>
                   <th>Provider</th>
+                  <th>Range</th>
                   <th>Status</th>
                   <th>Seen</th>
                   <th>Imported</th>
@@ -569,6 +594,27 @@
       </section>
     </div>
 
+    <div class="modal-backdrop hidden" id="manualSyncModal" aria-hidden="true">
+      <section class="modal compact-modal" role="dialog" aria-modal="true" aria-labelledby="manualSyncTitle">
+        <div class="modal-head">
+          <div>
+            <h2 id="manualSyncTitle">Manual Inbox Sync</h2>
+            <p>Select the received date/time range to scan for purchase orders.</p>
+          </div>
+          <button class="icon-btn" id="closeManualSyncBtn" title="Close">x</button>
+        </div>
+        <div class="grid">
+          <div class="field"><label>Start</label><input id="manualSyncStart" type="datetime-local" /></div>
+          <div class="field"><label>End</label><input id="manualSyncEnd" type="datetime-local" /></div>
+        </div>
+        <div class="upload-message" id="manualSyncMessage"></div>
+        <div class="modal-actions">
+          <button id="runManualSyncBtn">Sync</button>
+          <button class="secondary" id="cancelManualSyncBtn">Cancel</button>
+        </div>
+      </section>
+    </div>
+
     <div class="modal-backdrop hidden" id="userModal" aria-hidden="true">
       <section class="modal" role="dialog" aria-modal="true" aria-labelledby="userModalTitle">
         <div class="modal-head">
@@ -616,7 +662,8 @@
         <div class="grid">
           <div class="field"><label>Customer Name</label><input id="customerName" /></div>
           <div class="field"><label>Customer Number</label><input id="customerNumber" /></div>
-          <div class="field"><label>Payment Terms</label><input id="customerPaymentTerms" /></div>
+          <div class="field"><label>Payment Terms</label><select id="customerPaymentTermsId"></select></div>
+          <div class="field"><label>Payment Terms Text</label><input id="customerPaymentTerms" placeholder="Optional free-text fallback" /></div>
         </div>
         <div class="upload-message" id="customerModalMessage"></div>
         <div class="modal-actions">

@@ -6,6 +6,7 @@ let xrefs = [];
 let users = [];
 let customers = [];
 let departments = [];
+let paymentTerms = [];
 let testDocuments = [];
 let evaluationData = { run: null, results: [] };
 let inboxAccounts = [];
@@ -26,6 +27,7 @@ let editingContactId = null;
 let pendingReviewAction = null;
 let editingGoldenDocumentId = null;
 let currentGoldenAnswer = null;
+let manualSyncInboxId = null;
 
 const statuses = ["Received", "Needs Review", "Booked", "Rejected"];
 const headerFields = [
@@ -192,7 +194,6 @@ function renderDetail() {
       <div class="detail-status">${!canEditDashboard() ? '<span class="badge ViewOnly">View Only</span>' : ""}${badge(po.status)}</div>
     </div>
     <div class="grid">${headerFields.map((field) => renderField(po, field, "po")).join("")}</div>
-    ${renderInlineMasterDataAction("customer")}
     ${renderStructuredAddressSection("bill_to", "Bill-To Address", "bill_to_address_structured_json", "bill_to_address")}
     ${renderStructuredAddressSection("ship_to", "Ship-To Address", "ship_to_address_structured_json", "ship_to_address")}
     <div class="muted-panel">Corrections captured for learning: ${po.extraction_feedback_count || 0}. Reviewed: ${po.extraction_reviewed_at ? safe(po.extraction_reviewed_at) : "Not reviewed"}.</div>
@@ -221,19 +222,20 @@ function renderField(record, field, prefix) {
   const confidence = confidenceFor(record, key);
   const review = confidence < 0.7 ? "review" : "";
   const reviewNote = confidence < 0.7 ? '<div class="review-note">Review</div>' : "";
+  const action = renderFieldAction(key);
   if (!canEditDashboard() && !["readonly", "lineTotal"].includes(type)) {
     return renderReadonlyField(record, key, label, size, review, reviewNote);
   }
   if (type === "select") {
     return `<div class="field ${size} ${review}"><label>${label}</label><select id="${id}">${statuses
       .map((s) => `<option ${record[key] === s ? "selected" : ""}>${s}</option>`)
-      .join("")}</select>${reviewNote}</div>`;
+      .join("")}</select>${reviewNote}${action}</div>`;
   }
   if (type === "orderType") {
     return `<div class="field ${size} ${review}"><label>${label}</label><select id="${id}">
       <option value="">Select order type</option>
       ${orderTypes.map((orderType) => `<option value="${orderType.id}" ${Number(record[key]) === Number(orderType.id) ? "selected" : ""}>${safe(orderType.name)}</option>`).join("")}
-    </select>${reviewNote}</div>`;
+    </select>${reviewNote}${action}</div>`;
   }
   if (type === "readonly") {
     return `<div class="field ${size}"><label>${label}</label><div class="readonly-value">${money(record[key], record.currency)}</div></div>`;
@@ -242,9 +244,9 @@ function renderField(record, field, prefix) {
     return `<div class="field ${size}"><label>${label}</label><div class="readonly-value">${money(calculatedLineTotal(record), currentDetail?.purchase_order?.currency || "USD")}</div></div>`;
   }
   if (type === "textarea") {
-    return `<div class="field ${size} ${review}"><label>${label}</label><textarea id="${id}">${safe(record[key])}</textarea>${reviewNote}</div>`;
+    return `<div class="field ${size} ${review}"><label>${label}</label><textarea id="${id}">${safe(record[key])}</textarea>${reviewNote}${action}</div>`;
   }
-  return `<div class="field ${size} ${review}"><label>${label}</label><input id="${id}" type="${type}" value="${safe(inputValue(record[key], type))}" />${reviewNote}</div>`;
+  return `<div class="field ${size} ${review}"><label>${label}</label><input id="${id}" type="${type}" value="${safe(inputValue(record[key], type))}" />${reviewNote}${action}</div>`;
 }
 
 function renderReadonlyField(record, key, label, size, review, reviewNote) {
@@ -252,7 +254,13 @@ function renderReadonlyField(record, key, label, size, review, reviewNote) {
   if (key === "status") value = badge(value);
   else if (key === "order_type_id") value = safe(record.order_type_name || "");
   else value = safe(inputValue(value, "text"));
-  return `<div class="field ${size} ${review}"><label>${label}</label><div class="readonly-value">${value}</div>${reviewNote}</div>`;
+  return `<div class="field ${size} ${review}"><label>${label}</label><div class="readonly-value">${value}</div>${reviewNote}${renderFieldAction(key)}</div>`;
+}
+
+function renderFieldAction(key) {
+  if (key === "customer_company_name") return renderInlineMasterDataAction("customer");
+  if (key === "customer_contact_name") return renderInlineMasterDataAction("contact");
+  return "";
 }
 
 function renderStructuredAddressSection(prefix, title, jsonKey, textKey) {
@@ -583,13 +591,14 @@ async function switchView(view) {
 
 async function loadAdminData() {
   if (!canViewAdmin()) return;
-  const requests = [api("/api/order-types"), api("/api/customer-part-xrefs"), api("/api/customers"), api("/api/departments")];
+  const requests = [api("/api/order-types"), api("/api/customer-part-xrefs"), api("/api/customers"), api("/api/departments"), api("/api/payment-terms")];
   if (canManageUsers()) requests.push(api("/api/users"));
-  const [orderTypeData, xrefData, customerData, departmentData, userData] = await Promise.all(requests);
+  const [orderTypeData, xrefData, customerData, departmentData, paymentTermData, userData] = await Promise.all(requests);
   orderTypes = orderTypeData;
   xrefs = xrefData;
   customers = customerData;
   departments = departmentData;
+  paymentTerms = paymentTermData;
   users = userData || [];
   document.querySelector("#usersPanel").classList.toggle("hidden", !canManageUsers());
   document.querySelector("#adminTabUsersBtn").classList.toggle("hidden", !canManageUsers());
@@ -598,6 +607,7 @@ async function loadAdminData() {
   renderUsers();
   renderCustomers();
   renderDepartments();
+  renderPaymentTerms();
   await loadTestingData();
 }
 
@@ -872,6 +882,23 @@ function renderExtractionLearning() {
     .join("");
 }
 
+function renderPaymentTerms() {
+  document.querySelector("#paymentTermRows").innerHTML = paymentTerms
+    .map(
+      (row) => `
+      <tr>
+        <td><input id="payment_term_name_${row.id}" value="${safe(row.name)}" /></td>
+        <td>${row.is_active ? "Active" : "Inactive"}</td>
+        <td>
+          <button class="secondary" onclick="savePaymentTerm(${row.id})">Save</button>
+          <button class="danger" onclick="deletePaymentTerm(${row.id})">Delete</button>
+        </td>
+      </tr>
+    `,
+    )
+    .join("");
+}
+
 function miniList(rows, labelKey) {
   if (!rows.length) return '<div class="muted-panel">No data yet.</div>';
   return rows.map((row) => `<span class="mini-pill">${safe(row[labelKey])}: ${row.count}</span>`).join("");
@@ -918,6 +945,7 @@ function renderSyncRuns() {
       <tr>
         <td>${safe(row.started_at || row.created_at)}</td>
         <td>${safe(row.provider)}</td>
+        <td>${safe(row.start_at || "")}${row.end_at ? ` to ${safe(row.end_at)}` : ""}</td>
         <td>${safe(row.status)}</td>
         <td>${row.messages_seen}</td>
         <td>${row.messages_imported}</td>
@@ -1133,22 +1161,64 @@ async function saveOpenAIConfig() {
 }
 
 async function syncInboxAccount(id) {
-  setMessage("#testingMessage", "Running inbox sync...");
-  const data = await api(`/api/inbox-accounts/${id}/sync`, { method: "POST", body: "{}" });
+  openManualSyncModal(id);
+}
+
+function openManualSyncModal(id) {
+  manualSyncInboxId = id;
+  const account = inboxAccounts.find((row) => Number(row.id) === Number(id)) || {};
+  const end = new Date();
+  const start = account.last_sync_at ? new Date(account.last_sync_at) : new Date(end.getTime() - 24 * 60 * 60 * 1000);
+  document.querySelector("#manualSyncStart").value = datetimeLocalValue(start);
+  document.querySelector("#manualSyncEnd").value = datetimeLocalValue(end);
+  setMessage("#manualSyncMessage", "");
+  document.querySelector("#manualSyncModal").classList.remove("hidden");
+  document.querySelector("#manualSyncModal").setAttribute("aria-hidden", "false");
+}
+
+function closeManualSyncModal() {
+  manualSyncInboxId = null;
+  document.querySelector("#manualSyncModal").classList.add("hidden");
+  document.querySelector("#manualSyncModal").setAttribute("aria-hidden", "true");
+}
+
+function datetimeLocalValue(date) {
+  if (!(date instanceof Date) || Number.isNaN(date.getTime())) date = new Date();
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+async function runManualSync() {
+  if (!manualSyncInboxId) return;
+  const startAt = document.querySelector("#manualSyncStart").value;
+  const endAt = document.querySelector("#manualSyncEnd").value;
+  if (!startAt || !endAt || new Date(endAt) < new Date(startAt)) {
+    setMessage("#manualSyncMessage", "Enter a valid date/time range.", "error");
+    return;
+  }
+  const button = document.querySelector("#runManualSyncBtn");
+  button.disabled = true;
+  setMessage("#manualSyncMessage", `Syncing Gmail from ${startAt} to ${endAt}...`);
+  const data = await api(`/api/inbox-accounts/${manualSyncInboxId}/sync`, { method: "POST", body: JSON.stringify({ start_at: startAt, end_at: endAt }) });
   inboxAccounts = data.accounts || [];
   inboxSyncRuns = data.sync_runs || [];
   if (data.error) {
-    setMessage("#testingMessage", data.error, "error");
+    setMessage("#manualSyncMessage", data.error, "error");
+    button.disabled = false;
     renderInboxAccounts(data.gmail_configured);
     renderSyncRuns();
     return;
   }
   const detection = await api("/api/inbox-detection-results");
   inboxDetectionResults = detection.results || [];
-  setMessage("#testingMessage", data.sync_run?.status === "failed" ? "Sync failed. Check sync run errors." : "Sync complete.", data.sync_run?.status === "failed" ? "error" : "success");
+  const run = data.sync_run || {};
+  const summary = `Seen ${run.messages_seen || 0}, imported ${run.messages_imported || 0}, skipped ${run.messages_skipped || 0}, POs created ${run.purchase_orders_created || 0}.`;
+  setMessage("#manualSyncMessage", (run.messages_seen || 0) === 0 ? `No messages found in selected range. ${summary}` : `${run.status === "failed" ? "Sync failed." : "Sync complete."} ${summary}`, run.status === "failed" ? "error" : "success");
+  button.disabled = false;
   renderInboxAccounts(data.gmail_configured);
   renderSyncRuns();
   renderDetectionResults();
+  await refresh();
 }
 
 async function deleteInboxAccount(id) {
@@ -1185,7 +1255,7 @@ function renderCustomers() {
       <tr>
         <td>${safe(row.customer_name)}</td>
         <td>${safe(row.customer_number)}</td>
-        <td>${safe(row.payment_terms)}</td>
+        <td>${safe(row.payment_terms_display || row.payment_terms)}</td>
         <td>${row.bill_to_count || 0}</td>
         <td>${row.ship_to_count || 0}</td>
         <td>${row.contact_count || 0}</td>
@@ -1204,6 +1274,7 @@ async function openCustomerModal(id = null) {
   document.querySelector("#customerName").value = "";
   document.querySelector("#customerNumber").value = "";
   document.querySelector("#customerPaymentTerms").value = "";
+  renderCustomerPaymentTermOptions();
   clearAddressForm();
   document.querySelector("#addressRows").innerHTML = "";
   document.querySelector("#contactRows").innerHTML = "";
@@ -1215,6 +1286,7 @@ async function openCustomerModal(id = null) {
     document.querySelector("#customerName").value = customer.customer_name || "";
     document.querySelector("#customerNumber").value = customer.customer_number || "";
     document.querySelector("#customerPaymentTerms").value = customer.payment_terms || "";
+    renderCustomerPaymentTermOptions(customer.payment_terms_id, customer.payment_terms);
     renderCustomerChildren();
   }
   document.querySelector("#customerModal").classList.remove("hidden");
@@ -1228,10 +1300,22 @@ function closeCustomerModal() {
   document.querySelector("#customerModal").classList.add("hidden");
 }
 
+function renderCustomerPaymentTermOptions(selectedId = null, fallbackText = "") {
+  const select = document.querySelector("#customerPaymentTermsId");
+  const activeTerms = paymentTerms.filter((term) => term.is_active || Number(term.id) === Number(selectedId));
+  const hasSelected = activeTerms.some((term) => Number(term.id) === Number(selectedId));
+  select.innerHTML = `
+    <option value="">${fallbackText ? "Use text value" : "Select payment terms"}</option>
+    ${!hasSelected && selectedId ? `<option value="${selectedId}" selected>Current: ${safe(fallbackText || selectedId)}</option>` : ""}
+    ${activeTerms.map((term) => `<option value="${term.id}" ${Number(term.id) === Number(selectedId) ? "selected" : ""}>${safe(term.name)}</option>`).join("")}
+  `;
+}
+
 async function saveCustomer() {
   const payload = {
     customer_name: document.querySelector("#customerName").value.trim(),
     customer_number: document.querySelector("#customerNumber").value.trim(),
+    payment_terms_id: document.querySelector("#customerPaymentTermsId").value,
     payment_terms: document.querySelector("#customerPaymentTerms").value.trim(),
   };
   const path = editingCustomerId ? `/api/customers/${editingCustomerId}` : "/api/customers";
@@ -1705,6 +1789,32 @@ async function deleteDepartment(id) {
   renderDepartments();
 }
 
+async function addPaymentTerm() {
+  if (!canViewAdmin()) return;
+  const input = document.querySelector("#paymentTermName");
+  if (!input.value.trim()) return;
+  const data = await api("/api/payment-terms", { method: "POST", body: JSON.stringify({ name: input.value.trim() }) });
+  paymentTerms = data.payment_terms || [];
+  input.value = "";
+  renderPaymentTerms();
+}
+
+async function savePaymentTerm(id) {
+  if (!canViewAdmin()) return;
+  const name = document.querySelector(`#payment_term_name_${id}`).value.trim();
+  const data = await api(`/api/payment-terms/${id}`, { method: "PUT", body: JSON.stringify({ name, is_active: true }) });
+  paymentTerms = data.payment_terms || [];
+  renderPaymentTerms();
+}
+
+async function deletePaymentTerm(id) {
+  if (!canViewAdmin()) return;
+  const data = await api(`/api/payment-terms/${id}`, { method: "DELETE" });
+  paymentTerms = data.payment_terms || [];
+  if (data.message) alert(data.message);
+  renderPaymentTerms();
+}
+
 async function addXref() {
   if (!canViewAdmin()) return;
   const payload = {
@@ -2086,6 +2196,7 @@ document.querySelector("#adminTabSetupBtn").addEventListener("click", () => swit
 document.querySelector("#adminTabTestingBtn").addEventListener("click", () => switchAdminTab("testing"));
 document.querySelector("#addOrderTypeBtn").addEventListener("click", addOrderType);
 document.querySelector("#addDepartmentBtn").addEventListener("click", addDepartment);
+document.querySelector("#addPaymentTermBtn").addEventListener("click", addPaymentTerm);
 document.querySelector("#addXrefBtn").addEventListener("click", addXref);
 document.querySelector("#inviteUserBtn").addEventListener("click", inviteUser);
 document.querySelector("#closeUserModalBtn").addEventListener("click", closeUserModal);
@@ -2125,6 +2236,9 @@ document.querySelector("#closeInboxConfigBtn").addEventListener("click", closeIn
 document.querySelector("#cancelInboxConfigBtn").addEventListener("click", closeInboxConfig);
 document.querySelector("#refreshInboxLabelsBtn").addEventListener("click", refreshInboxLabels);
 document.querySelector("#saveInboxConfigBtn").addEventListener("click", saveInboxConfig);
+document.querySelector("#closeManualSyncBtn").addEventListener("click", closeManualSyncModal);
+document.querySelector("#cancelManualSyncBtn").addEventListener("click", closeManualSyncModal);
+document.querySelector("#runManualSyncBtn").addEventListener("click", runManualSync);
 document.querySelector("#closeGoldenModalBtn").addEventListener("click", closeGoldenModal);
 document.querySelector("#cancelGoldenModalBtn").addEventListener("click", closeGoldenModal);
 document.querySelector("#saveGoldenHeaderBtn").addEventListener("click", saveGoldenHeader);
