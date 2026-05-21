@@ -31,6 +31,11 @@ from server.config import (
     GMAIL_CLIENT_SECRET,
     GMAIL_REDIRECT_URI,
     GMAIL_SCOPES,
+    OUTLOOK_CLIENT_ID,
+    OUTLOOK_CLIENT_SECRET,
+    OUTLOOK_REDIRECT_URI,
+    OUTLOOK_SCOPES,
+    OUTLOOK_TENANT,
     PUBLIC_DIR,
     SAMPLES_DIR,
     STORAGE_DIR,
@@ -136,6 +141,10 @@ class AppHandler(SimpleHTTPRequestHandler):
             if not self.require_permission("admin:view"):
                 return
             return self.respond_json(get_gmail_oauth_config())
+        if parsed.path == "/api/outlook-oauth-config":
+            if not self.require_permission("admin:view"):
+                return
+            return self.respond_json(get_outlook_oauth_config())
         if parsed.path == "/api/openai-extraction-config":
             if not self.require_permission("admin:view"):
                 return
@@ -150,6 +159,9 @@ class AppHandler(SimpleHTTPRequestHandler):
             return self.respond_json(extraction_learning_dashboard(params))
         if parsed.path == "/api/oauth/gmail/callback":
             body, status = gmail_oauth_callback(parsed.query)
+            return self.respond_html(body, status)
+        if parsed.path == "/api/oauth/outlook/callback":
+            body, status = outlook_oauth_callback(parsed.query)
             return self.respond_html(body, status)
         if parsed.path == "/api/customer-part-xrefs":
             if not self.require_permission("admin:view"):
@@ -233,6 +245,11 @@ class AppHandler(SimpleHTTPRequestHandler):
             if not actor:
                 return
             return self.respond_json(connect_gmail_account(self.read_json(), actor))
+        if parsed.path == "/api/inbox-accounts/outlook/connect":
+            actor = self.require_permission("admin:view")
+            if not actor:
+                return
+            return self.respond_json(connect_outlook_account(self.read_json(), actor))
         if parsed.path == "/api/inbox-accounts":
             actor = self.require_permission("admin:view")
             if not actor:
@@ -242,6 +259,10 @@ class AppHandler(SimpleHTTPRequestHandler):
             if not self.require_permission("admin:view"):
                 return
             return self.respond_json(save_gmail_oauth_config(self.read_json()))
+        if parsed.path == "/api/outlook-oauth-config":
+            if not self.require_permission("admin:view"):
+                return
+            return self.respond_json(save_outlook_oauth_config(self.read_json()))
         if parsed.path == "/api/openai-extraction-config":
             if not self.require_permission("admin:view"):
                 return
@@ -2301,11 +2322,18 @@ def list_inbox_accounts() -> dict:
             ).fetchall()
         )
     gmail_config = gmail_oauth_values()
-    return {"accounts": accounts, "sync_runs": runs, "gmail_configured": bool(gmail_config["client_id"] and gmail_config["client_secret"])}
+    outlook_config = outlook_oauth_values()
+    return {
+        "accounts": accounts,
+        "sync_runs": runs,
+        "gmail_configured": bool(gmail_config["client_id"] and gmail_config["client_secret"]),
+        "outlook_configured": bool(outlook_config["client_id"] and outlook_config["client_secret"]),
+    }
 
 
 def create_inbox_account(payload: dict, actor: dict) -> dict:
     provider = payload.get("provider") if payload.get("provider") in {"gmail", "outlook"} else "gmail"
+    default_folder = "Inbox" if provider == "outlook" else "INBOX"
     with db() as conn:
         conn.execute(
             """
@@ -2320,7 +2348,7 @@ def create_inbox_account(payload: dict, actor: dict) -> dict:
                 (payload.get("display_name") or f"{provider.title()} Inbox").strip(),
                 (payload.get("connected_email") or "").strip(),
                 (payload.get("monitored_email") or "").strip(),
-                (payload.get("folder") or "INBOX").strip(),
+                (payload.get("folder") or default_folder).strip(),
                 bool_int(payload.get("is_enabled", True)),
                 bool_int(payload.get("evaluate_without_attachments")),
                 clean_sync_interval(payload.get("sync_interval_hours", 24)),
@@ -2356,12 +2384,45 @@ def connect_gmail_account(payload: dict, actor: dict) -> dict:
     return {"auth_url": "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params), **list_inbox_accounts()}
 
 
+def connect_outlook_account(payload: dict, actor: dict) -> dict:
+    config = outlook_oauth_values()
+    if not config["client_id"] or not config["client_secret"]:
+        return {"error": "Outlook OAuth is not configured. Add the client ID, client secret, tenant, redirect URI, and scopes in the Outlook / Microsoft Graph Configuration panel.", **list_inbox_accounts()}
+    state = uuid.uuid4().hex
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO oauth_states (state, provider, user_id, inbox_account_id) VALUES (?, 'outlook', ?, ?)",
+            (state, actor.get("id"), payload.get("inbox_account_id")),
+        )
+        conn.commit()
+    tenant = config["tenant"] or "common"
+    params = {
+        "client_id": config["client_id"],
+        "redirect_uri": config["redirect_uri"],
+        "response_type": "code",
+        "response_mode": "query",
+        "scope": config["scopes"],
+        "state": state,
+    }
+    return {"auth_url": f"https://login.microsoftonline.com/{urllib.parse.quote(tenant)}/oauth2/v2.0/authorize?" + urllib.parse.urlencode(params), **list_inbox_accounts()}
+
+
 def gmail_oauth_values() -> dict[str, str]:
     return {
         "client_id": setting_value("gmail_client_id") or GMAIL_CLIENT_ID,
         "client_secret": setting_value("gmail_client_secret") or GMAIL_CLIENT_SECRET,
         "redirect_uri": setting_value("gmail_redirect_uri") or GMAIL_REDIRECT_URI,
         "scopes": setting_value("gmail_scopes") or GMAIL_SCOPES,
+    }
+
+
+def outlook_oauth_values() -> dict[str, str]:
+    return {
+        "client_id": setting_value("outlook_client_id") or OUTLOOK_CLIENT_ID,
+        "client_secret": setting_value("outlook_client_secret") or OUTLOOK_CLIENT_SECRET,
+        "tenant": setting_value("outlook_tenant") or OUTLOOK_TENANT,
+        "redirect_uri": setting_value("outlook_redirect_uri") or OUTLOOK_REDIRECT_URI,
+        "scopes": setting_value("outlook_scopes") or OUTLOOK_SCOPES,
     }
 
 
@@ -2381,6 +2442,24 @@ def get_gmail_oauth_config() -> dict:
     }
 
 
+def get_outlook_oauth_config() -> dict:
+    values = outlook_oauth_values()
+    return {
+        "client_id": values["client_id"],
+        "client_secret_configured": bool(values["client_secret"]),
+        "tenant": values["tenant"],
+        "redirect_uri": values["redirect_uri"],
+        "scopes": values["scopes"],
+        "source": {
+            "client_id": "database" if setting_value("outlook_client_id") else "env" if OUTLOOK_CLIENT_ID else "missing",
+            "client_secret": "database" if setting_value("outlook_client_secret") else "env" if OUTLOOK_CLIENT_SECRET else "missing",
+            "tenant": "database" if setting_value("outlook_tenant") else "env/default",
+            "redirect_uri": "database" if setting_value("outlook_redirect_uri") else "env/default",
+            "scopes": "database" if setting_value("outlook_scopes") else "env/default",
+        },
+    }
+
+
 def save_gmail_oauth_config(payload: dict) -> dict:
     upsert_setting("gmail_client_id", (payload.get("client_id") or "").strip(), False)
     if payload.get("client_secret"):
@@ -2388,6 +2467,16 @@ def save_gmail_oauth_config(payload: dict) -> dict:
     upsert_setting("gmail_redirect_uri", (payload.get("redirect_uri") or GMAIL_REDIRECT_URI).strip(), False)
     upsert_setting("gmail_scopes", (payload.get("scopes") or GMAIL_SCOPES).strip(), False)
     return get_gmail_oauth_config()
+
+
+def save_outlook_oauth_config(payload: dict) -> dict:
+    upsert_setting("outlook_client_id", (payload.get("client_id") or "").strip(), False)
+    if payload.get("client_secret"):
+        upsert_setting("outlook_client_secret", str(payload.get("client_secret")).strip(), True)
+    upsert_setting("outlook_tenant", (payload.get("tenant") or OUTLOOK_TENANT).strip() or "common", False)
+    upsert_setting("outlook_redirect_uri", (payload.get("redirect_uri") or OUTLOOK_REDIRECT_URI).strip(), False)
+    upsert_setting("outlook_scopes", (payload.get("scopes") or OUTLOOK_SCOPES).strip(), False)
+    return get_outlook_oauth_config()
 
 
 def setting_value(key: str) -> str:
@@ -2473,6 +2562,71 @@ def gmail_oauth_callback(query: str) -> tuple[str, int]:
             return oauth_result_page("Gmail connection failed", "The token exchange failed. Check the Gmail OAuth configuration and server logs."), 500
 
 
+def outlook_oauth_callback(query: str) -> tuple[str, int]:
+    params = parse_qs(query)
+    if params.get("error"):
+        return oauth_result_page("Outlook connection failed", params["error"][0]), 400
+    code = params.get("code", [""])[0]
+    state = params.get("state", [""])[0]
+    if not code or not state:
+        return oauth_result_page("Outlook connection failed", "Missing code or state."), 400
+    with db() as conn:
+        state_row = conn.execute("SELECT * FROM oauth_states WHERE state = ? AND provider = 'outlook'", (state,)).fetchone()
+        if not state_row:
+            return oauth_result_page("Outlook connection failed", "OAuth state was invalid or expired."), 400
+        try:
+            token = exchange_outlook_code(code)
+            access_token = token.get("access_token")
+            refresh_token = token.get("refresh_token")
+            if not access_token:
+                raise ValueError("Microsoft did not return an access token.")
+            profile = outlook_api_get("/v1.0/me", access_token, {"$select": "displayName,mail,userPrincipalName"})
+            email = profile.get("mail") or profile.get("userPrincipalName") or ""
+            display_name = profile.get("displayName") or email
+            expires_at = token_expiry_iso(token.get("expires_in", 3600))
+            existing = conn.execute("SELECT id, refresh_token FROM inbox_accounts WHERE provider = 'outlook' AND connected_email = ?", (email,)).fetchone()
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE inbox_accounts
+                    SET display_name = COALESCE(NULLIF(display_name, ''), ?), access_token = ?,
+                        refresh_token = COALESCE(?, refresh_token), token_expires_at = ?, granted_scopes = ?,
+                        monitored_email = COALESCE(NULLIF(monitored_email, ''), ?), folder = COALESCE(NULLIF(folder, ''), 'Inbox'),
+                        sync_status = 'connected', is_enabled = 1, next_sync_at = COALESCE(next_sync_at, ?),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (f"Outlook - {display_name}", access_token, refresh_token, expires_at, token.get("scope") or "", email, calculate_next_sync_at(24, "02:00"), existing["id"]),
+                )
+                account_id = existing["id"]
+            else:
+                cur = conn.execute(
+                    """
+                    INSERT INTO inbox_accounts (
+                        provider, display_name, connected_email, monitored_email, folder, sync_status,
+                        access_token, refresh_token, token_expires_at, granted_scopes, is_enabled,
+                        evaluate_without_attachments, sync_interval_hours, sync_start_time, next_sync_at,
+                        created_by_user_id
+                    )
+                    VALUES ('outlook', ?, ?, ?, 'Inbox', 'connected', ?, ?, ?, ?, 1, 0, 24, '02:00', ?, ?)
+                    """,
+                    (f"Outlook - {display_name}", email, email, access_token, refresh_token, expires_at, token.get("scope") or "", calculate_next_sync_at(24, "02:00"), state_row["user_id"]),
+                )
+                account_id = int(cur.lastrowid)
+            refresh_outlook_folders(conn, account_id)
+            conn.execute("DELETE FROM oauth_states WHERE state = ?", (state,))
+            conn.commit()
+            return oauth_result_page("Outlook connected", f"{email} is connected. You can close this tab and return to POInbox."), 200
+        except Exception as exc:
+            conn.execute(
+                "INSERT INTO processing_logs (level, message, metadata_json) VALUES ('error', ?, ?)",
+                ("Outlook OAuth callback failed.", json.dumps({"error": str(exc)})),
+            )
+            conn.execute("DELETE FROM oauth_states WHERE state = ?", (state,))
+            conn.commit()
+            return oauth_result_page("Outlook connection failed", "The token exchange failed. Check the Outlook OAuth configuration and server logs."), 500
+
+
 def oauth_result_page(title: str, message: str) -> str:
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>{html.escape(title)}</title>
@@ -2493,6 +2647,28 @@ def exchange_gmail_code(code: str) -> dict:
     ).encode("utf-8")
     request = urllib.request.Request(
         "https://oauth2.googleapis.com/token",
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    return urlopen_json(request)
+
+
+def exchange_outlook_code(code: str) -> dict:
+    config = outlook_oauth_values()
+    tenant = config["tenant"] or "common"
+    payload = urllib.parse.urlencode(
+        {
+            "code": code,
+            "client_id": config["client_id"],
+            "client_secret": config["client_secret"],
+            "redirect_uri": config["redirect_uri"],
+            "grant_type": "authorization_code",
+            "scope": config["scopes"],
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        f"https://login.microsoftonline.com/{urllib.parse.quote(tenant)}/oauth2/v2.0/token",
         data=payload,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         method="POST",
@@ -2599,10 +2775,13 @@ def refresh_inbox_labels_response(account_id: int) -> dict:
         account = row_to_dict(conn.execute("SELECT * FROM inbox_accounts WHERE id = ?", (account_id,)).fetchone())
         if not account:
             return {"error": "not_found"}
-        if account["provider"] != "gmail":
-            return {"error": "Label refresh is only implemented for Gmail."}
         try:
-            labels = refresh_inbox_labels(conn, account_id)
+            if account["provider"] == "gmail":
+                labels = refresh_inbox_labels(conn, account_id)
+            elif account["provider"] == "outlook":
+                labels = refresh_outlook_folders(conn, account_id)
+            else:
+                return {"error": "Unknown inbox provider.", **get_inbox_config(account_id)}
             conn.commit()
             return {"labels": labels, **get_inbox_config(account_id)}
         except Exception as exc:
@@ -2656,6 +2835,49 @@ def refresh_inbox_labels(conn, inbox_account_id: int) -> list[dict]:
             (inbox_account_id, *seen),
         )
     return list_inbox_labels(conn, inbox_account_id)
+
+
+def refresh_outlook_folders(conn, inbox_account_id: int) -> list[dict]:
+    access_token = get_outlook_access_token(conn, inbox_account_id)
+    payload = outlook_api_get("/v1.0/me/mailFolders", access_token, {"$top": "100"})
+    folders = payload.get("value") or []
+    existing = {
+        row["label_id"]: row
+        for row in conn.execute("SELECT label_id, is_selected FROM inbox_labels WHERE inbox_account_id = ?", (inbox_account_id,)).fetchall()
+    }
+    any_existing_selected = any(row["is_selected"] for row in existing.values())
+    seen = set()
+    for folder in folders:
+        folder_id = folder.get("id") or ""
+        if not folder_id:
+            continue
+        seen.add(folder_id)
+        name = folder.get("displayName") or folder_id
+        is_inbox = normalize_label_name(name) == "inbox" or normalize_label_name(folder.get("wellKnownName")) == "inbox"
+        default_selected = 1 if is_inbox and not any_existing_selected else 0
+        selected = existing[folder_id]["is_selected"] if folder_id in existing else default_selected
+        conn.execute(
+            """
+            INSERT INTO inbox_labels (inbox_account_id, provider, label_id, label_name, label_type, is_selected)
+            VALUES (?, 'outlook', ?, ?, 'folder', ?)
+            ON CONFLICT(inbox_account_id, label_id) DO UPDATE SET
+                label_name = excluded.label_name,
+                label_type = excluded.label_type,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (inbox_account_id, folder_id, name, selected),
+        )
+    if seen:
+        placeholders = ",".join("?" for _ in seen)
+        conn.execute(
+            f"DELETE FROM inbox_labels WHERE inbox_account_id = ? AND label_id NOT IN ({placeholders})",
+            (inbox_account_id, *seen),
+        )
+    return list_inbox_labels(conn, inbox_account_id)
+
+
+def normalize_label_name(value: object) -> str:
+    return re.sub(r"\s+", "", str(value or "").strip().lower())
 
 
 def clean_sync_interval(value: object) -> int:
@@ -2733,7 +2955,15 @@ def sync_inbox_account(account_id: int, payload: dict | None = None) -> dict:
             except Exception as exc:
                 errors.append(str(exc))
         elif account["provider"] == "outlook":
-            errors.append("Outlook connector is planned but not implemented in this MVP.")
+            try:
+                sync_result = sync_outlook_messages(conn, account_id, run_id, start_at, end_at)
+                messages_seen = sync_result["messages_seen"]
+                messages_imported = sync_result["messages_imported"]
+                messages_skipped = sync_result["messages_skipped"]
+                purchase_orders_created = sync_result["purchase_orders_created"]
+                errors.extend(sync_result["errors"])
+            except Exception as exc:
+                errors.append(str(exc))
         else:
             errors.append("Unknown inbox provider.")
         conn.execute(
@@ -2941,6 +3171,191 @@ def sync_gmail_messages(conn, account_id: int, run_id: int, start_at: datetime |
     return result
 
 
+def sync_outlook_messages(conn, account_id: int, run_id: int, start_at: datetime | None = None, end_at: datetime | None = None) -> dict:
+    account = row_to_dict(conn.execute("SELECT * FROM inbox_accounts WHERE id = ?", (account_id,)).fetchone())
+    if not account:
+        raise ValueError("Inbox account not found.")
+    access_token = get_outlook_access_token(conn, account_id)
+    refresh_outlook_folders(conn, account_id)
+    selected_folders = [
+        row["label_id"]
+        for row in conn.execute(
+            "SELECT label_id FROM inbox_labels WHERE inbox_account_id = ? AND is_selected = 1 ORDER BY label_name",
+            (account_id,),
+        ).fetchall()
+    ]
+    if not selected_folders:
+        raise ValueError("Select at least one Outlook folder to sync.")
+    messages_by_id: dict[str, dict] = {}
+    errors: list[str] = []
+    for folder_id in selected_folders:
+        try:
+            folder_messages = list_outlook_folder_messages(access_token, folder_id, start_at, end_at)
+            for message in folder_messages:
+                if message.get("id"):
+                    messages_by_id[message["id"]] = message
+        except Exception as exc:
+            errors.append(f"Folder {folder_id}: {exc}")
+    result = {"messages_seen": len(messages_by_id), "messages_imported": 0, "messages_skipped": 0, "purchase_orders_created": 0, "errors": errors}
+    for message in messages_by_id.values():
+        started = time.perf_counter()
+        message_id = message.get("id")
+        if not message_id:
+            continue
+        provider_message_id = f"outlook:{message_id}"
+        try:
+            received_at = parse_iso_datetime(message.get("receivedDateTime"))
+            if not message_received_in_range(received_at, start_at, end_at):
+                result["messages_skipped"] += 1
+                write_detection_result(conn, run_id, None, provider_message_id, "skipped_outside_sync_range", None, 0, 0, None, elapsed_ms(started), False, "Skipped because message was outside selected sync range.")
+                continue
+            existing = row_to_dict(conn.execute("SELECT * FROM emails WHERE provider = 'outlook' AND provider_message_id = ?", (provider_message_id,)).fetchone())
+            existing_attachment_rows: list[dict] = []
+            if existing:
+                existing_attachment_rows = rows_to_dicts(
+                    conn.execute(
+                        """
+                        SELECT id, filename, extracted_text, extraction_method
+                        FROM attachments
+                        WHERE email_id = ?
+                        ORDER BY id
+                        """,
+                        (existing["id"],),
+                    ).fetchall()
+                )
+                po_row = conn.execute("SELECT id FROM purchase_orders WHERE email_id = ? ORDER BY id DESC LIMIT 1", (existing["id"],)).fetchone()
+                if po_row:
+                    result["messages_skipped"] += 1
+                    write_detection_result(
+                        conn,
+                        run_id,
+                        existing["id"],
+                        provider_message_id,
+                        existing.get("classification"),
+                        existing.get("classification_confidence"),
+                        1 if existing_attachment_rows else 0,
+                        len(existing_attachment_rows),
+                        po_row["id"],
+                        elapsed_ms(started),
+                        True,
+                        "Skipped duplicate Outlook message that already has a purchase order.",
+                    )
+                    continue
+            attachments: list[IncomingAttachment] = []
+            attachment_errors: list[str] = []
+            had_any_attachment = bool(message.get("hasAttachments"))
+            if not existing_attachment_rows:
+                attachments, attachment_errors, had_any_attachment = download_outlook_attachments(message_id, access_token, STORAGE_DIR / "outlook" / safe_storage_segment(message_id), had_any_attachment)
+            if not attachments and not existing_attachment_rows and not account.get("evaluate_without_attachments"):
+                result["messages_skipped"] += 1
+                write_detection_result(
+                    conn,
+                    run_id,
+                    existing["id"] if existing else None,
+                    provider_message_id,
+                    "skipped_no_supported_attachment",
+                    None,
+                    1 if had_any_attachment else 0,
+                    0,
+                    None,
+                    elapsed_ms(started),
+                    False,
+                    "Skipped because the email had no supported attachments and body-only evaluation is disabled.",
+                )
+                continue
+            incoming = IncomingEmail(
+                provider="outlook",
+                provider_message_id=provider_message_id,
+                sender=extract_outlook_sender(message),
+                recipients=extract_outlook_recipients(message),
+                subject=message.get("subject") or "",
+                received_at=received_at.isoformat() if received_at else message.get("receivedDateTime") or "",
+                body_text=extract_outlook_body_text(message),
+                attachments=attachments,
+            )
+            attachment_rows = list(existing_attachment_rows)
+            if existing:
+                email_id = existing["id"]
+                conn.execute(
+                    """
+                    UPDATE emails
+                    SET sender = ?, recipients = ?, subject = ?, received_at = ?, body_text = ?
+                    WHERE id = ?
+                    """,
+                    (incoming.sender, incoming.recipients, incoming.subject, incoming.received_at, incoming.body_text, email_id),
+                )
+                conn.commit()
+            else:
+                email_id = insert_email(conn, incoming)
+            for attachment in incoming.attachments:
+                attachment_rows.append(insert_attachment(conn, email_id, attachment))
+            created = process_email(conn, email_id, attachment_rows)
+            email_row = conn.execute("SELECT classification, classification_confidence FROM emails WHERE id = ?", (email_id,)).fetchone()
+            po_row = conn.execute("SELECT id FROM purchase_orders WHERE email_id = ? ORDER BY id DESC LIMIT 1", (email_id,)).fetchone()
+            po_duplicate_skipped = bool(created == 0 and not po_row and email_row and email_row["classification"] in {"possible_po", "purchase_order"})
+            result["messages_imported"] += 1
+            if po_duplicate_skipped:
+                result["messages_skipped"] += 1
+            result["purchase_orders_created"] += created
+            if attachment_errors:
+                result["errors"].extend(attachment_errors)
+            write_detection_result(
+                conn,
+                run_id,
+                email_id,
+                provider_message_id,
+                email_row["classification"] if email_row else None,
+                email_row["classification_confidence"] if email_row else None,
+                1 if attachment_rows or had_any_attachment else 0,
+                len(attachment_rows),
+                po_row["id"] if po_row else None,
+                elapsed_ms(started),
+                po_duplicate_skipped,
+                "Duplicate PO number/revision skipped." if po_duplicate_skipped else "; ".join(attachment_errors),
+            )
+        except Exception as exc:
+            result["errors"].append(f"{message_id}: {exc}")
+            write_detection_result(conn, run_id, None, provider_message_id, None, None, 0, 0, None, elapsed_ms(started), False, str(exc))
+    conn.commit()
+    return result
+
+
+def list_outlook_folder_messages(access_token: str, folder_id: str, start_at: datetime | None, end_at: datetime | None) -> list[dict]:
+    params = {
+        "$top": "50",
+        "$orderby": "receivedDateTime desc",
+        "$select": "id,subject,from,toRecipients,receivedDateTime,body,hasAttachments,internetMessageId",
+    }
+    filters = []
+    if start_at:
+        filters.append(f"receivedDateTime ge {graph_datetime(start_at)}")
+    if end_at:
+        filters.append(f"receivedDateTime le {graph_datetime(end_at)}")
+    if filters:
+        params["$filter"] = " and ".join(filters)
+    path = f"/v1.0/me/mailFolders/{urllib.parse.quote(folder_id, safe='')}/messages"
+    messages: list[dict] = []
+    next_url: str | None = None
+    while len(messages) < 250:
+        payload = outlook_api_get_url(next_url, access_token) if next_url else outlook_api_get(path, access_token, params)
+        for message in payload.get("value") or []:
+            received_at = parse_iso_datetime(message.get("receivedDateTime"))
+            if message_received_in_range(received_at, start_at, end_at):
+                messages.append(message)
+                if len(messages) >= 250:
+                    break
+        next_url = payload.get("@odata.nextLink")
+        if not next_url:
+            break
+    return messages
+
+
+def graph_datetime(value: datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
 def gmail_query_for_date_range(start_at: datetime | None, end_at: datetime | None) -> str:
     parts = []
     if start_at:
@@ -3031,10 +3446,81 @@ def refresh_gmail_token(conn, account: dict) -> str:
     return access_token
 
 
+def get_outlook_access_token(conn, inbox_account_id: int) -> str:
+    account = row_to_dict(conn.execute("SELECT * FROM inbox_accounts WHERE id = ?", (inbox_account_id,)).fetchone())
+    if not account:
+        raise ValueError("Inbox account not found.")
+    token = account.get("access_token")
+    expires_at = parse_iso_datetime(account.get("token_expires_at"))
+    if token and expires_at and expires_at > datetime.now(timezone.utc) + timedelta(minutes=5):
+        return token
+    return refresh_outlook_token(conn, account)
+
+
+def refresh_outlook_token(conn, account: dict) -> str:
+    refresh_token = account.get("refresh_token")
+    if not refresh_token:
+        raise ValueError("Outlook account has no refresh token. Reconnect Outlook.")
+    config = outlook_oauth_values()
+    tenant = config["tenant"] or "common"
+    payload = urllib.parse.urlencode(
+        {
+            "client_id": config["client_id"],
+            "client_secret": config["client_secret"],
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+            "scope": config["scopes"],
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        f"https://login.microsoftonline.com/{urllib.parse.quote(tenant)}/oauth2/v2.0/token",
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        data = urlopen_json(request)
+    except Exception:
+        conn.execute("UPDATE inbox_accounts SET sync_status = 'auth_failed', updated_at = CURRENT_TIMESTAMP WHERE id = ?", (account["id"],))
+        conn.commit()
+        raise
+    access_token = data.get("access_token")
+    if not access_token:
+        raise ValueError("Microsoft refresh response did not include access token.")
+    conn.execute(
+        """
+        UPDATE inbox_accounts
+        SET access_token = ?, refresh_token = COALESCE(?, refresh_token), token_expires_at = ?,
+            granted_scopes = COALESCE(?, granted_scopes), sync_status = 'connected',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (access_token, data.get("refresh_token"), token_expiry_iso(data.get("expires_in", 3600)), data.get("scope"), account["id"]),
+    )
+    conn.commit()
+    return access_token
+
+
 def gmail_api_get(path: str, access_token: str, params: dict | None = None) -> dict:
     query = f"?{urllib.parse.urlencode(params)}" if params else ""
     request = urllib.request.Request(
         f"https://gmail.googleapis.com{path}{query}",
+        headers={"Authorization": f"Bearer {access_token}"},
+        method="GET",
+    )
+    return urlopen_json(request)
+
+
+def outlook_api_get(path: str, access_token: str, params: dict | None = None) -> dict:
+    url = f"https://graph.microsoft.com{path}"
+    if params:
+        url += f"?{urllib.parse.urlencode(params)}"
+    return outlook_api_get_url(url, access_token)
+
+
+def outlook_api_get_url(url: str, access_token: str) -> dict:
+    request = urllib.request.Request(
+        url,
         headers={"Authorization": f"Bearer {access_token}"},
         method="GET",
     )
@@ -3100,6 +3586,66 @@ def download_gmail_attachments(message: dict, access_token: str, target_dir: Pat
         path.write_bytes(decode_gmail_base64url(data))
         attachments.append(IncomingAttachment(path.name, part.get("mimeType") or mimetypes.guess_type(path.name)[0] or "application/octet-stream", path))
     return attachments, errors
+
+
+def extract_outlook_sender(message: dict) -> str:
+    email = ((message.get("from") or {}).get("emailAddress") or {})
+    name = email.get("name") or ""
+    address = email.get("address") or ""
+    return f"{name} <{address}>".strip() if name and address else address or name
+
+
+def extract_outlook_recipients(message: dict) -> str:
+    values = []
+    for recipient in message.get("toRecipients") or []:
+        email = recipient.get("emailAddress") or {}
+        name = email.get("name") or ""
+        address = email.get("address") or ""
+        values.append(f"{name} <{address}>".strip() if name and address else address or name)
+    return ", ".join(value for value in values if value)
+
+
+def extract_outlook_body_text(message: dict) -> str:
+    body = message.get("body") or {}
+    content = body.get("content") or ""
+    if (body.get("contentType") or "").lower() == "html":
+        return strip_html(content)
+    return content
+
+
+def download_outlook_attachments(message_id: str, access_token: str, target_dir: Path, had_any_attachment: bool = False) -> tuple[list[IncomingAttachment], list[str], bool]:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    attachments: list[IncomingAttachment] = []
+    errors: list[str] = []
+    payload = outlook_api_get(f"/v1.0/me/messages/{urllib.parse.quote(message_id, safe='')}/attachments", access_token)
+    for item in payload.get("value") or []:
+        had_any_attachment = True
+        odata_type = item.get("@odata.type") or ""
+        if odata_type != "#microsoft.graph.fileAttachment":
+            errors.append(f"Skipped unsupported Outlook attachment type {odata_type or 'unknown'}")
+            continue
+        filename = item.get("name") or ""
+        safe_name = safe_upload_filename(filename)
+        extension = Path(safe_name).suffix.lower()
+        if extension not in {".pdf", ".txt", ".eml"}:
+            errors.append(f"Skipped unsupported attachment {filename or 'unnamed'}")
+            continue
+        data = item.get("contentBytes")
+        if not data:
+            errors.append(f"Attachment {filename} had no content bytes")
+            continue
+        path = unique_upload_path(target_dir, safe_name)
+        try:
+            path.write_bytes(base64.b64decode(data))
+        except Exception as exc:
+            errors.append(f"Attachment {filename} could not be decoded: {exc}")
+            continue
+        attachments.append(IncomingAttachment(path.name, item.get("contentType") or mimetypes.guess_type(path.name)[0] or "application/octet-stream", path))
+    return attachments, errors, had_any_attachment
+
+
+def safe_storage_segment(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip(".-") or uuid.uuid4().hex
 
 
 def walk_gmail_parts(part: dict):

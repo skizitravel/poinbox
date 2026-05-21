@@ -431,11 +431,11 @@
           <div class="admin-head">
             <div>
               <h2>Inbox Connections</h2>
-              <p>Connect Gmail for manual sync testing. Outlook is planned next.</p>
+              <p>Connect Gmail or Outlook for manual sync testing.</p>
             </div>
             <div class="actions">
               <button class="secondary" id="connectGmailBtn">Connect Gmail</button>
-              <button class="secondary" disabled>Connect Outlook Later</button>
+              <button class="secondary" id="connectOutlookBtn">Connect Outlook</button>
             </div>
           </div>
           <div class="admin-form">
@@ -479,6 +479,26 @@
           </div>
           <div class="modal-actions">
             <button id="saveGmailConfigBtn">Save Gmail Config</button>
+          </div>
+        </div>
+
+        <div class="admin-panel">
+          <div class="admin-head">
+            <div>
+              <h2>Outlook / Microsoft Graph Configuration</h2>
+              <p>Local MVP settings for the Microsoft Entra app used by Outlook inbox connections.</p>
+            </div>
+          </div>
+          <div class="upload-message" id="outlookConfigMessage"></div>
+          <div class="grid">
+            <div class="field wide"><label>Client ID</label><input id="outlookClientId" placeholder="Microsoft Entra app client ID" /></div>
+            <div class="field wide"><label>Client Secret</label><input id="outlookClientSecret" type="password" placeholder="Leave blank to keep existing secret" /></div>
+            <div class="field"><label>Tenant</label><input id="outlookTenant" placeholder="common" /></div>
+            <div class="field wide"><label>Redirect URI</label><input id="outlookRedirectUri" /></div>
+            <div class="field wide"><label>Scopes</label><input id="outlookScopes" /></div>
+          </div>
+          <div class="modal-actions">
+            <button id="saveOutlookConfigBtn">Save Outlook Config</button>
           </div>
         </div>
 
@@ -822,7 +842,7 @@
         <div class="modal-head">
           <div>
             <h2 id="inboxConfigTitle">Configure Inbox</h2>
-            <p>Choose Gmail labels, attachment filtering, and sync schedule for this connection.</p>
+            <p>Choose Gmail labels or Outlook folders, attachment filtering, and sync schedule for this connection.</p>
           </div>
           <button class="icon-btn" id="closeInboxConfigBtn" title="Close">x</button>
         </div>
@@ -839,7 +859,7 @@
           <div class="field wide"><label>Next Scheduled Sync</label><div class="readonly-value" id="configNextSync"></div></div>
         </div>
         <div class="section-title section-title-row">
-          <span>Gmail Labels</span>
+          <span id="inboxLabelTitle">Gmail Labels</span>
           <button class="secondary table-action" id="refreshInboxLabelsBtn">Refresh Labels</button>
         </div>
         <div class="label-list" id="inboxLabelList"></div>

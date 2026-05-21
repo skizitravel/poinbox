@@ -1,4 +1,4 @@
-let selectedId = null;
+﻿let selectedId = null;
 let currentDetail = null;
 let selectedUploadFiles = [];
 let orderTypes = [];
@@ -13,6 +13,7 @@ let inboxAccounts = [];
 let inboxSyncRuns = [];
 let inboxDetectionResults = [];
 let gmailConfig = {};
+let outlookConfig = {};
 let openaiConfig = {};
 let currentInboxConfig = null;
 let configuringInboxId = null;
@@ -662,11 +663,12 @@ function renderDepartments() {
 
 async function loadTestingData() {
   if (!canViewAdmin()) return;
-  const [documentsData, evaluationsData, inboxData, gmailData, openaiData, detectionData, learningData] = await Promise.all([
+  const [documentsData, evaluationsData, inboxData, gmailData, outlookData, openaiData, detectionData, learningData] = await Promise.all([
     api("/api/testing/documents"),
     api("/api/testing/evaluations"),
     api("/api/inbox-accounts"),
     api("/api/gmail-oauth-config"),
+    api("/api/outlook-oauth-config"),
     api("/api/openai-extraction-config"),
     api("/api/inbox-detection-results"),
     api("/api/extraction-learning"),
@@ -676,6 +678,7 @@ async function loadTestingData() {
   inboxAccounts = inboxData.accounts || [];
   inboxSyncRuns = inboxData.sync_runs || [];
   gmailConfig = gmailData || {};
+  outlookConfig = outlookData || {};
   openaiConfig = openaiData || {};
   inboxDetectionResults = detectionData.results || [];
   extractionLearning = learningData || extractionLearning;
@@ -683,7 +686,8 @@ async function loadTestingData() {
   renderEvaluation();
   renderOpenAIConfig();
   renderGmailConfig();
-  renderInboxAccounts(inboxData.gmail_configured);
+  renderOutlookConfig();
+  renderInboxAccounts(inboxData.gmail_configured, inboxData.outlook_configured);
   renderSyncRuns();
   renderDetectionResults();
   renderExtractionLearning();
@@ -905,8 +909,9 @@ function miniList(rows, labelKey) {
   return rows.map((row) => `<span class="mini-pill">${safe(row[labelKey])}: ${row.count}</span>`).join("");
 }
 
-function renderInboxAccounts(gmailConfigured = false) {
+function renderInboxAccounts(gmailConfigured = false, outlookConfigured = false) {
   document.querySelector("#connectGmailBtn").title = gmailConfigured ? "Start Gmail OAuth" : "Set Gmail config first";
+  document.querySelector("#connectOutlookBtn").title = outlookConfigured ? "Start Outlook OAuth" : "Set Outlook config first";
   document.querySelector("#inboxAccountRows").innerHTML = inboxAccounts
     .map(
       (row) => `
@@ -936,6 +941,14 @@ function renderGmailConfig() {
   document.querySelector("#gmailRedirectUri").value = gmailConfig.redirect_uri || "http://127.0.0.1:8000/api/oauth/gmail/callback";
   document.querySelector("#gmailScopes").value = gmailConfig.scopes || "https://www.googleapis.com/auth/gmail.readonly";
   document.querySelector("#gmailClientSecret").placeholder = gmailConfig.client_secret_configured ? "Secret configured - leave blank to keep it" : "Google OAuth client secret";
+}
+
+function renderOutlookConfig() {
+  document.querySelector("#outlookClientId").value = outlookConfig.client_id || "";
+  document.querySelector("#outlookTenant").value = outlookConfig.tenant || "common";
+  document.querySelector("#outlookRedirectUri").value = outlookConfig.redirect_uri || "http://127.0.0.1:8000/api/oauth/outlook/callback";
+  document.querySelector("#outlookScopes").value = outlookConfig.scopes || "offline_access User.Read Mail.Read";
+  document.querySelector("#outlookClientSecret").placeholder = outlookConfig.client_secret_configured ? "Secret configured - leave blank to keep it" : "Microsoft Graph client secret";
 }
 
 function renderSyncRuns() {
@@ -990,12 +1003,21 @@ async function addInboxAccount() {
   const data = await api("/api/inbox-accounts", { method: "POST", body: JSON.stringify(payload) });
   inboxAccounts = data.accounts || [];
   inboxSyncRuns = data.sync_runs || [];
-  renderInboxAccounts(data.gmail_configured);
+  renderInboxAccounts(data.gmail_configured, data.outlook_configured);
   renderSyncRuns();
 }
 
 async function connectGmail() {
   const data = await api("/api/inbox-accounts/gmail/connect", { method: "POST", body: "{}" });
+  if (data.error) {
+    setMessage("#testingMessage", data.error, "error");
+    return;
+  }
+  if (data.auth_url) window.open(data.auth_url, "_blank");
+}
+
+async function connectOutlook() {
+  const data = await api("/api/inbox-accounts/outlook/connect", { method: "POST", body: "{}" });
   if (data.error) {
     setMessage("#testingMessage", data.error, "error");
     return;
@@ -1016,7 +1038,7 @@ async function saveInboxAccount(id) {
   };
   const data = await api(`/api/inbox-accounts/${id}`, { method: "PUT", body: JSON.stringify(payload) });
   inboxAccounts = data.accounts || [];
-  renderInboxAccounts(data.gmail_configured);
+  renderInboxAccounts(data.gmail_configured, data.outlook_configured);
 }
 
 async function toggleInboxAccount(id, enabled) {
@@ -1033,7 +1055,7 @@ async function toggleInboxAccount(id, enabled) {
   };
   const data = await api(`/api/inbox-accounts/${id}`, { method: "PUT", body: JSON.stringify(payload) });
   inboxAccounts = data.accounts || [];
-  renderInboxAccounts(data.gmail_configured);
+  renderInboxAccounts(data.gmail_configured, data.outlook_configured);
 }
 
 async function openInboxConfig(id) {
@@ -1060,6 +1082,7 @@ function closeInboxConfig() {
 function renderInboxConfig() {
   const account = currentInboxConfig?.account || {};
   const labels = currentInboxConfig?.labels || [];
+  const isOutlook = account.provider === "outlook";
   document.querySelector("#configInboxName").value = account.display_name || "";
   document.querySelector("#configConnectedEmail").value = account.connected_email || "";
   document.querySelector("#configMonitoredEmail").value = account.monitored_email || "";
@@ -1069,9 +1092,11 @@ function renderInboxConfig() {
   document.querySelector("#configSyncInterval").value = account.sync_interval_hours || 24;
   document.querySelector("#configSyncStart").value = account.sync_start_time || "02:00";
   document.querySelector("#configNextSync").textContent = account.next_sync_at || "Not scheduled";
+  document.querySelector("#inboxLabelTitle").textContent = isOutlook ? "Outlook Folders" : "Gmail Labels";
+  document.querySelector("#refreshInboxLabelsBtn").textContent = isOutlook ? "Refresh Folders" : "Refresh Labels";
   const labelList = document.querySelector("#inboxLabelList");
   if (!labels.length) {
-    labelList.innerHTML = `<div class="muted-panel">No labels cached yet. Use Refresh Labels after Gmail is connected.</div>`;
+    labelList.innerHTML = `<div class="muted-panel">No ${isOutlook ? "folders" : "labels"} cached yet. Use ${isOutlook ? "Refresh Folders" : "Refresh Labels"} after the inbox is connected.</div>`;
     return;
   }
   labelList.innerHTML = labels
@@ -1080,7 +1105,7 @@ function renderInboxConfig() {
       <label class="label-row">
         <input type="checkbox" data-label-id="${safe(label.label_id)}" ${label.is_selected ? "checked" : ""} />
         <span class="label-main">${safe(label.label_name || label.label_id)}</span>
-        <span class="label-meta">${safe(label.label_id)}${label.label_type ? ` · ${safe(label.label_type)}` : ""}</span>
+        <span class="label-meta">${safe(label.label_id)}${label.label_type ? ` - ${safe(label.label_type)}` : ""}</span>
       </label>
     `,
     )
@@ -1089,7 +1114,9 @@ function renderInboxConfig() {
 
 async function refreshInboxLabels() {
   if (!configuringInboxId) return;
-  setMessage("#inboxConfigMessage", "Refreshing Gmail labels...");
+  const account = currentInboxConfig?.account || {};
+  const noun = account.provider === "outlook" ? "folders" : "labels";
+  setMessage("#inboxConfigMessage", `Refreshing ${noun}...`);
   const data = await api(`/api/inbox-accounts/${configuringInboxId}/labels/refresh`, { method: "POST", body: "{}" });
   currentInboxConfig = data;
   renderInboxConfig();
@@ -1097,7 +1124,7 @@ async function refreshInboxLabels() {
     setMessage("#inboxConfigMessage", data.error, "error");
     return;
   }
-  setMessage("#inboxConfigMessage", "Labels refreshed.", "success");
+  setMessage("#inboxConfigMessage", `${account.provider === "outlook" ? "Folders" : "Labels"} refreshed.`, "success");
 }
 
 async function saveInboxConfig() {
@@ -1141,6 +1168,22 @@ async function saveGmailConfig() {
   document.querySelector("#gmailClientSecret").value = "";
   setMessage("#gmailConfigMessage", data.client_secret_configured ? "Gmail config saved. Secret is configured." : "Gmail config saved. Client secret is not configured.", data.client_secret_configured ? "success" : "error");
   renderGmailConfig();
+  await loadTestingData();
+}
+
+async function saveOutlookConfig() {
+  const payload = {
+    client_id: document.querySelector("#outlookClientId").value.trim(),
+    client_secret: document.querySelector("#outlookClientSecret").value.trim(),
+    tenant: document.querySelector("#outlookTenant").value.trim(),
+    redirect_uri: document.querySelector("#outlookRedirectUri").value.trim(),
+    scopes: document.querySelector("#outlookScopes").value.trim(),
+  };
+  const data = await api("/api/outlook-oauth-config", { method: "POST", body: JSON.stringify(payload) });
+  outlookConfig = data;
+  document.querySelector("#outlookClientSecret").value = "";
+  setMessage("#outlookConfigMessage", data.client_secret_configured ? "Outlook config saved. Secret is configured." : "Outlook config saved. Client secret is not configured.", data.client_secret_configured ? "success" : "error");
+  renderOutlookConfig();
   await loadTestingData();
 }
 
@@ -1203,14 +1246,15 @@ async function runManualSync() {
   const endAt = endDate.toISOString();
   const button = document.querySelector("#runManualSyncBtn");
   button.disabled = true;
-  setMessage("#manualSyncMessage", `Syncing Gmail from ${startAtLocal} to ${endAtLocal}...`);
+  const account = inboxAccounts.find((row) => Number(row.id) === Number(manualSyncInboxId)) || {};
+  setMessage("#manualSyncMessage", `Syncing ${(account.provider || "inbox").toUpperCase()} from ${startAtLocal} to ${endAtLocal}...`);
   const data = await api(`/api/inbox-accounts/${manualSyncInboxId}/sync`, { method: "POST", body: JSON.stringify({ start_at: startAt, end_at: endAt }) });
   inboxAccounts = data.accounts || [];
   inboxSyncRuns = data.sync_runs || [];
   if (data.error) {
     setMessage("#manualSyncMessage", data.error, "error");
     button.disabled = false;
-    renderInboxAccounts(data.gmail_configured);
+    renderInboxAccounts(data.gmail_configured, data.outlook_configured);
     renderSyncRuns();
     return;
   }
@@ -1220,7 +1264,7 @@ async function runManualSync() {
   const summary = `Seen ${run.messages_seen || 0}, imported ${run.messages_imported || 0}, skipped ${run.messages_skipped || 0}, POs created ${run.purchase_orders_created || 0}.`;
   setMessage("#manualSyncMessage", (run.messages_seen || 0) === 0 ? `No messages found in selected range. ${summary}` : `${run.status === "failed" ? "Sync failed." : "Sync complete."} ${summary}`, run.status === "failed" ? "error" : "success");
   button.disabled = false;
-  renderInboxAccounts(data.gmail_configured);
+  renderInboxAccounts(data.gmail_configured, data.outlook_configured);
   renderSyncRuns();
   renderDetectionResults();
   await refresh();
@@ -1231,7 +1275,7 @@ async function deleteInboxAccount(id) {
   const data = await api(`/api/inbox-accounts/${id}`, { method: "DELETE" });
   inboxAccounts = data.accounts || [];
   inboxSyncRuns = data.sync_runs || [];
-  renderInboxAccounts(data.gmail_configured);
+  renderInboxAccounts(data.gmail_configured, data.outlook_configured);
   renderSyncRuns();
 }
 
@@ -2264,7 +2308,9 @@ document.querySelector("#runEvaluationBtn").addEventListener("click", runEvaluat
 document.querySelector("#refreshLearningBtn").addEventListener("click", loadExtractionLearning);
 document.querySelector("#addInboxAccountBtn").addEventListener("click", addInboxAccount);
 document.querySelector("#connectGmailBtn").addEventListener("click", connectGmail);
+document.querySelector("#connectOutlookBtn").addEventListener("click", connectOutlook);
 document.querySelector("#saveGmailConfigBtn").addEventListener("click", saveGmailConfig);
+document.querySelector("#saveOutlookConfigBtn").addEventListener("click", saveOutlookConfig);
 document.querySelector("#saveOpenAIConfigBtn").addEventListener("click", saveOpenAIConfig);
 document.querySelector("#closeInboxConfigBtn").addEventListener("click", closeInboxConfig);
 document.querySelector("#cancelInboxConfigBtn").addEventListener("click", closeInboxConfig);
@@ -2290,3 +2336,5 @@ loadMe().then((ok) => {
   if (!ok) return;
   switchView(canViewDashboard() ? "dashboard" : "admin");
 });
+
+

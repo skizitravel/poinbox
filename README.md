@@ -243,7 +243,7 @@ AI extraction behavior:
 - **AI With Prior Examples** evaluation also includes reviewed corrections from the feedback loop as guidance
 - production deployments should replace local SQLite/API-key storage with encrypted managed secret storage
 
-## Gmail Inbox Testing
+## Gmail And Outlook Inbox Testing
 
 The app now has an inbox connection foundation in **Admin > Testing > Inbox Connections**.
 
@@ -257,7 +257,16 @@ Current Gmail MVP status:
 - `Sync Inbox Now` refreshes tokens, fetches recent Gmail messages, downloads supported attachments, deduplicates messages, and reuses the PO detection/extraction pipeline
 - inbox connections can be activated/deactivated without deleting them
 - each Gmail connection has a **Configure** modal for labels, attachment filtering, and schedule settings
-- Outlook is stubbed for a later Microsoft Graph implementation
+
+Current Outlook / Microsoft Graph MVP status:
+
+- Outlook OAuth configuration can be entered in **Admin > Testing > Outlook / Microsoft Graph Configuration**
+- `GET /api/outlook-oauth-config` never returns the raw client secret
+- `Connect Outlook` redirects to Microsoft sign-in when client ID/secret are configured
+- the Outlook OAuth callback exchanges the code for tokens, fetches `/me`, and stores the connected account
+- connected Outlook accounts fetch and cache Microsoft Graph mail folders
+- manual date/time-range sync fetches messages from selected folders, downloads supported attachments, deduplicates messages, and reuses the PO detection/extraction pipeline
+- deleted POs can be recreated by resyncing retained Outlook email/attachment records
 
 Gmail folders are labels. After a Gmail account connects, the app fetches labels from Gmail and caches them per inbox connection. Use **Configure > Refresh Labels** to refresh the cached labels manually. Labels are also refreshed when the account connects and when a sync runs. New labels are selected by default except `TRASH` and `SPAM`; existing selections are preserved on refresh.
 
@@ -266,6 +275,8 @@ In the Configure modal, choose which labels should be monitored. Sync checks the
 The **Evaluate emails without attachments** setting is off by default. When it is off, Gmail sync skips body-only emails or emails without supported attachments and records them in inbox detection metrics as `skipped_no_supported_attachment`. Turn it on when you want the app to evaluate email-body purchase orders too.
 
 Use **Sync Now** on a Gmail inbox connection to run a manual date/time-range sync. The modal asks for a start and end datetime, then scans configured Gmail labels for messages received in that range. Gmail's search date operators are coarse by day, so the app also filters exact received datetime after fetching each message.
+
+Outlook uses mail folders instead of Gmail labels. After an Outlook account connects, the app fetches folders from Microsoft Graph and caches them per inbox connection. **Inbox** is selected by default. Use **Configure > Refresh Folders** to refresh the cached folder list. Manual sync scans selected Outlook folders for messages received in the selected date/time range and applies exact datetime filtering after fetching messages.
 
 Per-inbox schedule settings are stored for future automation:
 
@@ -282,6 +293,16 @@ GMAIL_CLIENT_ID=
 GMAIL_CLIENT_SECRET=
 GMAIL_REDIRECT_URI=http://127.0.0.1:8000/api/oauth/gmail/callback
 GMAIL_SCOPES=https://www.googleapis.com/auth/gmail.readonly
+```
+
+Add these values to `.env.local` when you are ready to configure Outlook / Microsoft Graph:
+
+```text
+OUTLOOK_CLIENT_ID=
+OUTLOOK_CLIENT_SECRET=
+OUTLOOK_TENANT=common
+OUTLOOK_REDIRECT_URI=http://127.0.0.1:8000/api/oauth/outlook/callback
+OUTLOOK_SCOPES=offline_access User.Read Mail.Read
 ```
 
 Manual sync comes first. Gmail Pub/Sub push notifications are intentionally not part of this MVP because they require more Google Cloud setup. Token storage in SQLite is MVP-only and should be replaced with encrypted/managed secret storage before production.
@@ -302,25 +323,37 @@ http://127.0.0.1:8000/api/oauth/gmail/callback
 
 If a client secret was pasted into chat, committed, or otherwise exposed, rotate it in Google Cloud before using it.
 
+To configure Microsoft Entra / Outlook:
+
+1. Create an app registration in Microsoft Entra ID.
+2. Add delegated Microsoft Graph permissions:
+   - `offline_access`
+   - `User.Read`
+   - `Mail.Read`
+3. Create a client secret.
+4. Add this local redirect URI:
+
+```text
+http://127.0.0.1:8000/api/oauth/outlook/callback
+```
+
+For Codespaces, add the forwarded port URI too:
+
+```text
+https://YOUR-CODESPACE-8000.app.github.dev/api/oauth/outlook/callback
+```
+
+5. Copy the client ID, client secret, tenant, redirect URI, and scopes into the Outlook config panel.
+
+If a Microsoft client secret was pasted into chat, committed, or otherwise exposed, rotate it before using it. Local SQLite token storage is MVP-only; production should use encrypted managed secret storage.
+
+Outlook delta sync is planned later. The app keeps the existing `delta_token` field available for a future Microsoft Graph `/me/mailFolders/{id}/messages/delta` implementation, but manual sync is the supported path in this MVP.
+
 ## Real Inbox Next Step
 
-The app currently ships with a connector interface and local sample connector. Add Gmail or Outlook by implementing `InboxConnector.fetch_recent()` in `server/connectors.py`.
+The app currently ships with a connector interface and local sample connector. Gmail and Outlook manual sync now run through provider-specific API helpers in `server/app.py` and map live messages into the same `IncomingEmail` and `IncomingAttachment` structures used by sample import.
 
-Recommended Gmail path:
-
-- Create a Google Cloud OAuth client
-- Request Gmail readonly scope
-- Fetch recent messages and attachments
-- Map them into the `IncomingEmail` and `IncomingAttachment` structures
-
-Recommended Outlook path:
-
-- Register an Azure app
-- Use Microsoft Graph Mail.Read
-- Fetch recent shared mailbox messages and attachments
-- Map them into the same connector structures
-
-The rest of the pipeline should not need to change.
+The next production-grade inbox steps are encrypted token storage, background scheduling, Microsoft Graph delta sync, and provider-specific shared mailbox handling.
 
 ## Project Layout
 
