@@ -47,7 +47,30 @@
           <option>Rejected</option>
         </select>
         <input id="searchInput" placeholder="Search customer, PO number, sender" />
+        <button class="secondary" id="exceptionsBtn">Exceptions</button>
         <button class="secondary" id="exportBtn">Export</button>
+      </section>
+
+      <section class="logs hidden" id="exceptionsPanel">
+        <div class="section-title">Exceptions Queue</div>
+        <div class="admin-table-wrap small-table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Severity</th>
+                <th>PO</th>
+                <th>Customer</th>
+                <th>Reason</th>
+                <th>Field</th>
+                <th>Current</th>
+                <th>Confidence</th>
+                <th>Created</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="exceptionRows"></tbody>
+          </table>
+        </div>
       </section>
 
       <section class="split">
@@ -91,6 +114,7 @@
         <button class="secondary" id="adminTabMasterBtn">Master Data</button>
         <button class="secondary" id="adminTabSetupBtn">Setup</button>
         <button class="secondary" id="adminTabTestingBtn">Testing</button>
+        <button class="secondary" id="adminTabAnalyticsBtn">Analytics</button>
       </nav>
 
       <section class="admin-tab-pane" id="adminTabUsers">
@@ -182,10 +206,12 @@
           </div>
           <div class="upload-message" id="xrefMessage"></div>
           <div class="admin-form">
-            <input id="xrefCustomer" placeholder="Customer" />
-            <input id="xrefCustomerPart" placeholder="Customer part #" />
-            <input id="xrefInternalPart" placeholder="Internal part #" />
-            <button id="addXrefBtn">Add / Update</button>
+              <input id="xrefCustomer" placeholder="Customer" />
+              <input id="xrefCustomerPart" placeholder="Customer part #" />
+              <input id="xrefCustomerRev" placeholder="Customer rev" />
+              <input id="xrefInternalPart" placeholder="Internal part #" />
+              <input id="xrefInternalRev" placeholder="Internal rev" />
+              <button id="addXrefBtn">Add / Update</button>
           </div>
           <div class="admin-table-wrap">
             <table>
@@ -193,11 +219,49 @@
                 <tr>
                   <th>Customer</th>
                   <th>Customer Part #</th>
+                  <th>Cust Rev</th>
                   <th>Internal Part #</th>
+                  <th>Int Rev</th>
                   <th></th>
                 </tr>
               </thead>
               <tbody id="xrefRows"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="admin-panel">
+          <div class="admin-head">
+            <div>
+              <h2>Item Master</h2>
+              <p>Internal items/products used for exact and fuzzy PO line matching.</p>
+            </div>
+            <div class="actions">
+              <input id="productCsvInput" type="file" accept=".csv" hidden />
+              <button class="secondary" id="uploadProductsCsvBtn">Upload Item Master CSV</button>
+              <button class="secondary" id="downloadProductsCsvBtn">Download Item Master CSV</button>
+            </div>
+          </div>
+          <div class="upload-message" id="productsMessage"></div>
+          <div class="admin-form">
+            <input id="productPart" placeholder="Internal part #" />
+            <input id="productRevision" placeholder="Revision" />
+            <input id="productDescription" placeholder="Description" />
+            <input id="productUom" placeholder="UOM" />
+            <button id="addProductBtn">Add / Update</button>
+          </div>
+          <div class="admin-table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Internal Part #</th>
+                  <th>Rev</th>
+                  <th>Description</th>
+                  <th>UOM</th>
+                  <th>Status</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="productRows"></tbody>
             </table>
           </div>
         </div>
@@ -290,7 +354,7 @@
               <p>Upload and label PO and non-PO examples for extraction testing.</p>
             </div>
             <div class="actions">
-              <input id="testDocInput" type="file" accept=".pdf,.txt,.eml,.csv,.xlsx" multiple hidden />
+              <input id="testDocInput" type="file" accept=".pdf,.txt,.eml,.csv,.xlsx,.docx" multiple hidden />
               <button class="secondary" id="testDocUploadBtn">Upload Documents</button>
             </div>
           </div>
@@ -426,7 +490,6 @@
             </table>
           </div>
         </div>
-
         <div class="admin-panel">
           <div class="admin-head">
             <div>
@@ -549,6 +612,26 @@
         </div>
       </section>
       </section>
+
+      <section class="admin-tab-pane hidden" id="adminTabAnalytics">
+      <section class="admin-grid">
+        <div class="admin-panel">
+          <div class="admin-head">
+            <div>
+              <h2>Operations Metrics</h2>
+              <p>Basic throughput, exception, correction, and inbox metrics.</p>
+            </div>
+            <button class="secondary" id="refreshOperationsBtn">Refresh Metrics</button>
+          </div>
+          <div class="upload-message" id="operationsMessage"></div>
+          <div id="operationsSummary" class="summary compact-summary"></div>
+          <div class="section-title">POs Received By Day</div>
+          <div id="receivedTrendRows" class="mini-list"></div>
+          <div class="section-title">POs Booked By Day</div>
+          <div id="bookedTrendRows" class="mini-list"></div>
+        </div>
+      </section>
+      </section>
     </main>
 
     <div class="modal-backdrop hidden" id="uploadModal" aria-hidden="true">
@@ -562,7 +645,7 @@
         </div>
 
         <div class="drop-zone" id="dropZone">
-          <input id="fileInput" type="file" accept=".pdf,.txt,.eml" multiple hidden />
+          <input id="fileInput" type="file" accept=".pdf,.txt,.eml,.xlsx,.docx" multiple hidden />
           <div class="drop-title">Drop files here</div>
           <div class="drop-copy">PDF, TXT, or EML files. Multiple files are supported.</div>
           <button class="secondary" id="selectFileBtn">Select File</button>

@@ -108,10 +108,23 @@ def initialize(conn: sqlite3.Connection) -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             customer_name TEXT NOT NULL,
             customer_part_number TEXT NOT NULL,
+            customer_part_revision TEXT,
             internal_part_number TEXT NOT NULL,
+            internal_part_revision TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(customer_name, customer_part_number)
+        );
+
+        CREATE TABLE IF NOT EXISTS products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            internal_part_number TEXT NOT NULL UNIQUE,
+            internal_part_revision TEXT,
+            description TEXT,
+            unit_of_measure TEXT,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
 
         CREATE TABLE IF NOT EXISTS order_types (
@@ -414,6 +427,54 @@ def initialize(conn: sqlite3.Connection) -> None:
             inbox_account_id INTEGER REFERENCES inbox_accounts(id) ON DELETE SET NULL,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE TABLE IF NOT EXISTS review_tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            purchase_order_id INTEGER REFERENCES purchase_orders(id) ON DELETE CASCADE,
+            purchase_order_line_id INTEGER REFERENCES purchase_order_lines(id) ON DELETE CASCADE,
+            entity_type TEXT NOT NULL,
+            entity_id INTEGER,
+            reason_code TEXT NOT NULL,
+            message TEXT NOT NULL,
+            severity TEXT NOT NULL DEFAULT 'warning',
+            status TEXT NOT NULL DEFAULT 'open',
+            field_name TEXT,
+            current_value TEXT,
+            extracted_value TEXT,
+            suggested_value_json TEXT,
+            source_snippet TEXT,
+            confidence REAL,
+            created_by_system INTEGER NOT NULL DEFAULT 1,
+            resolved_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            resolved_at TEXT,
+            ignored_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            ignored_at TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS po_audit_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            purchase_order_id INTEGER REFERENCES purchase_orders(id) ON DELETE CASCADE,
+            event_type TEXT NOT NULL,
+            message TEXT NOT NULL,
+            metadata_json TEXT,
+            created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS export_profiles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            output_type TEXT NOT NULL DEFAULT 'csv',
+            include_lines INTEGER NOT NULL DEFAULT 1,
+            field_mapping_json TEXT,
+            date_format TEXT,
+            number_format TEXT,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
         """
     )
     ensure_column(conn, "purchase_orders", "order_type_id", "INTEGER REFERENCES order_types(id) ON DELETE SET NULL")
@@ -434,6 +495,12 @@ def initialize(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "purchase_order_lines", "field_confidence_json", "TEXT")
     ensure_column(conn, "purchase_order_lines", "customer_part_revision", "TEXT")
     ensure_column(conn, "purchase_order_lines", "internal_part_revision", "TEXT")
+    ensure_column(conn, "purchase_order_lines", "product_match_status", "TEXT")
+    ensure_column(conn, "purchase_order_lines", "matched_product_id", "INTEGER REFERENCES products(id) ON DELETE SET NULL")
+    ensure_column(conn, "purchase_order_lines", "product_match_score", "REAL")
+    ensure_column(conn, "purchase_order_lines", "product_match_reason", "TEXT")
+    ensure_column(conn, "customer_part_xrefs", "customer_part_revision", "TEXT")
+    ensure_column(conn, "customer_part_xrefs", "internal_part_revision", "TEXT")
     ensure_column(conn, "extraction_evaluation_runs", "extraction_mode", "TEXT DEFAULT 'rule_based'")
     ensure_column(conn, "users", "first_name", "TEXT")
     ensure_column(conn, "users", "last_name", "TEXT")

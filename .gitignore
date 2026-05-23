@@ -1,5 +1,6 @@
 .env
 .env.local
+server-runtime.log
 data/*.db
 data/*.sqlite
 data/*.log

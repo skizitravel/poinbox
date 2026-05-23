@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import threading
 import uuid
 import base64
 import cgi
@@ -27,6 +28,7 @@ from server.config import (
     APP_HOST,
     APP_PORT,
     DATABASE_PATH,
+    ENABLE_BACKGROUND_SYNC,
     GMAIL_CLIENT_ID,
     GMAIL_CLIENT_SECRET,
     GMAIL_REDIRECT_URI,
@@ -46,16 +48,21 @@ from server.connectors import IncomingAttachment, IncomingEmail
 from server.processing import (
     extract_pdf_text,
     find_similar_extraction_examples,
+    generate_review_tasks_for_po,
     import_samples,
     insert_attachment,
     insert_email,
     log_document_extraction_run,
+    match_product_for_line,
     process_email,
     recalculate_po_total,
 )
 from server.extraction import classify_purchase_order, extract_purchase_order, normalize_date
 from server.master_data import addresses_match, format_structured_address, list_reviews, parse_structured_address, resolve_review, run_master_data_reviews
 from server.openai_settings import get_openai_extraction_config, get_openai_runtime_config, save_openai_extraction_config
+
+
+SYNC_LOCKS: set[int] = set()
 
 
 class AppHandler(SimpleHTTPRequestHandler):
@@ -83,6 +90,14 @@ class AppHandler(SimpleHTTPRequestHandler):
             if not self.require_permission("admin:view"):
                 return
             return self.respond_json(list_customers())
+        if parsed.path == "/api/products":
+            if not self.require_permission("admin:view"):
+                return
+            return self.respond_json({"products": list_products()})
+        if parsed.path == "/api/products.csv":
+            if not self.require_permission("admin:view"):
+                return
+            return self.respond_csv(products_csv(), "products.csv")
         if parsed.path == "/api/customers.csv":
             if not self.require_permission("admin:view"):
                 return
@@ -157,6 +172,14 @@ class AppHandler(SimpleHTTPRequestHandler):
             if not self.require_permission("admin:view"):
                 return
             return self.respond_json(extraction_learning_dashboard(params))
+        if parsed.path == "/api/review-tasks":
+            if not self.require_permission("po_dashboard:view"):
+                return
+            return self.respond_json(list_review_tasks(params))
+        if parsed.path == "/api/reporting/operations":
+            if not self.require_permission("admin:view"):
+                return
+            return self.respond_json(operations_reporting())
         if parsed.path == "/api/oauth/gmail/callback":
             body, status = gmail_oauth_callback(parsed.query)
             return self.respond_html(body, status)
@@ -183,6 +206,16 @@ class AppHandler(SimpleHTTPRequestHandler):
                 return
             attachment_id = int(parsed.path.split("/")[-2])
             return self.serve_attachment(attachment_id)
+        if parsed.path.startswith("/api/purchase-orders/") and parsed.path.endswith("/confirmed-order"):
+            if not self.require_permission("po_dashboard:view"):
+                return
+            po_id = int(parsed.path.split("/")[-2])
+            return self.respond_json(confirmed_order_view(po_id))
+        if parsed.path.startswith("/api/purchase-orders/") and parsed.path.endswith("/acknowledgment-draft"):
+            if not self.require_permission("po_dashboard:view"):
+                return
+            po_id = int(parsed.path.split("/")[-2])
+            return self.respond_json(acknowledgment_draft(po_id))
         if parsed.path.startswith("/api/purchase-orders/"):
             if not self.require_permission("po_dashboard:view"):
                 return
@@ -208,6 +241,10 @@ class AppHandler(SimpleHTTPRequestHandler):
             if not self.require_permission("admin:view"):
                 return
             return self.respond_json(upload_customer_part_xrefs(self))
+        if parsed.path == "/api/products/upload-csv":
+            if not self.require_permission("admin:view"):
+                return
+            return self.respond_json(upload_products_csv(self))
         if parsed.path == "/api/customers/upload-csv":
             if not self.require_permission("admin:view"):
                 return
@@ -220,6 +257,10 @@ class AppHandler(SimpleHTTPRequestHandler):
             if not self.require_permission("admin:view"):
                 return
             return self.respond_json(create_customer_part_xref(self.read_json()))
+        if parsed.path == "/api/products":
+            if not self.require_permission("admin:view"):
+                return
+            return self.respond_json(create_product(self.read_json()))
         if parsed.path == "/api/order-types":
             if not self.require_permission("admin:view"):
                 return
@@ -292,6 +333,18 @@ class AppHandler(SimpleHTTPRequestHandler):
                 return
             po_id = int(parsed.path.split("/")[-3])
             return self.respond_json(run_purchase_order_master_data_reviews(po_id))
+        if parsed.path.startswith("/api/review-tasks/") and parsed.path.endswith("/resolve"):
+            actor = self.require_permission("po_dashboard:edit")
+            if not actor:
+                return
+            task_id = int(parsed.path.split("/")[-2])
+            return self.respond_json(resolve_review_task_action(task_id, actor))
+        if parsed.path.startswith("/api/review-tasks/") and parsed.path.endswith("/ignore"):
+            actor = self.require_permission("po_dashboard:edit")
+            if not actor:
+                return
+            task_id = int(parsed.path.split("/")[-2])
+            return self.respond_json(ignore_review_task_action(task_id, actor))
         if parsed.path == "/api/users":
             actor = self.require_permission("users:manage")
             if not actor:
@@ -353,6 +406,11 @@ class AppHandler(SimpleHTTPRequestHandler):
                 return
             xref_id = int(parsed.path.rsplit("/", 1)[-1])
             return self.respond_json(update_customer_part_xref(xref_id, self.read_json()))
+        if parsed.path.startswith("/api/products/"):
+            if not self.require_permission("admin:view"):
+                return
+            product_id = int(parsed.path.rsplit("/", 1)[-1])
+            return self.respond_json(update_product(product_id, self.read_json()))
         if parsed.path.startswith("/api/order-types/"):
             if not self.require_permission("admin:view"):
                 return
@@ -439,6 +497,11 @@ class AppHandler(SimpleHTTPRequestHandler):
                 return
             xref_id = int(parsed.path.rsplit("/", 1)[-1])
             return self.respond_json(delete_customer_part_xref(xref_id))
+        if parsed.path.startswith("/api/products/"):
+            if not self.require_permission("admin:view"):
+                return
+            product_id = int(parsed.path.rsplit("/", 1)[-1])
+            return self.respond_json(delete_product(product_id))
         if parsed.path.startswith("/api/order-types/"):
             if not self.require_permission("admin:view"):
                 return
@@ -1219,6 +1282,9 @@ def get_purchase_order(po_id: int) -> dict:
             order_type = row_to_dict(conn.execute("SELECT * FROM order_types WHERE id = ?", (po["order_type_id"],)).fetchone())
             po["order_type_name"] = order_type["name"] if order_type else None
         run_master_data_reviews(conn, po_id)
+        generate_review_tasks_for_po(conn, po_id)
+        review_tasks = list_review_tasks_for_po(conn, po_id)
+        audit_events = list_audit_events_for_po(conn, po_id)
         reviews = list_reviews(conn, po_id)
         return {
             "purchase_order": po,
@@ -1227,6 +1293,8 @@ def get_purchase_order(po_id: int) -> dict:
             "attachment": attachment,
             "order_types": order_types,
             "master_data_reviews": reviews,
+            "review_tasks": review_tasks,
+            "audit_events": audit_events,
         }
 
 
@@ -1285,7 +1353,10 @@ def update_purchase_order(po_id: int, payload: dict, actor: dict | None = None) 
             conn.commit()
     mark_fields_reviewed("purchase_orders", po_id, payload.keys())
     with db() as conn:
+        resolve_review_tasks_for_fields(conn, po_id, None, payload.keys(), actor)
         run_master_data_reviews(conn, po_id)
+        generate_review_tasks_for_po(conn, po_id)
+        record_audit_event(conn, po_id, "po_updated", "PO header saved.", actor, {"fields": list(payload.keys())})
     return get_purchase_order(po_id)
 
 
@@ -1313,14 +1384,15 @@ def add_line(po_id: int, payload: dict) -> dict:
     with db() as conn:
         po_number = conn.execute("SELECT po_number FROM purchase_orders WHERE id = ?", (po_id,)).fetchone()["po_number"]
         line_total = line_total_from_payload(payload)
+        product_match = match_product_for_line(conn, po_id, payload)
         conn.execute(
             """
             INSERT INTO purchase_order_lines (
                 purchase_order_id, po_number, line_number, customer_part_number, customer_part_revision,
                 internal_part_number, internal_part_revision, description,
                 quantity, unit_of_measure, unit_price, line_total, requested_date, extraction_confidence, extraction_notes,
-                field_confidence_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0.5, 'Manually added', ?)
+                field_confidence_json, product_match_status, matched_product_id, product_match_score, product_match_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0.5, 'Manually added', ?, ?, ?, ?, ?)
             """,
             (
                 po_id,
@@ -1337,9 +1409,14 @@ def add_line(po_id: int, payload: dict) -> dict:
                 line_total,
                 payload.get("requested_date"),
                 json.dumps({key: 1.0 for key in payload.keys()}),
+                product_match["status"],
+                product_match["product_id"],
+                product_match["score"],
+                product_match["reason"],
             ),
         )
         conn.execute("UPDATE purchase_orders SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (po_id,))
+        generate_review_tasks_for_po(conn, po_id)
         conn.commit()
         recalculate_po_total(conn, po_id)
     return get_purchase_order(po_id)
@@ -1370,7 +1447,30 @@ def update_line(line_id: int, payload: dict, actor: dict | None = None) -> dict:
         row = conn.execute("SELECT quantity, unit_price FROM purchase_order_lines WHERE id = ?", (line_id,)).fetchone()
         calculated = line_total_from_payload(dict(row))
         conn.execute("UPDATE purchase_order_lines SET line_total = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (calculated, line_id))
+        line = row_to_dict(conn.execute("SELECT * FROM purchase_order_lines WHERE id = ?", (line_id,)).fetchone())
+        product_match = match_product_for_line(conn, po_id, line or {})
+        conn.execute(
+            """
+            UPDATE purchase_order_lines
+            SET product_match_status = ?, matched_product_id = ?, product_match_score = ?,
+                product_match_reason = ?, internal_part_number = COALESCE(NULLIF(internal_part_number, ''), ?),
+                internal_part_revision = COALESCE(NULLIF(internal_part_revision, ''), ?)
+            WHERE id = ?
+            """,
+            (
+                product_match["status"],
+                product_match["product_id"],
+                product_match["score"],
+                product_match["reason"],
+                (line or {}).get("internal_part_number"),
+                (line or {}).get("internal_part_revision"),
+                line_id,
+            ),
+        )
         recalculate_po_total(conn, po_id)
+        resolve_review_tasks_for_fields(conn, po_id, line_id, payload.keys(), actor)
+        generate_review_tasks_for_po(conn, po_id)
+        record_audit_event(conn, po_id, "line_updated", "PO line saved.", actor, {"line_id": line_id, "fields": list(payload.keys())})
     return get_purchase_order(po_id)
 
 
@@ -1506,6 +1606,7 @@ def delete_line(line_id: int) -> dict:
         conn.execute("DELETE FROM purchase_order_lines WHERE id = ?", (line_id,))
         conn.execute("UPDATE purchase_orders SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (po_id,))
         recalculate_po_total(conn, po_id)
+        generate_review_tasks_for_po(conn, po_id)
         conn.commit()
     return get_purchase_order(po_id)
 
@@ -1685,7 +1786,7 @@ def delete_payment_term(payment_term_id: int) -> dict:
 
 TEST_DOCUMENT_TYPES = {"po_pdf", "po_email_body", "scanned_po_pdf", "quote", "order_confirmation", "invoice", "rfq", "random_email", "other"}
 TEST_CLASSIFICATIONS = {"purchase_order", "possible_po", "not_po"}
-TEST_UPLOAD_EXTENSIONS = {".pdf", ".txt", ".eml", ".csv", ".xlsx"}
+TEST_UPLOAD_EXTENSIONS = {".pdf", ".txt", ".eml", ".csv", ".xlsx", ".docx"}
 
 
 def list_test_documents() -> dict:
@@ -1739,7 +1840,7 @@ def upload_test_documents(handler: AppHandler) -> dict:
             filename = safe_upload_filename(raw_name)
             extension = Path(filename).suffix.lower()
             if not filename or extension not in TEST_UPLOAD_EXTENSIONS:
-                rejected.append({"filename": raw_name or "(missing)", "reason": "Allowed: .pdf, .txt, .eml, .csv, .xlsx"})
+                rejected.append({"filename": raw_name or "(missing)", "reason": "Allowed: .pdf, .txt, .eml, .csv, .xlsx, .docx"})
                 continue
             target = unique_upload_path(TEST_CORPUS_DIR, filename)
             with target.open("wb") as output:
@@ -2112,6 +2213,10 @@ def test_document_text(document: dict) -> tuple[str, str]:
         return text, "pdf_text"
     if suffix in {".txt", ".eml", ".csv"}:
         return path.read_text(encoding="utf-8", errors="replace"), "body"
+    if suffix in {".xlsx", ".docx"}:
+        from server.processing import extract_docx_text, extract_xlsx_text
+
+        return (extract_xlsx_text(path), "excel_text") if suffix == ".xlsx" else (extract_docx_text(path), "docx_text")
     return "", "unsupported"
 
 
@@ -2839,7 +2944,8 @@ def refresh_inbox_labels(conn, inbox_account_id: int) -> list[dict]:
 
 def refresh_outlook_folders(conn, inbox_account_id: int) -> list[dict]:
     access_token = get_outlook_access_token(conn, inbox_account_id)
-    payload = outlook_api_get("/v1.0/me/mailFolders", access_token, {"$top": "100"})
+    account = row_to_dict(conn.execute("SELECT * FROM inbox_accounts WHERE id = ?", (inbox_account_id,)).fetchone()) or {}
+    payload = outlook_api_get(f"{outlook_mailbox_base_path(account)}/mailFolders", access_token, {"$top": "100"})
     folders = payload.get("value") or []
     existing = {
         row["label_id"]: row
@@ -2915,6 +3021,16 @@ def delete_inbox_account(account_id: int) -> dict:
 
 
 def sync_inbox_account(account_id: int, payload: dict | None = None) -> dict:
+    if account_id in SYNC_LOCKS:
+        return {"error": "Sync is already running for this inbox.", **list_inbox_accounts()}
+    SYNC_LOCKS.add(account_id)
+    try:
+        return sync_inbox_account_unlocked(account_id, payload)
+    finally:
+        SYNC_LOCKS.discard(account_id)
+
+
+def sync_inbox_account_unlocked(account_id: int, payload: dict | None = None) -> dict:
     started = now_iso()
     payload = payload or {}
     start_at = parse_local_datetime(payload.get("start_at"))
@@ -3190,7 +3306,7 @@ def sync_outlook_messages(conn, account_id: int, run_id: int, start_at: datetime
     errors: list[str] = []
     for folder_id in selected_folders:
         try:
-            folder_messages = list_outlook_folder_messages(access_token, folder_id, start_at, end_at)
+            folder_messages = list_outlook_folder_messages(access_token, folder_id, start_at, end_at, account)
             for message in folder_messages:
                 if message.get("id"):
                     messages_by_id[message["id"]] = message
@@ -3245,7 +3361,7 @@ def sync_outlook_messages(conn, account_id: int, run_id: int, start_at: datetime
             attachment_errors: list[str] = []
             had_any_attachment = bool(message.get("hasAttachments"))
             if not existing_attachment_rows:
-                attachments, attachment_errors, had_any_attachment = download_outlook_attachments(message_id, access_token, STORAGE_DIR / "outlook" / safe_storage_segment(message_id), had_any_attachment)
+                attachments, attachment_errors, had_any_attachment = download_outlook_attachments(message_id, access_token, STORAGE_DIR / "outlook" / safe_storage_segment(message_id), had_any_attachment, account)
             if not attachments and not existing_attachment_rows and not account.get("evaluate_without_attachments"):
                 result["messages_skipped"] += 1
                 write_detection_result(
@@ -3320,7 +3436,7 @@ def sync_outlook_messages(conn, account_id: int, run_id: int, start_at: datetime
     return result
 
 
-def list_outlook_folder_messages(access_token: str, folder_id: str, start_at: datetime | None, end_at: datetime | None) -> list[dict]:
+def list_outlook_folder_messages(access_token: str, folder_id: str, start_at: datetime | None, end_at: datetime | None, account: dict | None = None) -> list[dict]:
     params = {
         "$top": "50",
         "$orderby": "receivedDateTime desc",
@@ -3333,7 +3449,7 @@ def list_outlook_folder_messages(access_token: str, folder_id: str, start_at: da
         filters.append(f"receivedDateTime le {graph_datetime(end_at)}")
     if filters:
         params["$filter"] = " and ".join(filters)
-    path = f"/v1.0/me/mailFolders/{urllib.parse.quote(folder_id, safe='')}/messages"
+    path = f"{outlook_mailbox_base_path(account or {})}/mailFolders/{urllib.parse.quote(folder_id, safe='')}/messages"
     messages: list[dict] = []
     next_url: str | None = None
     while len(messages) < 250:
@@ -3574,7 +3690,7 @@ def download_gmail_attachments(message: dict, access_token: str, target_dir: Pat
             continue
         safe_name = safe_upload_filename(filename)
         extension = Path(safe_name).suffix.lower()
-        if extension not in {".pdf", ".txt", ".eml"}:
+        if extension not in {".pdf", ".txt", ".eml", ".xlsx", ".docx"}:
             errors.append(f"Skipped unsupported attachment {filename}")
             continue
         payload = gmail_api_get(f"/gmail/v1/users/me/messages/{message_id}/attachments/{attachment_id}", access_token)
@@ -3613,11 +3729,19 @@ def extract_outlook_body_text(message: dict) -> str:
     return content
 
 
-def download_outlook_attachments(message_id: str, access_token: str, target_dir: Path, had_any_attachment: bool = False) -> tuple[list[IncomingAttachment], list[str], bool]:
+def outlook_mailbox_base_path(account: dict) -> str:
+    connected = (account.get("connected_email") or "").strip().lower()
+    monitored = (account.get("monitored_email") or "").strip()
+    if monitored and monitored.lower() != connected:
+        return f"/v1.0/users/{urllib.parse.quote(monitored, safe='')}"
+    return "/v1.0/me"
+
+
+def download_outlook_attachments(message_id: str, access_token: str, target_dir: Path, had_any_attachment: bool = False, account: dict | None = None) -> tuple[list[IncomingAttachment], list[str], bool]:
     target_dir.mkdir(parents=True, exist_ok=True)
     attachments: list[IncomingAttachment] = []
     errors: list[str] = []
-    payload = outlook_api_get(f"/v1.0/me/messages/{urllib.parse.quote(message_id, safe='')}/attachments", access_token)
+    payload = outlook_api_get(f"{outlook_mailbox_base_path(account or {})}/messages/{urllib.parse.quote(message_id, safe='')}/attachments", access_token)
     for item in payload.get("value") or []:
         had_any_attachment = True
         odata_type = item.get("@odata.type") or ""
@@ -3627,7 +3751,7 @@ def download_outlook_attachments(message_id: str, access_token: str, target_dir:
         filename = item.get("name") or ""
         safe_name = safe_upload_filename(filename)
         extension = Path(safe_name).suffix.lower()
-        if extension not in {".pdf", ".txt", ".eml"}:
+        if extension not in {".pdf", ".txt", ".eml", ".xlsx", ".docx"}:
             errors.append(f"Skipped unsupported attachment {filename or 'unnamed'}")
             continue
         data = item.get("contentBytes")
@@ -3758,14 +3882,20 @@ def list_customer_part_xrefs() -> list[dict]:
 
 def customer_part_xrefs_csv() -> str:
     output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=["customer", "customer_part_number", "internal_part_number"], lineterminator="\n")
+    writer = csv.DictWriter(
+        output,
+        fieldnames=["customer", "customer_part_number", "customer_part_revision", "internal_part_number", "internal_part_revision"],
+        lineterminator="\n",
+    )
     writer.writeheader()
     for row in list_customer_part_xrefs():
         writer.writerow(
             {
                 "customer": row["customer_name"],
                 "customer_part_number": row["customer_part_number"],
+                "customer_part_revision": row.get("customer_part_revision"),
                 "internal_part_number": row["internal_part_number"],
+                "internal_part_revision": row.get("internal_part_revision"),
             }
         )
     return output.getvalue()
@@ -3889,6 +4019,338 @@ def export_line_row(line: dict) -> dict:
     }
 
 
+def list_products() -> list[dict]:
+    with db() as conn:
+        return rows_to_dicts(conn.execute("SELECT * FROM products ORDER BY is_active DESC, internal_part_number").fetchall())
+
+
+def create_product(payload: dict) -> dict:
+    internal_part_number = (payload.get("internal_part_number") or "").strip()
+    if not internal_part_number:
+        return {"error": "internal_part_number_required", "products": list_products()}
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO products (internal_part_number, internal_part_revision, description, unit_of_measure, is_active)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(internal_part_number) DO UPDATE SET
+                internal_part_revision = excluded.internal_part_revision,
+                description = excluded.description,
+                unit_of_measure = excluded.unit_of_measure,
+                is_active = excluded.is_active,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                internal_part_number,
+                (payload.get("internal_part_revision") or "").strip(),
+                (payload.get("description") or "").strip(),
+                (payload.get("unit_of_measure") or "").strip(),
+                1 if payload.get("is_active", True) else 0,
+            ),
+        )
+        conn.commit()
+    return {"products": list_products()}
+
+
+def update_product(product_id: int, payload: dict) -> dict:
+    allowed = ["internal_part_number", "internal_part_revision", "description", "unit_of_measure", "is_active"]
+    if "is_active" in payload:
+        payload["is_active"] = 1 if payload.get("is_active") else 0
+    update_fields("products", product_id, payload, allowed)
+    return {"products": list_products()}
+
+
+def delete_product(product_id: int) -> dict:
+    with db() as conn:
+        used = conn.execute("SELECT COUNT(*) AS count FROM purchase_order_lines WHERE matched_product_id = ?", (product_id,)).fetchone()["count"]
+        if used:
+            conn.execute("UPDATE products SET is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (product_id,))
+        else:
+            conn.execute("DELETE FROM products WHERE id = ?", (product_id,))
+        conn.commit()
+    return {"products": list_products()}
+
+
+def products_csv() -> str:
+    output = io.StringIO()
+    fields = ["internal_part_number", "internal_part_revision", "description", "unit_of_measure", "is_active"]
+    writer = csv.DictWriter(output, fieldnames=fields, lineterminator="\n")
+    writer.writeheader()
+    for row in list_products():
+        writer.writerow({field: row.get(field) for field in fields})
+    return output.getvalue()
+
+
+def upload_products_csv(handler: AppHandler) -> dict:
+    imported = 0
+    skipped = 0
+    errors: list[str] = []
+    for filename, text in uploaded_csv_texts(handler, errors):
+        reader = csv.DictReader(text.splitlines())
+        if not reader.fieldnames:
+            errors.append(f"{filename}: CSV has no header row.")
+            continue
+        field_map = {normalize_header(name): name for name in reader.fieldnames}
+        aliases = {
+            "internal_part_number": ["internal_part_number", "internalpartnumber", "part_number", "partnumber", "sku"],
+            "internal_part_revision": ["internal_part_revision", "internalpartrevision", "revision", "rev"],
+            "description": ["description", "item_description", "itemdescription"],
+            "unit_of_measure": ["unit_of_measure", "uom", "unit"],
+            "is_active": ["is_active", "active"],
+        }
+        resolved = {target: next((field_map[item] for item in options if item in field_map), None) for target, options in aliases.items()}
+        if not resolved.get("internal_part_number"):
+            errors.append(f"{filename}: Missing internal_part_number.")
+            continue
+        for index, row in enumerate(reader, start=2):
+            part = (row.get(resolved["internal_part_number"]) or "").strip()
+            if not part:
+                skipped += 1
+                errors.append(f"{filename} row {index}: missing internal_part_number.")
+                continue
+            create_product(
+                {
+                    "internal_part_number": part,
+                    "internal_part_revision": row.get(resolved.get("internal_part_revision") or "", ""),
+                    "description": row.get(resolved.get("description") or "", ""),
+                    "unit_of_measure": row.get(resolved.get("unit_of_measure") or "", ""),
+                    "is_active": parse_bool(row.get(resolved.get("is_active") or "", "1")),
+                }
+            )
+            imported += 1
+    return {"imported": imported, "skipped": skipped, "errors": errors, "products": list_products()}
+
+
+def parse_bool(value: object) -> bool:
+    return str(value).strip().lower() not in {"0", "false", "no", "inactive"}
+
+
+def list_review_tasks(params: dict[str, list[str]]) -> dict:
+    status = params.get("status", ["open"])[0] or "open"
+    query = """
+        SELECT rt.*, po.po_number, po.customer_company_name, po.status AS po_status
+        FROM review_tasks rt
+        LEFT JOIN purchase_orders po ON po.id = rt.purchase_order_id
+    """
+    args: list[object] = []
+    if status != "all":
+        query += " WHERE rt.status = ?"
+        args.append(status)
+    query += """
+        ORDER BY CASE rt.severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END,
+                 rt.created_at DESC, rt.id DESC
+        LIMIT 300
+    """
+    with db() as conn:
+        return {"tasks": rows_to_dicts(conn.execute(query, args).fetchall())}
+
+
+def list_review_tasks_for_po(conn, po_id: int) -> list[dict]:
+    return rows_to_dicts(
+        conn.execute(
+            """
+            SELECT * FROM review_tasks
+            WHERE purchase_order_id = ?
+            ORDER BY CASE status WHEN 'open' THEN 0 WHEN 'resolved' THEN 1 ELSE 2 END,
+                     CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END,
+                     created_at DESC
+            """,
+            (po_id,),
+        ).fetchall()
+    )
+
+
+def resolve_review_task_action(task_id: int, actor: dict) -> dict:
+    with db() as conn:
+        task = conn.execute("SELECT purchase_order_id, message FROM review_tasks WHERE id = ?", (task_id,)).fetchone()
+        if not task:
+            return {"error": "not_found"}
+        conn.execute(
+            """
+            UPDATE review_tasks
+            SET status = 'resolved', resolved_by_user_id = ?, resolved_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (actor.get("id"), task_id),
+        )
+        record_audit_event(conn, task["purchase_order_id"], "review_task_resolved", "Review task resolved.", actor, {"task_id": task_id, "message": task["message"]})
+        conn.commit()
+    return get_purchase_order(task["purchase_order_id"])
+
+
+def ignore_review_task_action(task_id: int, actor: dict) -> dict:
+    with db() as conn:
+        task = conn.execute("SELECT purchase_order_id, message FROM review_tasks WHERE id = ?", (task_id,)).fetchone()
+        if not task:
+            return {"error": "not_found"}
+        conn.execute(
+            """
+            UPDATE review_tasks
+            SET status = 'ignored', ignored_by_user_id = ?, ignored_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (actor.get("id"), task_id),
+        )
+        record_audit_event(conn, task["purchase_order_id"], "review_task_ignored", "Review task ignored.", actor, {"task_id": task_id, "message": task["message"]})
+        conn.commit()
+    return get_purchase_order(task["purchase_order_id"])
+
+
+def record_audit_event(conn, po_id: int | None, event_type: str, message: str, actor: dict | None = None, metadata: dict | None = None) -> None:
+    if not po_id:
+        return
+    conn.execute(
+        """
+        INSERT INTO po_audit_events (purchase_order_id, event_type, message, metadata_json, created_by_user_id)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (po_id, event_type, message, json.dumps(metadata or {}), actor.get("id") if actor else None),
+    )
+
+
+def resolve_review_tasks_for_fields(conn, po_id: int, line_id: int | None, field_names, actor: dict | None = None) -> None:
+    fields = [field for field in field_names if field not in {"extraction_notes"}]
+    if not fields:
+        return
+    placeholders = ",".join("?" for _ in fields)
+    args: list[object] = [actor.get("id") if actor else None, po_id, *fields]
+    line_clause = ""
+    if line_id is not None:
+        line_clause = " AND purchase_order_line_id = ?"
+        args.append(line_id)
+    else:
+        line_clause = " AND purchase_order_line_id IS NULL"
+    conn.execute(
+        f"""
+        UPDATE review_tasks
+        SET status = 'resolved', resolved_by_user_id = COALESCE(?, resolved_by_user_id),
+            resolved_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+        WHERE purchase_order_id = ? AND status = 'open' AND field_name IN ({placeholders}){line_clause}
+        """,
+        args,
+    )
+
+
+def list_audit_events_for_po(conn, po_id: int) -> list[dict]:
+    rows = conn.execute(
+        """
+        SELECT ae.*, u.email AS user_email,
+               COALESCE(NULLIF(TRIM(u.first_name || ' ' || u.last_name), ''), u.name, u.email) AS user_display
+        FROM po_audit_events ae
+        LEFT JOIN users u ON u.id = ae.created_by_user_id
+        WHERE ae.purchase_order_id = ?
+        ORDER BY ae.created_at DESC, ae.id DESC
+        LIMIT 100
+        """,
+        (po_id,),
+    ).fetchall()
+    events = rows_to_dicts(rows)
+    feedback = rows_to_dicts(
+        conn.execute(
+            """
+            SELECT ef.created_at, ef.field_name, ef.extracted_value, ef.corrected_value, u.email AS user_email
+            FROM extraction_feedback ef
+            LEFT JOIN users u ON u.id = ef.created_by_user_id
+            WHERE ef.purchase_order_id = ?
+            ORDER BY ef.created_at DESC, ef.id DESC
+            LIMIT 100
+            """,
+            (po_id,),
+        ).fetchall()
+    )
+    for row in feedback:
+        events.append(
+            {
+                "event_type": "field_correction",
+                "message": f"{row['field_name']} corrected from '{row['extracted_value']}' to '{row['corrected_value']}'.",
+                "created_at": row["created_at"],
+                "user_display": row.get("user_email") or "",
+            }
+        )
+    return sorted(events, key=lambda item: item.get("created_at") or "", reverse=True)[:100]
+
+
+def confirmed_order_view(po_id: int) -> dict:
+    detail = get_purchase_order(po_id)
+    if detail.get("error"):
+        return detail
+    return {
+        "purchase_order": detail["purchase_order"],
+        "lines": detail["lines"],
+        "summary": build_confirmed_order_text(detail),
+    }
+
+
+def acknowledgment_draft(po_id: int) -> dict:
+    detail = get_purchase_order(po_id)
+    if detail.get("error"):
+        return detail
+    po = detail["purchase_order"]
+    email = detail.get("email") or {}
+    subject = f"Purchase Order {po.get('po_number') or ''} Received".strip()
+    body = build_confirmed_order_text(detail)
+    body = f"Hello,\n\nWe have received purchase order {po.get('po_number') or ''}{(' revision ' + po.get('po_revision')) if po.get('po_revision') else ''}.\n\n{body}\n\nThank you."
+    return {"to": email.get("sender") or po.get("source_sender") or "", "subject": subject, "body": body}
+
+
+def build_confirmed_order_text(detail: dict) -> str:
+    po = detail["purchase_order"]
+    lines = detail.get("lines") or []
+    line_text = "\n".join(
+        f"- {line.get('line_number') or ''} {line.get('customer_part_number') or line.get('internal_part_number') or ''} {line.get('description') or ''}: {line.get('quantity') or ''} {line.get('unit_of_measure') or ''} @ {line.get('unit_price') or ''}"
+        for line in lines
+    )
+    return "\n".join(
+        [
+            f"Customer: {po.get('customer_company_name') or ''}",
+            f"PO: {po.get('po_number') or ''}",
+            f"Status: {po.get('status') or ''}",
+            f"Received: {po.get('date_received') or ''}",
+            f"Ship To: {po.get('ship_to_address') or ''}",
+            f"Bill To: {po.get('bill_to_address') or ''}",
+            f"Total: {po.get('total_value') or ''} {po.get('currency') or ''}",
+            "Lines:",
+            line_text or "(no lines)",
+        ]
+    )
+
+
+def operations_reporting() -> dict:
+    with db() as conn:
+        status_counts = {row["status"]: row["count"] for row in conn.execute("SELECT status, COUNT(*) AS count FROM purchase_orders GROUP BY status")}
+        total = sum(status_counts.values())
+        open_exceptions = conn.execute("SELECT COUNT(*) AS count FROM review_tasks WHERE status = 'open'").fetchone()["count"]
+        pos_with_exceptions = conn.execute("SELECT COUNT(DISTINCT purchase_order_id) AS count FROM review_tasks WHERE status = 'open' AND purchase_order_id IS NOT NULL").fetchone()["count"]
+        feedback_count = conn.execute("SELECT COUNT(*) AS count FROM extraction_feedback").fetchone()["count"]
+        avg_conf = conn.execute("SELECT AVG(extraction_confidence) AS value FROM purchase_orders").fetchone()["value"] or 0
+        received_by_day = rows_to_dicts(conn.execute("SELECT substr(created_at, 1, 10) AS day, COUNT(*) AS count FROM purchase_orders GROUP BY day ORDER BY day DESC LIMIT 14").fetchall())
+        booked_by_day = rows_to_dicts(conn.execute("SELECT substr(updated_at, 1, 10) AS day, COUNT(*) AS count FROM purchase_orders WHERE status = 'Booked' GROUP BY day ORDER BY day DESC LIMIT 14").fetchall())
+        inbox = row_to_dict(
+            conn.execute(
+                """
+                SELECT COALESCE(SUM(messages_seen), 0) AS messages_seen,
+                       COALESCE(SUM(messages_imported), 0) AS messages_imported,
+                       COALESCE(SUM(messages_skipped), 0) AS messages_skipped,
+                       COALESCE(SUM(purchase_orders_created), 0) AS purchase_orders_created
+                FROM inbox_sync_runs
+                """
+            ).fetchone()
+        )
+        return {
+            "status_counts": status_counts,
+            "total_purchase_orders": total,
+            "open_exceptions": open_exceptions,
+            "exception_rate": (pos_with_exceptions / total) if total else 0,
+            "average_extraction_confidence": avg_conf,
+            "manual_correction_count": feedback_count,
+            "received_by_day": received_by_day,
+            "booked_by_day": booked_by_day,
+            "inbox": inbox,
+        }
+
+
 def create_customer_part_xref(payload: dict) -> dict:
     try:
         save_customer_part_xref(payload)
@@ -3898,7 +4360,7 @@ def create_customer_part_xref(payload: dict) -> dict:
 
 
 def update_customer_part_xref(xref_id: int, payload: dict) -> dict:
-    allowed = ["customer_name", "customer_part_number", "internal_part_number"]
+    allowed = ["customer_name", "customer_part_number", "customer_part_revision", "internal_part_number", "internal_part_revision"]
     update_fields("customer_part_xrefs", xref_id, payload, allowed)
     return {"xrefs": list_customer_part_xrefs()}
 
@@ -3913,19 +4375,41 @@ def delete_customer_part_xref(xref_id: int) -> dict:
 def save_customer_part_xref(payload: dict) -> None:
     customer_name = (payload.get("customer_name") or payload.get("customer") or "").strip()
     customer_part = (payload.get("customer_part_number") or "").strip()
+    customer_part_revision = (payload.get("customer_part_revision") or "").strip()
     internal_part = (payload.get("internal_part_number") or "").strip()
+    internal_part_revision = (payload.get("internal_part_revision") or "").strip()
     if not customer_name or not customer_part or not internal_part:
         raise ValueError("customer_name, customer_part_number, and internal_part_number are required")
     with db() as conn:
-        conn.execute(
+        existing = conn.execute(
             """
-            INSERT INTO customer_part_xrefs (customer_name, customer_part_number, internal_part_number)
-            VALUES (?, ?, ?)
-            ON CONFLICT(customer_name, customer_part_number)
-            DO UPDATE SET internal_part_number = excluded.internal_part_number, updated_at = CURRENT_TIMESTAMP
+            SELECT id FROM customer_part_xrefs
+            WHERE LOWER(TRIM(customer_name)) = LOWER(TRIM(?))
+              AND LOWER(TRIM(customer_part_number)) = LOWER(TRIM(?))
+              AND LOWER(TRIM(COALESCE(customer_part_revision, ''))) = LOWER(TRIM(?))
             """,
-            (customer_name, customer_part, internal_part),
-        )
+            (customer_name, customer_part, customer_part_revision),
+        ).fetchone()
+        if existing:
+            conn.execute(
+                """
+                UPDATE customer_part_xrefs
+                SET internal_part_number = ?, internal_part_revision = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (internal_part, internal_part_revision, existing["id"]),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO customer_part_xrefs (
+                    customer_name, customer_part_number, customer_part_revision,
+                    internal_part_number, internal_part_revision
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (customer_name, customer_part, customer_part_revision, internal_part, internal_part_revision),
+            )
         conn.commit()
 
 
@@ -3977,7 +4461,9 @@ def import_xref_csv(text: str) -> dict:
     aliases = {
         "customer_name": ["customer", "customer_name", "customercompany", "customer_company", "customername"],
         "customer_part_number": ["customer_part_number", "customerpartnumber", "customer_sku", "customersku", "customerpart"],
+        "customer_part_revision": ["customer_part_revision", "customerpartrevision", "customer_rev", "customerrev", "part_rev", "partrevision"],
         "internal_part_number": ["internal_part_number", "internalpartnumber", "internal_sku", "internalsku", "internalpart"],
+        "internal_part_revision": ["internal_part_revision", "internalpartrevision", "internal_rev", "internalrev"],
     }
     resolved = {}
     for target, options in aliases.items():
@@ -3985,7 +4471,7 @@ def import_xref_csv(text: str) -> dict:
             if option in field_map:
                 resolved[target] = field_map[option]
                 break
-    missing = [target for target in aliases if target not in resolved]
+    missing = [target for target in ("customer_name", "customer_part_number", "internal_part_number") if target not in resolved]
     if missing:
         return {"imported": 0, "skipped": 0, "errors": [f"Missing required columns: {', '.join(missing)}"]}
     imported = 0
@@ -3994,9 +4480,11 @@ def import_xref_csv(text: str) -> dict:
     for row_number, row in enumerate(reader, start=2):
         payload = {
             "customer_name": row.get(resolved["customer_name"], ""),
-            "customer_part_number": row.get(resolved["customer_part_number"], ""),
-            "internal_part_number": row.get(resolved["internal_part_number"], ""),
-        }
+                "customer_part_number": row.get(resolved["customer_part_number"], ""),
+                "customer_part_revision": row.get(resolved.get("customer_part_revision", ""), ""),
+                "internal_part_number": row.get(resolved["internal_part_number"], ""),
+                "internal_part_revision": row.get(resolved.get("internal_part_revision", ""), ""),
+            }
         try:
             save_customer_part_xref(payload)
             imported += 1
@@ -4260,7 +4748,7 @@ def mark_fields_reviewed(table: str, row_id: int, fields: object) -> None:
         conn.commit()
 
 
-ALLOWED_UPLOAD_EXTENSIONS = {".pdf", ".txt", ".eml"}
+ALLOWED_UPLOAD_EXTENSIONS = {".pdf", ".txt", ".eml", ".xlsx", ".docx"}
 
 
 def upload_samples(handler: AppHandler) -> dict:
@@ -4291,7 +4779,7 @@ def upload_samples(handler: AppHandler) -> dict:
         filename = safe_upload_filename(raw_name)
         extension = Path(filename).suffix.lower()
         if not filename or extension not in ALLOWED_UPLOAD_EXTENSIONS:
-            rejected.append({"filename": raw_name or "(missing)", "reason": "Only .pdf, .txt, and .eml files are allowed."})
+            rejected.append({"filename": raw_name or "(missing)", "reason": "Only .pdf, .txt, .eml, .xlsx, and .docx files are allowed."})
             continue
         target = unique_upload_path(upload_dir, filename)
         with target.open("wb") as output:
@@ -4320,11 +4808,56 @@ def unique_upload_path(directory: Path, filename: str) -> Path:
     return directory / f"{Path(filename).stem}-{uuid.uuid4().hex[:8]}{Path(filename).suffix}"
 
 
+def start_background_sync_runner() -> None:
+    if not ENABLE_BACKGROUND_SYNC:
+        return
+    thread = threading.Thread(target=background_sync_loop, name="poinbox-background-sync", daemon=True)
+    thread.start()
+
+
+def background_sync_loop() -> None:
+    while True:
+        try:
+            run_due_background_syncs()
+        except Exception as exc:
+            with db() as conn:
+                conn.execute(
+                    "INSERT INTO processing_logs (level, message, metadata_json) VALUES ('error', ?, ?)",
+                    ("Background sync runner failed.", json.dumps({"error": str(exc)})),
+                )
+                conn.commit()
+        time.sleep(60)
+
+
+def run_due_background_syncs() -> None:
+    now = datetime.utcnow()
+    with db() as conn:
+        accounts = rows_to_dicts(
+            conn.execute(
+                """
+                SELECT id, last_sync_at, next_sync_at
+                FROM inbox_accounts
+                WHERE is_enabled = 1 AND sync_status IN ('connected', 'synced', 'sync_failed')
+                  AND next_sync_at IS NOT NULL AND next_sync_at <= ?
+                ORDER BY next_sync_at
+                LIMIT 5
+                """,
+                (now.isoformat(),),
+            ).fetchall()
+        )
+    for account in accounts:
+        if account["id"] in SYNC_LOCKS:
+            continue
+        start_at = account.get("last_sync_at") or (now - timedelta(hours=24)).isoformat()
+        sync_inbox_account(account["id"], {"start_at": start_at, "end_at": now.isoformat()})
+
+
 def main() -> None:
     STORAGE_DIR.mkdir(parents=True, exist_ok=True)
     SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
     with db():
         pass
+    start_background_sync_runner()
     server = ThreadingHTTPServer((APP_HOST, APP_PORT), AppHandler)
     print(f"POInbox PO Intake MVP running at http://{APP_HOST}:{APP_PORT}")
     server.serve_forever()

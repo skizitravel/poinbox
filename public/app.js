@@ -3,6 +3,7 @@ let currentDetail = null;
 let selectedUploadFiles = [];
 let orderTypes = [];
 let xrefs = [];
+let products = [];
 let users = [];
 let customers = [];
 let departments = [];
@@ -18,6 +19,8 @@ let openaiConfig = {};
 let currentInboxConfig = null;
 let configuringInboxId = null;
 let extractionLearning = { summary: {}, recent_feedback: [], recent_failures: [], corrected_fields: [], corrections_by_customer: [] };
+let reviewTasks = [];
+let operationsMetrics = {};
 let currentUser = null;
 let activeAdminTab = "users";
 let editingUserId = null;
@@ -58,6 +61,7 @@ const lineFields = [
   ["unit_of_measure", "UOM"],
   ["unit_price", "Unit Price", "number"],
   ["line_total", "Line Total", "lineTotal"],
+  ["product_match_status", "Product Match", "readonly"],
   ["requested_date", "Requested Date", "date"],
   ["extraction_notes", "Notes"],
 ];
@@ -119,7 +123,7 @@ function setMessage(selector, message, kind = "") {
 
 async function refresh() {
   if (!canViewDashboard()) return;
-  await Promise.all([loadSummary(), loadPOs(), loadLogs()]);
+  await Promise.all([loadSummary(), loadPOs(), loadLogs(), loadReviewTasks()]);
   if (selectedId) await openDetail(selectedId, false);
 }
 
@@ -200,6 +204,8 @@ function renderDetail() {
     <div class="muted-panel">Corrections captured for learning: ${po.extraction_feedback_count || 0}. Reviewed: ${po.extraction_reviewed_at ? safe(po.extraction_reviewed_at) : "Not reviewed"}.</div>
     <div class="line-actions">
       ${renderViewPoButton()}
+      <button class="secondary" onclick="openConfirmedOrderView()">Confirmed Order View</button>
+      <button class="secondary" onclick="openAcknowledgmentDraft()">Draft Acknowledgment</button>
       ${editActions}
     </div>
 
@@ -208,6 +214,8 @@ function renderDetail() {
     ${canEditDashboard() ? '<button class="secondary" onclick="addLine()">Add Line</button>' : ""}
 
     ${renderMasterDataReviews()}
+    ${renderDetailExceptions()}
+    ${renderAuditTrail()}
 
     <div class="section-title">Source</div>
     <div class="source">${safe(source)}</div>
@@ -239,7 +247,8 @@ function renderField(record, field, prefix) {
     </select>${reviewNote}${action}</div>`;
   }
   if (type === "readonly") {
-    return `<div class="field ${size}"><label>${label}</label><div class="readonly-value">${money(record[key], record.currency)}</div></div>`;
+    const value = key === "total_value" ? money(record[key], record.currency) : safe(record[key]);
+    return `<div class="field ${size}"><label>${label}</label><div class="readonly-value">${value}</div></div>`;
   }
   if (type === "lineTotal") {
     return `<div class="field ${size}"><label>${label}</label><div class="readonly-value">${money(calculatedLineTotal(record), currentDetail?.purchase_order?.currency || "USD")}</div></div>`;
@@ -248,6 +257,51 @@ function renderField(record, field, prefix) {
     return `<div class="field ${size} ${review}"><label>${label}</label><textarea id="${id}">${safe(record[key])}</textarea>${reviewNote}${action}</div>`;
   }
   return `<div class="field ${size} ${review}"><label>${label}</label><input id="${id}" type="${type}" value="${safe(inputValue(record[key], type))}" />${reviewNote}${action}</div>`;
+}
+
+function renderDetailExceptions() {
+  const tasks = currentDetail.review_tasks || [];
+  const openTasks = tasks.filter((task) => task.status === "open");
+  return `
+    <div class="section-title">Exceptions</div>
+    <div class="review-list">
+      ${
+        openTasks.length
+          ? openTasks
+              .map(
+                (task) => `
+          <div class="review-item ${safe(task.severity)}">
+            <div><strong>${safe(task.reason_code)}</strong> ${safe(task.message)}</div>
+            <div class="muted-line">${safe(task.field_name)} ${task.confidence != null ? `- ${pct(task.confidence)}` : ""}</div>
+            <div class="muted-line">Current: ${safe(task.current_value)} ${task.extracted_value ? `| Extracted: ${safe(task.extracted_value)}` : ""}</div>
+            ${
+              canEditDashboard()
+                ? `<button class="secondary table-action" onclick="resolveReviewTask(${task.id})">Resolve</button>
+                   <button class="secondary table-action" onclick="ignoreReviewTask(${task.id})">Ignore</button>`
+                : ""
+            }
+          </div>
+        `,
+              )
+              .join("")
+          : '<div class="muted-panel">No open exceptions.</div>'
+      }
+    </div>
+  `;
+}
+
+function renderAuditTrail() {
+  const events = currentDetail.audit_events || [];
+  return `
+    <div class="section-title">Audit Trail</div>
+    <div class="mini-list">
+      ${
+        events.length
+          ? events.map((event) => `<div class="log-row"><strong>${safe(event.event_type)}</strong> ${safe(event.message)} <span>${safe(event.created_at)} ${safe(event.user_display || event.user_email || "")}</span></div>`).join("")
+          : '<div class="muted-panel">No audit events yet.</div>'
+      }
+    </div>
+  `;
 }
 
 function renderReadonlyField(record, key, label, size, review, reviewNote) {
@@ -594,13 +648,15 @@ async function switchView(view) {
 async function loadAdminData() {
   if (!canViewAdmin()) return;
   const requests = [api("/api/order-types"), api("/api/customer-part-xrefs"), api("/api/customers"), api("/api/departments"), api("/api/payment-terms")];
+  requests.push(api("/api/products"));
   if (canManageUsers()) requests.push(api("/api/users"));
-  const [orderTypeData, xrefData, customerData, departmentData, paymentTermData, userData] = await Promise.all(requests);
+  const [orderTypeData, xrefData, customerData, departmentData, paymentTermData, productData, userData] = await Promise.all(requests);
   orderTypes = orderTypeData;
   xrefs = xrefData;
   customers = customerData;
   departments = departmentData;
   paymentTerms = paymentTermData;
+  products = productData.products || [];
   users = userData || [];
   document.querySelector("#usersPanel").classList.toggle("hidden", !canManageUsers());
   document.querySelector("#adminTabUsersBtn").classList.toggle("hidden", !canManageUsers());
@@ -608,6 +664,7 @@ async function loadAdminData() {
   renderXrefs();
   renderUsers();
   renderCustomers();
+  renderProducts();
   renderDepartments();
   renderPaymentTerms();
   await loadTestingData();
@@ -616,7 +673,7 @@ async function loadAdminData() {
 function switchAdminTab(tab) {
   if (tab === "users" && !canManageUsers()) tab = "master";
   activeAdminTab = tab;
-  const tabs = ["users", "master", "setup", "testing"];
+  const tabs = ["users", "master", "setup", "testing", "analytics"];
   for (const name of tabs) {
     document.querySelector(`#adminTab${capitalize(name)}`).classList.toggle("hidden", name !== tab);
     document.querySelector(`#adminTab${capitalize(name)}Btn`).classList.toggle("active-admin-tab", name === tab);
@@ -663,7 +720,7 @@ function renderDepartments() {
 
 async function loadTestingData() {
   if (!canViewAdmin()) return;
-  const [documentsData, evaluationsData, inboxData, gmailData, outlookData, openaiData, detectionData, learningData] = await Promise.all([
+  const [documentsData, evaluationsData, inboxData, gmailData, outlookData, openaiData, detectionData, learningData, reportingData] = await Promise.all([
     api("/api/testing/documents"),
     api("/api/testing/evaluations"),
     api("/api/inbox-accounts"),
@@ -672,6 +729,7 @@ async function loadTestingData() {
     api("/api/openai-extraction-config"),
     api("/api/inbox-detection-results"),
     api("/api/extraction-learning"),
+    api("/api/reporting/operations"),
   ]);
   testDocuments = documentsData.documents || [];
   evaluationData = evaluationsData.latest || { run: null, results: [] };
@@ -682,6 +740,7 @@ async function loadTestingData() {
   openaiConfig = openaiData || {};
   inboxDetectionResults = detectionData.results || [];
   extractionLearning = learningData || extractionLearning;
+  operationsMetrics = reportingData || {};
   renderTestDocuments();
   renderEvaluation();
   renderOpenAIConfig();
@@ -691,6 +750,7 @@ async function loadTestingData() {
   renderSyncRuns();
   renderDetectionResults();
   renderExtractionLearning();
+  renderOperationsMetrics();
 }
 
 function renderTestDocuments() {
@@ -904,9 +964,101 @@ function renderPaymentTerms() {
     .join("");
 }
 
+function renderProducts() {
+  const target = document.querySelector("#productRows");
+  if (!target) return;
+  target.innerHTML = products
+    .map(
+      (row) => `
+      <tr>
+        <td><input id="product_part_${row.id}" value="${safe(row.internal_part_number)}" /></td>
+        <td><input id="product_rev_${row.id}" value="${safe(row.internal_part_revision)}" /></td>
+        <td><input id="product_desc_${row.id}" value="${safe(row.description)}" /></td>
+        <td><input id="product_uom_${row.id}" value="${safe(row.unit_of_measure)}" /></td>
+        <td>${row.is_active ? "Active" : "Inactive"}</td>
+        <td>
+          <button class="secondary table-action" onclick="saveProduct(${row.id})">Save</button>
+          <button class="danger table-action" onclick="deleteProduct(${row.id})">Delete</button>
+        </td>
+      </tr>
+    `,
+    )
+    .join("");
+}
+
+async function loadReviewTasks() {
+  if (!canViewDashboard()) return;
+  const data = await api("/api/review-tasks?status=open");
+  reviewTasks = data.tasks || [];
+  renderReviewTasks();
+}
+
+function renderReviewTasks() {
+  const tbody = document.querySelector("#exceptionRows");
+  if (!tbody) return;
+  tbody.innerHTML = reviewTasks.length
+    ? reviewTasks
+        .map(
+          (task) => `
+        <tr>
+          <td>${safe(task.severity)}</td>
+          <td>${safe(task.po_number)}</td>
+          <td>${safe(task.customer_company_name)}</td>
+          <td>${safe(task.message)}</td>
+          <td>${safe(task.field_name)}</td>
+          <td>${safe(task.current_value)}</td>
+          <td>${pct(task.confidence)}</td>
+          <td>${safe(task.created_at)}</td>
+          <td>
+            ${task.purchase_order_id ? `<button class="secondary table-action" onclick="openDetail(${task.purchase_order_id})">Open PO</button>` : ""}
+            ${canEditDashboard() ? `<button class="secondary table-action" onclick="resolveReviewTask(${task.id})">Resolve</button><button class="secondary table-action" onclick="ignoreReviewTask(${task.id})">Ignore</button>` : ""}
+          </td>
+        </tr>
+      `,
+        )
+        .join("")
+    : '<tr><td colspan="9">No open exceptions.</td></tr>';
+}
+
 function miniList(rows, labelKey) {
   if (!rows.length) return '<div class="muted-panel">No data yet.</div>';
   return rows.map((row) => `<span class="mini-pill">${safe(row[labelKey])}: ${row.count}</span>`).join("");
+}
+
+function renderOperationsMetrics() {
+  const inbox = operationsMetrics.inbox || {};
+  const statusCounts = operationsMetrics.status_counts || {};
+  document.querySelector("#operationsSummary").innerHTML = `
+    ${metric("POs", operationsMetrics.total_purchase_orders || 0)}
+    ${metric("Received", statusCounts.Received || 0)}
+    ${metric("Booked", statusCounts.Booked || 0)}
+    ${metric("Open Exceptions", operationsMetrics.open_exceptions || 0)}
+    ${metric("Exception Rate", pct(operationsMetrics.exception_rate || 0))}
+    ${metric("Avg Confidence", pct(operationsMetrics.average_extraction_confidence || 0))}
+    ${metric("Corrections", operationsMetrics.manual_correction_count || 0)}
+    ${metric("Inbox Seen", inbox.messages_seen || 0)}
+    ${metric("Inbox POs", inbox.purchase_orders_created || 0)}
+  `;
+  document.querySelector("#receivedTrendRows").innerHTML = miniList(operationsMetrics.received_by_day || [], "day");
+  document.querySelector("#bookedTrendRows").innerHTML = miniList(operationsMetrics.booked_by_day || [], "day");
+}
+
+async function refreshOperationsMetrics() {
+  if (!canViewAdmin()) return;
+  const button = document.querySelector("#refreshOperationsBtn");
+  button.disabled = true;
+  button.textContent = "Refreshing...";
+  setMessage("#operationsMessage", "Refreshing operations metrics...");
+  try {
+    operationsMetrics = await api("/api/reporting/operations");
+    renderOperationsMetrics();
+    setMessage("#operationsMessage", "Metrics refreshed.", "success");
+  } catch (error) {
+    setMessage("#operationsMessage", error.message || "Metrics refresh failed.", "error");
+  } finally {
+    button.disabled = false;
+    button.textContent = "Refresh Metrics";
+  }
 }
 
 function renderInboxAccounts(gmailConfigured = false, outlookConfigured = false) {
@@ -1286,7 +1438,9 @@ function renderXrefs() {
       <tr>
         <td><input id="xref_customer_${row.id}" value="${safe(row.customer_name)}" /></td>
         <td><input id="xref_customer_part_${row.id}" value="${safe(row.customer_part_number)}" /></td>
+        <td><input id="xref_customer_rev_${row.id}" value="${safe(row.customer_part_revision)}" /></td>
         <td><input id="xref_internal_part_${row.id}" value="${safe(row.internal_part_number)}" /></td>
+        <td><input id="xref_internal_rev_${row.id}" value="${safe(row.internal_part_revision)}" /></td>
         <td>
           <button class="secondary" onclick="saveXref(${row.id})">Save</button>
           <button class="danger" onclick="deleteXref(${row.id})">Delete</button>
@@ -1894,7 +2048,9 @@ async function addXref() {
   const payload = {
     customer_name: document.querySelector("#xrefCustomer").value.trim(),
     customer_part_number: document.querySelector("#xrefCustomerPart").value.trim(),
+    customer_part_revision: document.querySelector("#xrefCustomerRev").value.trim(),
     internal_part_number: document.querySelector("#xrefInternalPart").value.trim(),
+    internal_part_revision: document.querySelector("#xrefInternalRev").value.trim(),
   };
   if (!payload.customer_name || !payload.customer_part_number || !payload.internal_part_number) {
     setXrefMessage("Customer, customer part number, and internal part number are required.", "error");
@@ -1904,7 +2060,9 @@ async function addXref() {
   xrefs = data.xrefs;
   document.querySelector("#xrefCustomer").value = "";
   document.querySelector("#xrefCustomerPart").value = "";
+  document.querySelector("#xrefCustomerRev").value = "";
   document.querySelector("#xrefInternalPart").value = "";
+  document.querySelector("#xrefInternalRev").value = "";
   setXrefMessage("Cross reference saved.", "success");
   renderXrefs();
 }
@@ -1914,7 +2072,9 @@ async function saveXref(id) {
   const payload = {
     customer_name: document.querySelector(`#xref_customer_${id}`).value.trim(),
     customer_part_number: document.querySelector(`#xref_customer_part_${id}`).value.trim(),
+    customer_part_revision: document.querySelector(`#xref_customer_rev_${id}`).value.trim(),
     internal_part_number: document.querySelector(`#xref_internal_part_${id}`).value.trim(),
+    internal_part_revision: document.querySelector(`#xref_internal_rev_${id}`).value.trim(),
   };
   const data = await api(`/api/customer-part-xrefs/${id}`, { method: "PUT", body: JSON.stringify(payload) });
   xrefs = data.xrefs;
@@ -1974,6 +2134,79 @@ async function uploadCustomerCsv(file, contacts = false) {
   renderCustomers();
 }
 
+async function addProduct() {
+  if (!canViewAdmin()) return;
+  const payload = {
+    internal_part_number: document.querySelector("#productPart").value.trim(),
+    internal_part_revision: document.querySelector("#productRevision").value.trim(),
+    description: document.querySelector("#productDescription").value.trim(),
+    unit_of_measure: document.querySelector("#productUom").value.trim(),
+    is_active: true,
+  };
+  if (!payload.internal_part_number) {
+    setProductsMessage("Internal part number is required.", "error");
+    return;
+  }
+  const data = await api("/api/products", { method: "POST", body: JSON.stringify(payload) });
+  products = data.products || [];
+  document.querySelector("#productPart").value = "";
+  document.querySelector("#productRevision").value = "";
+  document.querySelector("#productDescription").value = "";
+  document.querySelector("#productUom").value = "";
+  setProductsMessage("Product saved.", "success");
+  renderProducts();
+}
+
+async function saveProduct(id) {
+  if (!canViewAdmin()) return;
+  const payload = {
+    internal_part_number: document.querySelector(`#product_part_${id}`).value.trim(),
+    internal_part_revision: document.querySelector(`#product_rev_${id}`).value.trim(),
+    description: document.querySelector(`#product_desc_${id}`).value.trim(),
+    unit_of_measure: document.querySelector(`#product_uom_${id}`).value.trim(),
+    is_active: true,
+  };
+  const data = await api(`/api/products/${id}`, { method: "PUT", body: JSON.stringify(payload) });
+  products = data.products || [];
+  setProductsMessage("Product updated.", "success");
+  renderProducts();
+}
+
+async function deleteProduct(id) {
+  if (!canViewAdmin()) return;
+  const data = await api(`/api/products/${id}`, { method: "DELETE" });
+  products = data.products || [];
+  renderProducts();
+}
+
+async function uploadProductCsv(file) {
+  if (!canViewAdmin() || !file) return;
+  if (!file.name.toLowerCase().endsWith(".csv")) {
+    setProductsMessage("Only CSV files are allowed.", "error");
+    return;
+  }
+  const form = new FormData();
+  form.append("files", file);
+  setProductsMessage("Uploading product CSV...");
+  const res = await fetch("/api/products/upload-csv", { method: "POST", body: form });
+  const data = await res.json();
+  if (!res.ok || data.error) {
+    setProductsMessage(data.error || "Product CSV upload failed.", "error");
+    return;
+  }
+  products = data.products || [];
+  const errorText = data.errors?.length ? ` Errors: ${data.errors.join(" ")}` : "";
+  setProductsMessage(`Imported ${data.imported}, skipped ${data.skipped}.${errorText}`, data.errors?.length ? "error" : "success");
+  renderProducts();
+}
+
+function setProductsMessage(message, kind = "") {
+  const el = document.querySelector("#productsMessage");
+  if (!el) return;
+  el.className = `upload-message ${kind}`;
+  el.textContent = message;
+}
+
 function setCustomersMessage(message, kind = "") {
   const el = document.querySelector("#customersMessage");
   el.className = `upload-message ${kind}`;
@@ -2001,6 +2234,27 @@ function exportPOs(mode) {
   const search = encodeURIComponent(document.querySelector("#searchInput").value);
   window.location.href = `/api/export/purchase-orders.csv?mode=${mode}&status=${status}&search=${search}`;
   closeExportModal();
+}
+
+async function resolveReviewTask(id) {
+  if (!canEditDashboard()) return;
+  const data = await api(`/api/review-tasks/${id}/resolve`, { method: "POST", body: "{}" });
+  if (selectedId && data.purchase_order) currentDetail = data;
+  if (selectedId && data.purchase_order) renderDetail();
+  await loadReviewTasks();
+}
+
+async function ignoreReviewTask(id) {
+  if (!canEditDashboard()) return;
+  const data = await api(`/api/review-tasks/${id}/ignore`, { method: "POST", body: "{}" });
+  if (selectedId && data.purchase_order) currentDetail = data;
+  if (selectedId && data.purchase_order) renderDetail();
+  await loadReviewTasks();
+}
+
+function toggleExceptionsPanel() {
+  document.querySelector("#exceptionsPanel").classList.toggle("hidden");
+  loadReviewTasks();
 }
 
 function openCustomerCsvModal() {
@@ -2064,7 +2318,7 @@ function closeUploadModal() {
 }
 
 function setFiles(files) {
-  const allowed = [".pdf", ".txt", ".eml"];
+  const allowed = [".pdf", ".txt", ".eml", ".xlsx", ".docx"];
   const incoming = Array.from(files || []);
   const rejected = incoming.filter((file) => !allowed.some((ext) => file.name.toLowerCase().endsWith(ext)));
   selectedUploadFiles = incoming.filter((file) => allowed.some((ext) => file.name.toLowerCase().endsWith(ext)));
@@ -2083,6 +2337,40 @@ function renderSelectedFiles() {
     return;
   }
   container.innerHTML = `<ul>${selectedUploadFiles.map((file) => `<li>${safe(file.name)} (${Math.ceil(file.size / 1024)} KB)</li>`).join("")}</ul>`;
+}
+
+async function openConfirmedOrderView() {
+  if (!selectedId) return;
+  const data = await api(`/api/purchase-orders/${selectedId}/confirmed-order`);
+  const win = window.open("", "_blank");
+  if (!win) {
+    alert(data.summary || "Confirmed order view could not be opened.");
+    return;
+  }
+  win.document.write(`
+    <html><head><title>Confirmed Order ${safe(data.purchase_order?.po_number)}</title><style>
+      body{font-family:Segoe UI,Arial,sans-serif;padding:24px;color:#17202a}
+      table{width:100%;border-collapse:collapse;margin-top:16px}
+      th,td{border:1px solid #d8dee9;padding:8px;text-align:left}
+      button{padding:8px 12px}
+    </style></head><body>
+      <button onclick="window.print()">Print</button>
+      <pre>${safe(data.summary)}</pre>
+    </body></html>
+  `);
+  win.document.close();
+}
+
+async function openAcknowledgmentDraft() {
+  if (!selectedId) return;
+  const data = await api(`/api/purchase-orders/${selectedId}/acknowledgment-draft`);
+  const text = `To: ${data.to}\nSubject: ${data.subject}\n\n${data.body}`;
+  try {
+    await navigator.clipboard.writeText(text);
+    alert("Acknowledgment draft copied to clipboard.");
+  } catch {
+    prompt("Copy acknowledgment draft:", text);
+  }
 }
 
 function setUploadMessage(message, kind = "") {
@@ -2151,7 +2439,7 @@ async function logout() {
 async function uploadSelectedFiles() {
   if (!canEditDashboard()) return;
   if (!selectedUploadFiles.length) {
-    setUploadMessage("Select or drop at least one PDF, TXT, or EML file.", "error");
+    setUploadMessage("Select or drop at least one PDF, TXT, EML, XLSX, or DOCX file.", "error");
     return;
   }
   const btn = document.querySelector("#uploadProcessBtn");
@@ -2258,6 +2546,7 @@ document.querySelector("#syncBtn").addEventListener("click", () => {
 });
 
 document.querySelector("#exportBtn").addEventListener("click", openExportModal);
+document.querySelector("#exceptionsBtn").addEventListener("click", toggleExceptionsPanel);
 document.querySelector("#exportHeaderBtn").addEventListener("click", () => exportPOs("header"));
 document.querySelector("#exportLinesBtn").addEventListener("click", () => exportPOs("lines"));
 document.querySelector("#cancelExportBtn").addEventListener("click", closeExportModal);
@@ -2268,10 +2557,12 @@ document.querySelector("#adminTabUsersBtn").addEventListener("click", () => swit
 document.querySelector("#adminTabMasterBtn").addEventListener("click", () => switchAdminTab("master"));
 document.querySelector("#adminTabSetupBtn").addEventListener("click", () => switchAdminTab("setup"));
 document.querySelector("#adminTabTestingBtn").addEventListener("click", () => switchAdminTab("testing"));
+document.querySelector("#adminTabAnalyticsBtn").addEventListener("click", () => switchAdminTab("analytics"));
 document.querySelector("#addOrderTypeBtn").addEventListener("click", addOrderType);
 document.querySelector("#addDepartmentBtn").addEventListener("click", addDepartment);
 document.querySelector("#addPaymentTermBtn").addEventListener("click", addPaymentTerm);
 document.querySelector("#addXrefBtn").addEventListener("click", addXref);
+document.querySelector("#addProductBtn").addEventListener("click", addProduct);
 document.querySelector("#inviteUserBtn").addEventListener("click", inviteUser);
 document.querySelector("#closeUserModalBtn").addEventListener("click", closeUserModal);
 document.querySelector("#cancelUserModalBtn").addEventListener("click", closeUserModal);
@@ -2283,6 +2574,11 @@ document.querySelector("#uploadCustomerContactsCsvBtn").addEventListener("click"
 document.querySelector("#downloadCustomersCsvBtn").addEventListener("click", openCustomerCsvModal);
 document.querySelector("#customerCsvInput").addEventListener("change", (event) => uploadCustomerCsv(event.target.files[0], false));
 document.querySelector("#customerContactCsvInput").addEventListener("change", (event) => uploadCustomerCsv(event.target.files[0], true));
+document.querySelector("#uploadProductsCsvBtn").addEventListener("click", () => document.querySelector("#productCsvInput").click());
+document.querySelector("#downloadProductsCsvBtn").addEventListener("click", () => {
+  window.location.href = "/api/products.csv";
+});
+document.querySelector("#productCsvInput").addEventListener("change", (event) => uploadProductCsv(event.target.files[0]));
 document.querySelector("#downloadCustomersOnlyBtn").addEventListener("click", () => downloadCustomerCsv("customers"));
 document.querySelector("#downloadCustomersAddressesBtn").addEventListener("click", () => downloadCustomerCsv("addresses"));
 document.querySelector("#downloadCustomerContactsBtn").addEventListener("click", () => downloadCustomerCsv("contacts"));
@@ -2306,6 +2602,7 @@ document.querySelector("#testDocUploadBtn").addEventListener("click", () => docu
 document.querySelector("#testDocInput").addEventListener("change", (event) => uploadTestDocuments(event.target.files));
 document.querySelector("#runEvaluationBtn").addEventListener("click", runEvaluation);
 document.querySelector("#refreshLearningBtn").addEventListener("click", loadExtractionLearning);
+document.querySelector("#refreshOperationsBtn").addEventListener("click", refreshOperationsMetrics);
 document.querySelector("#addInboxAccountBtn").addEventListener("click", addInboxAccount);
 document.querySelector("#connectGmailBtn").addEventListener("click", connectGmail);
 document.querySelector("#connectOutlookBtn").addEventListener("click", connectOutlook);

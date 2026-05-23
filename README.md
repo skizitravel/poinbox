@@ -4,7 +4,7 @@ This repository contains a local MVP for purchase order intake from a shared inb
 
 ## What It Does
 
-- Imports `.txt`, `.eml`, and `.pdf` files from `samples/inbox`
+- Imports `.txt`, `.eml`, `.pdf`, `.xlsx`, and `.docx` files from `samples/inbox`
 - Stores email metadata, attachments, purchase order headers, PO lines, and processing logs in SQLite
 - Detects likely POs from subject/body/attachment text and records confidence/explanation
 - Extracts PO fields with a deterministic parser, with optional OpenAI extraction enabled by environment config
@@ -45,7 +45,7 @@ Log in with the seeded local admin unless you changed `.env.local`:
 admin@example.com
 ```
 
-Click **Import Samples** to open the upload dialog. You can drag `.pdf`, `.txt`, or `.eml` files into the dialog, click **Select File**, or use **Import Existing Sample Folder** to process files already in `samples/inbox`.
+Click **Import Samples** to open the upload dialog. You can drag `.pdf`, `.txt`, `.eml`, `.xlsx`, or `.docx` files into the dialog, click **Select File**, or use **Import Existing Sample Folder** to process files already in `samples/inbox`.
 
 Use the header switcher to move between **PO Dashboard** and **Admin**. Admin includes configurable order types and a customer part cross-reference CSV upload. Cross-reference CSV files should include customer, customer part number, and internal part number columns.
 
@@ -101,6 +101,7 @@ The Admin page is organized into tabs:
 - **Master Data** - maintain customer part cross-references and customer profiles.
 - **Setup** - maintain order types and departments.
 - **Testing** - build a PO test corpus, enter golden answers, run extraction evaluations, and prepare inbox connections.
+- **Analytics** - view operations metrics such as throughput, exceptions, corrections, and inbox activity.
 
 Admins can open **Admin > Users & Access** to create users by first name, last name, job title, and email. User profiles can be active/inactive, admin/non-admin, allowed into Admin, allowed into the PO Dashboard, and assigned PO Dashboard access:
 
@@ -112,7 +113,7 @@ To test view-only behavior, invite a user, set PO Dashboard access to `View Only
 
 ## Master Data
 
-The **Master Data** tab stores customer part cross-references and customer profiles.
+The **Master Data** tab stores customer part cross-references, the Item Master, and customer profiles.
 
 Customer profiles currently include:
 
@@ -152,13 +153,48 @@ The **Setup** tab also includes:
 
 Customer profiles can reference the payment terms setup list through a dropdown. The original free-text `payment_terms` value is still preserved for compatibility and CSV export.
 
+The **Item Master** section is the internal item/product master for PO line matching. Items include internal part number, revision, description, UOM, and active/inactive status. Admins can add/edit items in the table or upload/download Item Master CSV files with these headers:
+
+- `internal_part_number`
+- `internal_part_revision`
+- `description`
+- `unit_of_measure`
+- `is_active`
+
+Customer part cross-references now support customer and internal revisions. Existing 3-column CSV files still import, and new CSV files can include:
+
+- `customer`
+- `customer_part_number`
+- `customer_part_revision`
+- `internal_part_number`
+- `internal_part_revision`
+
+Line matching runs in this order: exact customer product cross-reference, exact internal product number, then transparent token-overlap fuzzy description matching against active products. Weak or missing product matches create review exceptions instead of silently accepting a bad match.
+
+## Exceptions Queue
+
+The PO Dashboard includes an **Exceptions** button that opens an operator-focused queue of open review tasks. Exceptions are generated from:
+
+- low-confidence extracted fields
+- missing required PO header fields
+- missing required line fields
+- missing customer/address/contact master data
+- unmatched or weak product master matches
+- OCR/processing warnings as those paths are expanded
+
+Each exception shows severity, PO, customer, reason, field/current value, confidence, and created date. Edit users can open the PO, resolve a task, or ignore it. View-only users can see exceptions but cannot resolve them.
+
+PO detail also includes an **Exceptions** section and an **Audit Trail** section. The audit trail combines saved PO changes, resolved/ignored exceptions, and extraction feedback corrections where available.
+
+PO detail also has a **Confirmed Order View** for a printable read-only order summary and a **Draft Acknowledgment** action that prepares a copyable receipt email draft. The app does not send the email yet.
+
 ## Testing PO Extraction
 
 Use **Admin > Testing** to build a repeatable test set for PO detection and extraction.
 
 ### PO Test Corpus
 
-Upload scrubbed `.pdf`, `.txt`, `.eml`, `.csv`, or `.xlsx` samples into the PO Test Corpus. The app stores these under `samples/test-corpus`, which is ignored by Git so real customer documents are not committed.
+Upload scrubbed `.pdf`, `.txt`, `.eml`, `.csv`, `.xlsx`, or `.docx` samples into the PO Test Corpus. The app stores these under `samples/test-corpus`, which is ignored by Git so real customer documents are not committed.
 
 For each document, set:
 
@@ -243,6 +279,19 @@ AI extraction behavior:
 - **AI With Prior Examples** evaluation also includes reviewed corrections from the feedback loop as guidance
 - production deployments should replace local SQLite/API-key storage with encrypted managed secret storage
 
+## Analytics
+
+Use **Admin > Analytics** for Operations Metrics. The panel shows basic throughput and ROI-style operating signals from SQLite:
+
+- POs by status
+- open exceptions and exception rate
+- average extraction confidence
+- manual correction count
+- POs received and booked by day
+- inbox messages seen/imported/skipped and POs created from inbox sync
+
+The **Refresh Metrics** button updates only the operations metrics route and shows refresh/success/error feedback.
+
 ## Gmail And Outlook Inbox Testing
 
 The app now has an inbox connection foundation in **Admin > Testing > Inbox Connections**.
@@ -284,7 +333,7 @@ Per-inbox schedule settings are stored for future automation:
 - `Starting at ___`
 - `Next scheduled sync`
 
-Manual **Sync Inbox Now** remains available for active inbox connections regardless of the stored schedule. This MVP stores schedule settings but does not run a background scheduler yet.
+Manual **Sync Inbox Now** remains available for active inbox connections regardless of the stored schedule. A lightweight local scheduler can be enabled with `ENABLE_BACKGROUND_SYNC=1`; it checks due inboxes every 60 seconds and uses the same sync path as the manual button. It is useful for MVP/Codespaces testing, but production should still use a proper job runner.
 
 Add these values to `.env.local` when you are ready to configure Gmail:
 
@@ -353,7 +402,7 @@ Outlook delta sync is planned later. The app keeps the existing `delta_token` fi
 
 The app currently ships with a connector interface and local sample connector. Gmail and Outlook manual sync now run through provider-specific API helpers in `server/app.py` and map live messages into the same `IncomingEmail` and `IncomingAttachment` structures used by sample import.
 
-The next production-grade inbox steps are encrypted token storage, background scheduling, Microsoft Graph delta sync, and provider-specific shared mailbox handling.
+The next production-grade inbox steps are encrypted token storage, hardened background scheduling, Microsoft Graph delta sync, and provider-specific shared mailbox handling.
 
 ## Project Layout
 

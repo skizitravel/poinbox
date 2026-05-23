@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import sqlite3
 import json
+import re
+import zipfile
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from xml.etree import ElementTree
 
 from pypdf import PdfReader
 
@@ -13,6 +16,20 @@ from server.connectors import IncomingAttachment, IncomingEmail, SampleInboxConn
 from server.db import log
 from server.extraction import classify_purchase_order, extract_purchase_order, normalize_date
 from server.master_data import format_structured_address, parse_structured_address, run_master_data_reviews
+
+SUPPORTED_ATTACHMENT_EXTENSIONS = {".pdf", ".txt", ".eml", ".xlsx", ".docx"}
+COMMON_PRODUCT_WORDS = {
+    "a",
+    "an",
+    "and",
+    "assy",
+    "assembly",
+    "for",
+    "of",
+    "part",
+    "the",
+    "with",
+}
 
 
 def import_samples(conn: sqlite3.Connection, sample_dir: Path, storage_dir: Path) -> dict[str, Any]:
@@ -64,6 +81,16 @@ def insert_attachment(conn: sqlite3.Connection, email_id: int, attachment: Incom
     elif attachment.filename.lower().endswith(".txt"):
         extracted_text = attachment.local_path.read_text(encoding="utf-8")
         method = "text"
+    elif attachment.filename.lower().endswith(".xlsx"):
+        extracted_text = extract_xlsx_text(attachment.local_path)
+        method = "excel_text" if extracted_text.strip() else "excel_text_empty"
+    elif attachment.filename.lower().endswith(".xls"):
+        method = "unsupported_office"
+    elif attachment.filename.lower().endswith(".docx"):
+        extracted_text = extract_docx_text(attachment.local_path)
+        method = "docx_text" if extracted_text.strip() else "docx_text_empty"
+    elif attachment.filename.lower().endswith(".doc"):
+        method = "unsupported_office"
     cur = conn.execute(
         """
         INSERT INTO attachments (email_id, filename, content_type, local_path, extracted_text, extraction_method, page_count)
@@ -82,6 +109,8 @@ def insert_attachment(conn: sqlite3.Connection, email_id: int, attachment: Incom
     conn.commit()
     if method == "ocr_unavailable":
         log(conn, "warning", "PDF had little or no embedded text; OCR is not configured.", email_id, int(cur.lastrowid))
+    if method == "unsupported_office":
+        log(conn, "warning", "Office attachment type is not supported by the MVP extractor.", email_id, int(cur.lastrowid), {"filename": attachment.filename})
     return {
         "id": int(cur.lastrowid),
         "filename": attachment.filename,
@@ -97,6 +126,63 @@ def extract_pdf_text(path: Path) -> tuple[str, int | None]:
         return text, len(reader.pages)
     except Exception:
         return "", None
+
+
+def extract_xlsx_text(path: Path) -> str:
+    try:
+        from openpyxl import load_workbook
+    except Exception:
+        return ""
+    try:
+        workbook = load_workbook(path, read_only=True, data_only=True)
+        chunks = [f"Workbook: {path.name}"]
+        for sheet in workbook.worksheets:
+            if sheet.sheet_state != "visible":
+                continue
+            chunks.append(f"Sheet: {sheet.title}")
+            for row in sheet.iter_rows(values_only=True):
+                values = ["" if value is None else str(value).strip() for value in row]
+                while values and values[-1] == "":
+                    values.pop()
+                if any(values):
+                    chunks.append("\t".join(values))
+        return "\n".join(chunks)
+    except Exception:
+        return ""
+
+
+def extract_docx_text(path: Path) -> str:
+    try:
+        from docx import Document
+    except Exception:
+        return extract_docx_text_from_zip(path)
+    try:
+        document = Document(str(path))
+        chunks = [paragraph.text.strip() for paragraph in document.paragraphs if paragraph.text.strip()]
+        for table in document.tables:
+            for row in table.rows:
+                cells = [cell.text.strip().replace("\n", " ") for cell in row.cells]
+                if any(cells):
+                    chunks.append("\t".join(cells))
+        return "\n".join(chunks)
+    except Exception:
+        return extract_docx_text_from_zip(path)
+
+
+def extract_docx_text_from_zip(path: Path) -> str:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            xml = archive.read("word/document.xml")
+        root = ElementTree.fromstring(xml)
+        namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+        chunks: list[str] = []
+        for paragraph in root.findall(".//w:p", namespace):
+            text = "".join(node.text or "" for node in paragraph.findall(".//w:t", namespace)).strip()
+            if text:
+                chunks.append(text)
+        return "\n".join(chunks)
+    except Exception:
+        return ""
 
 
 def extract_pdf_with_vision_or_ocr(path: Path) -> tuple[str, str]:
@@ -175,6 +261,7 @@ def process_email(conn: sqlite3.Connection, email_id: int, attachments: list[dic
         insert_po_line(conn, po_id, extraction.get("po_number"), line)
     recalculate_po_total(conn, po_id, extracted_total=extraction.get("total_value"))
     run_master_data_reviews(conn, po_id)
+    generate_review_tasks_for_po(conn, po_id)
     log(conn, "info", "Purchase order created for review.", email_id, source_attachment["id"] if source_attachment else None, {"po_id": po_id})
     return 1
 
@@ -395,15 +482,16 @@ def find_similar_extraction_examples(
 
 def insert_po_line(conn: sqlite3.Connection, purchase_order_id: int, po_number: str | None, line: dict[str, Any]) -> int:
     line_total = normalized_line_total(line.get("quantity"), line.get("unit_price"), line.get("line_total"))
+    product_match = match_product_for_line(conn, purchase_order_id, line)
     cur = conn.execute(
         """
         INSERT INTO purchase_order_lines (
             purchase_order_id, po_number, line_number, customer_part_number, customer_part_revision,
             internal_part_number, internal_part_revision, description,
             quantity, unit_of_measure, unit_price, line_total, requested_date, extraction_confidence, extraction_notes,
-            field_confidence_json
+            field_confidence_json, product_match_status, matched_product_id, product_match_score, product_match_reason
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             purchase_order_id,
@@ -422,6 +510,10 @@ def insert_po_line(conn: sqlite3.Connection, purchase_order_id: int, po_number: 
             line.get("extraction_confidence"),
             line.get("extraction_notes"),
             json.dumps(line.get("field_confidence") or {}),
+            product_match["status"],
+            product_match["product_id"],
+            product_match["score"],
+            product_match["reason"],
         ),
     )
     conn.commit()
@@ -469,18 +561,228 @@ def apply_cross_references(conn: sqlite3.Connection, extraction: dict[str, Any])
         customer_part = (line.get("customer_part_number") or "").strip().lower()
         if not customer_part:
             continue
+        customer_revision = (line.get("customer_part_revision") or "").strip().lower()
         row = conn.execute(
             """
-            SELECT internal_part_number
+            SELECT internal_part_number, internal_part_revision
             FROM customer_part_xrefs
             WHERE LOWER(TRIM(customer_name)) = ? AND LOWER(TRIM(customer_part_number)) = ?
+              AND LOWER(TRIM(COALESCE(customer_part_revision, ''))) = ?
             """,
-            (customer, customer_part),
+            (customer, customer_part, customer_revision),
         ).fetchone()
+        if not row:
+            row = conn.execute(
+                """
+                SELECT internal_part_number, internal_part_revision
+                FROM customer_part_xrefs
+                WHERE LOWER(TRIM(customer_name)) = ? AND LOWER(TRIM(customer_part_number)) = ?
+                  AND COALESCE(NULLIF(TRIM(customer_part_revision), ''), '') = ''
+                """,
+                (customer, customer_part),
+            ).fetchone()
         if not row:
             continue
         line["internal_part_number"] = row["internal_part_number"]
+        if row["internal_part_revision"] and not line.get("internal_part_revision"):
+            line["internal_part_revision"] = row["internal_part_revision"]
         notes = line.get("extraction_notes") or ""
-        line["extraction_notes"] = (notes + " Matched from customer part cross reference.").strip()
+        line["extraction_notes"] = (notes + " Matched from customer product cross reference.").strip()
         confidence = line.setdefault("field_confidence", {})
         confidence["internal_part_number"] = 0.95
+        confidence["internal_part_revision"] = 0.95
+
+
+def match_product_for_line(conn: sqlite3.Connection, po_id: int, line: dict[str, Any]) -> dict[str, Any]:
+    internal_part = (line.get("internal_part_number") or "").strip()
+    internal_revision = (line.get("internal_part_revision") or "").strip()
+    if internal_part:
+        row = conn.execute(
+            """
+            SELECT * FROM products
+            WHERE is_active = 1 AND LOWER(TRIM(internal_part_number)) = LOWER(TRIM(?))
+            ORDER BY CASE WHEN LOWER(TRIM(COALESCE(internal_part_revision, ''))) = LOWER(TRIM(?)) THEN 0 ELSE 1 END
+            LIMIT 1
+            """,
+            (internal_part, internal_revision),
+        ).fetchone()
+        if row:
+            return {"status": "matched_exact", "product_id": row["id"], "score": 1.0, "reason": "Matched active product by internal part number."}
+    description = line.get("description") or ""
+    best_row = None
+    best_score = 0.0
+    source_tokens = product_tokens(description)
+    if source_tokens:
+        for row in conn.execute("SELECT * FROM products WHERE is_active = 1 AND COALESCE(description, '') != ''").fetchall():
+            score = token_similarity(source_tokens, product_tokens(row["description"]))
+            if score > best_score:
+                best_row = row
+                best_score = score
+    if best_row and best_score >= 0.85:
+        if not internal_part:
+            line["internal_part_number"] = best_row["internal_part_number"]
+        if not internal_revision and best_row["internal_part_revision"]:
+            line["internal_part_revision"] = best_row["internal_part_revision"]
+        return {
+            "status": "matched_fuzzy",
+            "product_id": best_row["id"],
+            "score": round(best_score, 3),
+            "reason": f"Fuzzy description match to {best_row['internal_part_number']}.",
+        }
+    if best_row and best_score >= 0.55:
+        return {
+            "status": "needs_review",
+            "product_id": best_row["id"],
+            "score": round(best_score, 3),
+            "reason": f"Weak description match to {best_row['internal_part_number']}; review before using.",
+        }
+    return {"status": "unmatched", "product_id": None, "score": round(best_score, 3), "reason": "No product master match."}
+
+
+def product_tokens(value: Any) -> set[str]:
+    tokens = re.findall(r"[a-z0-9]+", str(value or "").lower())
+    return {token for token in tokens if len(token) > 1 and token not in COMMON_PRODUCT_WORDS}
+
+
+def token_similarity(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    overlap = len(left & right)
+    union = len(left | right)
+    score = overlap / union if union else 0.0
+    numeric_left = {token for token in left if any(char.isdigit() for char in token)}
+    numeric_right = {token for token in right if any(char.isdigit() for char in token)}
+    if numeric_left and numeric_left & numeric_right:
+        score += 0.15
+    return min(score, 1.0)
+
+
+def generate_review_tasks_for_po(conn: sqlite3.Connection, po_id: int) -> None:
+    po = conn.execute("SELECT * FROM purchase_orders WHERE id = ?", (po_id,)).fetchone()
+    if not po:
+        return
+    conn.execute(
+        """
+        UPDATE review_tasks
+        SET status = 'resolved', resolved_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+        WHERE purchase_order_id = ? AND status = 'open' AND created_by_system = 1
+        """,
+        (po_id,),
+    )
+    confidence = parse_json_dict(po["field_confidence_json"] if "field_confidence_json" in po.keys() else None)
+    for field, label in [
+        ("customer_company_name", "Customer company"),
+        ("po_number", "PO number"),
+        ("date_received", "Date received"),
+    ]:
+        if not po[field]:
+            upsert_review_task(conn, po_id, None, "po_header", po_id, "missing_required_field", f"{label} is missing.", "critical", field, po[field], None, None)
+    for field, value in confidence.items():
+        try:
+            score = float(value)
+        except (TypeError, ValueError):
+            continue
+        if score < 0.7:
+            upsert_review_task(conn, po_id, None, "po_header", po_id, "low_confidence", f"{field.replace('_', ' ').title()} has low extraction confidence.", "warning", field, po[field] if field in po.keys() else None, po[field] if field in po.keys() else None, score)
+    for review in conn.execute("SELECT * FROM po_master_data_reviews WHERE purchase_order_id = ? AND status = 'open'", (po_id,)).fetchall():
+        reason = {
+            "customer": "unmatched_customer",
+            "bill_to_address": "unmatched_bill_to",
+            "ship_to_address": "unmatched_ship_to",
+            "contact": "unmatched_contact",
+        }.get(review["review_type"], "processing_error")
+        upsert_review_task(conn, po_id, None, "master_data", review["id"], reason, review["message"], "warning", review["review_type"], None, None, None, review["suggested_value_json"])
+    for line in conn.execute("SELECT * FROM purchase_order_lines WHERE purchase_order_id = ?", (po_id,)).fetchall():
+        line_conf = parse_json_dict(line["field_confidence_json"] if "field_confidence_json" in line.keys() else None)
+        if not line["customer_part_number"] and not line["description"]:
+            upsert_review_task(conn, po_id, line["id"], "po_line", line["id"], "missing_required_field", "Line is missing both customer part number and description.", "critical", "customer_part_number", "", "", None)
+        for field in ("quantity", "unit_price"):
+            if line[field] in (None, ""):
+                upsert_review_task(conn, po_id, line["id"], "po_line", line["id"], "missing_required_field", f"Line {line['line_number'] or line['id']} is missing {field.replace('_', ' ')}.", "warning", field, line[field], line[field], None)
+        for field, value in line_conf.items():
+            try:
+                score = float(value)
+            except (TypeError, ValueError):
+                continue
+            if score < 0.7:
+                upsert_review_task(conn, po_id, line["id"], "po_line", line["id"], "low_confidence", f"Line {line['line_number'] or line['id']} {field.replace('_', ' ')} has low confidence.", "warning", field, line[field] if field in line.keys() else None, line[field] if field in line.keys() else None, score)
+        if line["product_match_status"] in {"unmatched", "needs_review"}:
+            reason = "weak_product_match" if line["product_match_status"] == "needs_review" else "unmatched_product"
+            severity = "warning" if reason == "weak_product_match" else "critical"
+            upsert_review_task(conn, po_id, line["id"], "product_match", line["id"], reason, line["product_match_reason"] or "Line item was not matched to product master.", severity, "internal_part_number", line["internal_part_number"], None, line["product_match_score"])
+    conn.commit()
+
+
+def upsert_review_task(
+    conn: sqlite3.Connection,
+    po_id: int,
+    line_id: int | None,
+    entity_type: str,
+    entity_id: int | None,
+    reason_code: str,
+    message: str,
+    severity: str,
+    field_name: str | None,
+    current_value: Any,
+    extracted_value: Any,
+    confidence: float | None,
+    suggested_value_json: str | None = None,
+) -> None:
+    ignored = conn.execute(
+        """
+        SELECT id FROM review_tasks
+        WHERE purchase_order_id = ? AND COALESCE(purchase_order_line_id, 0) = COALESCE(?, 0)
+          AND entity_type = ? AND reason_code = ? AND COALESCE(field_name, '') = COALESCE(?, '')
+          AND status = 'ignored'
+        """,
+        (po_id, line_id, entity_type, reason_code, field_name),
+    ).fetchone()
+    if ignored:
+        return
+    existing = conn.execute(
+        """
+        SELECT id FROM review_tasks
+        WHERE purchase_order_id = ? AND COALESCE(purchase_order_line_id, 0) = COALESCE(?, 0)
+          AND entity_type = ? AND reason_code = ? AND COALESCE(field_name, '') = COALESCE(?, '')
+          AND status = 'open'
+        """,
+        (po_id, line_id, entity_type, reason_code, field_name),
+    ).fetchone()
+    args = (
+        message,
+        severity,
+        "" if current_value is None else str(current_value),
+        "" if extracted_value is None else str(extracted_value),
+        suggested_value_json,
+        confidence,
+    )
+    if existing:
+        conn.execute(
+            """
+            UPDATE review_tasks
+            SET message = ?, severity = ?, current_value = ?, extracted_value = ?,
+                suggested_value_json = ?, confidence = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (*args, existing["id"]),
+        )
+        return
+    conn.execute(
+        """
+        INSERT INTO review_tasks (
+            purchase_order_id, purchase_order_line_id, entity_type, entity_id, reason_code, message,
+            severity, status, field_name, current_value, extracted_value, suggested_value_json,
+            confidence, created_by_system
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, 1)
+        """,
+        (po_id, line_id, entity_type, entity_id, reason_code, message, severity, field_name, args[2], args[3], suggested_value_json, confidence),
+    )
+
+
+def parse_json_dict(value: str | None) -> dict:
+    try:
+        parsed = json.loads(value or "{}")
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        return {}

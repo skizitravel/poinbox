@@ -42,3 +42,4 @@ OUTLOOK_CLIENT_SECRET = os.getenv("OUTLOOK_CLIENT_SECRET", "")
 OUTLOOK_TENANT = os.getenv("OUTLOOK_TENANT", "common")
 OUTLOOK_REDIRECT_URI = os.getenv("OUTLOOK_REDIRECT_URI", f"http://{APP_HOST}:{APP_PORT}/api/oauth/outlook/callback")
 OUTLOOK_SCOPES = os.getenv("OUTLOOK_SCOPES", "offline_access User.Read Mail.Read")
+ENABLE_BACKGROUND_SYNC = os.getenv("ENABLE_BACKGROUND_SYNC", "0") == "1"

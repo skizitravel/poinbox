@@ -44,12 +44,16 @@ class SampleInboxConnector(InboxConnector):
         for path in sorted(self.sample_dir.rglob("*")):
             if not path.is_file():
                 continue
-            if path.suffix.lower() not in {".txt", ".eml", ".pdf"}:
+            if path.suffix.lower() not in {".txt", ".eml", ".pdf", ".xlsx", ".docx"}:
                 continue
             if path.suffix.lower() == ".eml":
                 messages.append(self._read_eml(path))
             elif path.suffix.lower() == ".pdf":
                 messages.append(self._read_standalone_attachment(path, "application/pdf"))
+            elif path.suffix.lower() == ".xlsx":
+                messages.append(self._read_standalone_attachment(path, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
+            elif path.suffix.lower() == ".docx":
+                messages.append(self._read_standalone_attachment(path, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"))
             else:
                 messages.append(self._read_text(path))
         return messages
