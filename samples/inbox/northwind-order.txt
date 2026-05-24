@@ -1,0 +1,14 @@
+Subject: PO Number NW-77820 for May release
+
+Please process the attached purchase order.
+
+Customer: Northwind Components
+Bill To: Northwind Components, 88 Lake Ave, Grand Rapids, MI 49503
+Ship To: Northwind Receiving Dock, 12 Industrial Way, Grand Rapids, MI 49512
+PO Number: NW-77820
+Request Date: 2026-06-03
+
+1 NW-AXLE-5 IN-2001 Machined Axle 25 EA 31.40 785.00
+2 NW-SEAL-2 IN-2002 Seal Pack 100 EA 2.10 210.00
+
+Grand Total: $995.00

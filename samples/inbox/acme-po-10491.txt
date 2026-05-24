@@ -1,0 +1,18 @@
+Purchase Order PO-10491
+Customer: Acme Industrial Supply
+Contact: Dana Morris
+Bill To:
+Acme Industrial Supply
+100 Market Street
+Cleveland, OH 44114
+Ship To:
+Acme Plant 4
+4500 Foundry Road
+Akron, OH 44308
+Requested Date: 2026-06-12
+
+Line CustomerPart InternalPart Description Qty UnitPrice LineTotal RequestedDate
+1 ACM-8821 INT-4408 Bearing Housing Assembly 12 EA 48.50 582.00 2026-06-12
+2 ACM-9910 INT-5511 Stainless Bracket Kit 40 EA 7.25 290.00 2026-06-12
+
+Total: $872.00
