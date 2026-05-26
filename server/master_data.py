@@ -112,6 +112,18 @@ def find_matching_customer(conn: sqlite3.Connection, customer_name: str | None) 
     for row in conn.execute("SELECT * FROM customers").fetchall():
         if normalize_match_text(row["customer_name"]) == needle:
             return row
+    canonical = conn.execute(
+        """
+        SELECT legacy_source_id
+        FROM trading_partner_account
+        WHERE legacy_source_table = 'customers'
+          AND LOWER(TRIM(account_name)) = LOWER(TRIM(?))
+        LIMIT 1
+        """,
+        (customer_name,),
+    ).fetchone()
+    if canonical:
+        return conn.execute("SELECT * FROM customers WHERE id = ?", (canonical["legacy_source_id"],)).fetchone()
     return None
 
 
@@ -125,6 +137,27 @@ def find_matching_address(
         (customer_id, address_type),
     ).fetchall()
     for row in rows:
+        if addresses_match(extracted_address, row):
+            return row
+    role_code = "BILL_TO" if address_type == "bill_to" else "SHIP_TO" if address_type == "ship_to" else "SOLD_TO"
+    canonical_rows = conn.execute(
+        """
+        SELECT ca.*
+        FROM partner_role_assignment pra
+        JOIN trading_partner_account tpa ON tpa.id = pra.trading_partner_account_id
+        JOIN trading_partner_site tps ON tps.id = pra.trading_partner_site_id
+        JOIN customer_addresses ca
+          ON ca.id = CAST(tps.legacy_source_id AS INTEGER)
+         AND tps.legacy_source_table = 'customer_addresses'
+        WHERE tpa.legacy_source_table = 'customers'
+          AND tpa.legacy_source_id = ?
+          AND pra.role_code = ?
+          AND pra.active_flag = 1
+        ORDER BY pra.primary_flag DESC, pra.id
+        """,
+        (str(customer_id), role_code),
+    ).fetchall()
+    for row in canonical_rows:
         if addresses_match(extracted_address, row):
             return row
     return None

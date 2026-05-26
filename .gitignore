@@ -1,8 +1,11 @@
 .env
 .env.local
+.env.production
+.env.*.local
 server-runtime.log
 data/*.db
 data/*.sqlite
+data/*.sqlite-*
 data/*.log
 data/*.txt
 data/*.csv
@@ -14,5 +17,6 @@ samples/test-corpus/*
 !samples/test-corpus/.gitkeep
 tokens/*
 *.token.json
+*.log
 __pycache__/
 *.pyc

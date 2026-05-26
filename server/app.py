@@ -25,6 +25,8 @@ from urllib.parse import parse_qs, urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from server.config import (
+    APP_BASE_URL,
+    APP_ENV,
     APP_HOST,
     APP_PORT,
     DATABASE_PATH,
@@ -40,10 +42,16 @@ from server.config import (
     OUTLOOK_TENANT,
     PUBLIC_DIR,
     SAMPLES_DIR,
+    SESSION_COOKIE_NAME,
+    SESSION_COOKIE_SECURE,
+    SESSION_TTL_HOURS,
     STORAGE_DIR,
     TEST_CORPUS_DIR,
+    validate_production_config,
 )
-from server.db import connect, initialize, row_to_dict, rows_to_dicts
+from server.auth import generate_temporary_password, hash_password, hash_session_token, new_session_token, verify_password
+from server.crypto_utils import decrypt_secret, encrypt_secret, encrypted_secret_label
+from server.db import backfill_canonical_master_data, connect, initialize, row_to_dict, rows_to_dicts
 from server.connectors import IncomingAttachment, IncomingEmail
 from server.processing import (
     extract_pdf_text,
@@ -58,11 +66,27 @@ from server.processing import (
     recalculate_po_total,
 )
 from server.extraction import classify_purchase_order, extract_purchase_order, normalize_date
+from server.erp_adapters import (
+    ORACLE_EBS_ORDER_ENTRY_MANIFEST,
+    adapter_manifests,
+    oracle_payload_preview,
+    oracle_profile_response,
+)
 from server.master_data import addresses_match, format_structured_address, list_reviews, parse_structured_address, resolve_review, run_master_data_reviews
 from server.openai_settings import get_openai_extraction_config, get_openai_runtime_config, save_openai_extraction_config
 
 
 SYNC_LOCKS: set[int] = set()
+ADMIN_TABS = ("users", "master", "setup", "testing", "analytics", "erp")
+ADMIN_TAB_LABELS = {
+    "users": "Users & Access",
+    "master": "Master Data",
+    "setup": "Setup",
+    "testing": "Testing",
+    "analytics": "Analytics",
+    "erp": "ERP",
+}
+ADMIN_ACCESS_LEVELS = {"no_access", "view_only", "full_access"}
 
 
 class AppHandler(SimpleHTTPRequestHandler):
@@ -72,6 +96,8 @@ class AppHandler(SimpleHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
+        if parsed.path == "/health":
+            return self.respond_json({"ok": True, "app": "mountaingoat", "environment": APP_ENV})
         if parsed.path == "/api/me":
             return self.respond_json({"user": public_user(self.current_user())})
         if parsed.path == "/api/summary":
@@ -83,93 +109,109 @@ class AppHandler(SimpleHTTPRequestHandler):
                 return
             return self.respond_json(list_purchase_orders(params))
         if parsed.path == "/api/users":
-            if not self.require_permission("users:manage"):
+            if not self.require_permission("users:view"):
                 return
             return self.respond_json(list_users())
         if parsed.path == "/api/customers":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("master"):
                 return
             return self.respond_json(list_customers())
         if parsed.path == "/api/products":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("master"):
                 return
             return self.respond_json({"products": list_products()})
+        if parsed.path == "/api/canonical-master-data":
+            if not self.require_any_admin_tab(("master", "setup", "erp")):
+                return
+            return self.respond_json(list_canonical_master_data())
         if parsed.path == "/api/products.csv":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("master"):
                 return
             return self.respond_csv(products_csv(), "products.csv")
         if parsed.path == "/api/customers.csv":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("master"):
                 return
             mode = params.get("mode", ["customers"])[0]
             filename = "customers-with-addresses.csv" if mode == "addresses" else "customers.csv"
             return self.respond_csv(customers_csv(mode), filename)
         if parsed.path == "/api/customer-contacts.csv":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("master"):
                 return
             return self.respond_csv(customer_contacts_csv(), "customer-contacts.csv")
         if parsed.path.startswith("/api/customers/"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("master"):
                 return
             customer_id = int(parsed.path.rsplit("/", 1)[-1])
             return self.respond_json(get_customer(customer_id))
         if parsed.path == "/api/order-types":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("setup"):
                 return
             return self.respond_json(list_order_types())
         if parsed.path == "/api/departments":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("setup"):
                 return
             return self.respond_json(list_departments())
         if parsed.path == "/api/payment-terms":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("setup"):
                 return
             return self.respond_json(list_payment_terms())
         if parsed.path == "/api/testing/documents":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("testing"):
                 return
             return self.respond_json(list_test_documents())
         if parsed.path.startswith("/api/testing/documents/") and parsed.path.endswith("/golden-answer"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("testing"):
                 return
             document_id = int(parsed.path.split("/")[-2])
             return self.respond_json(get_golden_answer(document_id))
         if parsed.path == "/api/testing/evaluations":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("testing"):
                 return
             return self.respond_json(list_evaluation_runs())
         if parsed.path.startswith("/api/testing/evaluations/"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("testing"):
                 return
             run_id = int(parsed.path.rsplit("/", 1)[-1])
             return self.respond_json(get_evaluation_run(run_id))
         if parsed.path == "/api/inbox-accounts":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("setup"):
                 return
             return self.respond_json(list_inbox_accounts())
         if parsed.path.startswith("/api/inbox-accounts/") and parsed.path.endswith("/config"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("setup"):
                 return
             account_id = int(parsed.path.split("/")[-2])
             return self.respond_json(get_inbox_config(account_id))
         if parsed.path == "/api/gmail-oauth-config":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("testing"):
                 return
             return self.respond_json(get_gmail_oauth_config())
         if parsed.path == "/api/outlook-oauth-config":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("testing"):
                 return
             return self.respond_json(get_outlook_oauth_config())
         if parsed.path == "/api/openai-extraction-config":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("testing"):
                 return
             return self.respond_json(get_openai_extraction_config())
         if parsed.path == "/api/inbox-detection-results":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("testing"):
                 return
             return self.respond_json(list_inbox_detection_results())
+        if parsed.path == "/api/export-destinations":
+            if not self.require_admin_tab("setup"):
+                return
+            return self.respond_json(list_export_destinations())
+        if parsed.path == "/api/erp/adapters":
+            if not self.require_admin_tab("erp"):
+                return
+            return self.respond_json({"adapters": adapter_manifests()})
+        if parsed.path == "/api/erp/oracle-ebs":
+            if not self.require_admin_tab("erp"):
+                return
+            return self.respond_json(get_oracle_ebs_profile())
         if parsed.path == "/api/extraction-learning":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("testing"):
                 return
             return self.respond_json(extraction_learning_dashboard(params))
         if parsed.path == "/api/review-tasks":
@@ -177,19 +219,19 @@ class AppHandler(SimpleHTTPRequestHandler):
                 return
             return self.respond_json(list_review_tasks(params))
         if parsed.path == "/api/reporting/operations":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("analytics"):
                 return
             return self.respond_json(operations_reporting())
         if parsed.path == "/api/reporting/summary.csv":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("analytics"):
                 return
             return self.respond_csv(reporting_summary_csv(params), "operations-summary.csv")
         if parsed.path == "/api/reporting/exceptions.csv":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("analytics"):
                 return
             return self.respond_csv(reporting_exceptions_csv(params), "exceptions-report.csv")
         if parsed.path == "/api/reporting/corrections.csv":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("analytics"):
                 return
             return self.respond_csv(reporting_corrections_csv(params), "corrections-report.csv")
         if parsed.path == "/api/oauth/gmail/callback":
@@ -199,11 +241,11 @@ class AppHandler(SimpleHTTPRequestHandler):
             body, status = outlook_oauth_callback(parsed.query)
             return self.respond_html(body, status)
         if parsed.path == "/api/customer-part-xrefs":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("master"):
                 return
             return self.respond_json(list_customer_part_xrefs())
         if parsed.path == "/api/customer-part-xrefs.csv":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("master"):
                 return
             return self.respond_csv(customer_part_xrefs_csv(), "customer-part-cross-reference.csv")
         if parsed.path == "/api/export/purchase-orders.csv":
@@ -250,93 +292,105 @@ class AppHandler(SimpleHTTPRequestHandler):
                 return
             return self.respond_json(upload_samples(self))
         if parsed.path == "/api/customer-part-xrefs/upload":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("master", "edit"):
                 return
             return self.respond_json(upload_customer_part_xrefs(self))
         if parsed.path == "/api/products/upload-csv":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("master", "edit"):
                 return
             return self.respond_json(upload_products_csv(self))
         if parsed.path == "/api/customers/upload-csv":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("master", "edit"):
                 return
             return self.respond_json(upload_customers_csv(self))
         if parsed.path == "/api/customer-contacts/upload-csv":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("master", "edit"):
                 return
             return self.respond_json(upload_customer_contacts_csv(self))
         if parsed.path == "/api/customer-part-xrefs":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("master", "edit"):
                 return
             return self.respond_json(create_customer_part_xref(self.read_json()))
+        if parsed.path == "/api/canonical-master-data/backfill":
+            if not self.require_admin_tab("master", "edit"):
+                return
+            return self.respond_json(run_canonical_master_data_backfill())
         if parsed.path == "/api/products":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("master", "edit"):
                 return
             return self.respond_json(create_product(self.read_json()))
         if parsed.path == "/api/order-types":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("setup", "edit"):
                 return
             return self.respond_json(create_order_type(self.read_json()))
         if parsed.path == "/api/departments":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("setup", "edit"):
                 return
             return self.respond_json(create_department(self.read_json()))
         if parsed.path == "/api/payment-terms":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("setup", "edit"):
                 return
             return self.respond_json(create_payment_term(self.read_json()))
         if parsed.path == "/api/testing/documents/upload":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("testing", "edit"):
                 return
             return self.respond_json(upload_test_documents(self))
         if parsed.path == "/api/testing/evaluations/run":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("testing", "edit"):
                 return
             return self.respond_json(run_extraction_evaluation(self.read_json()))
         if parsed.path == "/api/inbox-accounts/gmail/connect":
-            actor = self.require_permission("admin:view")
+            actor = self.require_admin_tab("setup", "edit")
             if not actor:
                 return
             return self.respond_json(connect_gmail_account(self.read_json(), actor))
         if parsed.path == "/api/inbox-accounts/outlook/connect":
-            actor = self.require_permission("admin:view")
+            actor = self.require_admin_tab("setup", "edit")
             if not actor:
                 return
             return self.respond_json(connect_outlook_account(self.read_json(), actor))
         if parsed.path == "/api/inbox-accounts":
-            actor = self.require_permission("admin:view")
+            actor = self.require_admin_tab("setup", "edit")
             if not actor:
                 return
             return self.respond_json(create_inbox_account(self.read_json(), actor))
         if parsed.path == "/api/gmail-oauth-config":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("testing", "edit"):
                 return
             return self.respond_json(save_gmail_oauth_config(self.read_json()))
         if parsed.path == "/api/outlook-oauth-config":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("testing", "edit"):
                 return
             return self.respond_json(save_outlook_oauth_config(self.read_json()))
         if parsed.path == "/api/openai-extraction-config":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("testing", "edit"):
                 return
             return self.respond_json(save_openai_extraction_config(self.read_json()))
         if parsed.path.startswith("/api/inbox-accounts/") and parsed.path.endswith("/sync"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("setup", "edit"):
                 return
             account_id = int(parsed.path.split("/")[-2])
             return self.respond_json(sync_inbox_account(account_id, self.read_json()))
         if parsed.path.startswith("/api/inbox-accounts/") and parsed.path.endswith("/labels/refresh"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("setup", "edit"):
                 return
             account_id = int(parsed.path.split("/")[-3])
             return self.respond_json(refresh_inbox_labels_response(account_id))
+        if parsed.path == "/api/export-destinations":
+            if not self.require_admin_tab("setup", "edit"):
+                return
+            return self.respond_json(save_export_destination(self.read_json()))
+        if parsed.path == "/api/erp/oracle-ebs":
+            if not self.require_admin_tab("erp", "edit"):
+                return
+            return self.respond_json(save_oracle_ebs_profile(self.read_json()))
         if parsed.path.startswith("/api/testing/golden-answers/") and parsed.path.endswith("/lines"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("testing", "edit"):
                 return
             header_id = int(parsed.path.split("/")[-2])
             return self.respond_json(create_golden_line(header_id, self.read_json()))
         if parsed.path.startswith("/api/master-data-reviews/") and parsed.path.endswith("/resolve"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("master", "edit"):
                 return
             review_id = int(parsed.path.split("/")[-2])
             return self.respond_json(resolve_master_data_review(review_id, self.read_json()))
@@ -345,6 +399,13 @@ class AppHandler(SimpleHTTPRequestHandler):
                 return
             po_id = int(parsed.path.split("/")[-3])
             return self.respond_json(run_purchase_order_master_data_reviews(po_id))
+        if parsed.path.startswith("/api/purchase-orders/") and parsed.path.endswith("/erp/oracle-ebs/preview"):
+            if not self.require_permission("po_dashboard:view"):
+                return
+            if not self.require_admin_tab("erp", "edit"):
+                return
+            po_id = int(parsed.path.split("/")[-4])
+            return self.respond_json(preview_oracle_ebs_payload(po_id))
         if parsed.path.startswith("/api/review-tasks/") and parsed.path.endswith("/resolve"):
             actor = self.require_permission("po_dashboard:edit")
             if not actor:
@@ -375,12 +436,12 @@ class AppHandler(SimpleHTTPRequestHandler):
             candidate_id = int(parsed.path.split("/")[-2])
             return self.respond_json(duplicate_candidate_action(candidate_id, self.read_json(), actor))
         if parsed.path.startswith("/api/inbox-message-records/") and parsed.path.endswith("/retry"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("testing", "edit"):
                 return
             record_id = int(parsed.path.split("/")[-2])
             return self.respond_json(retry_inbox_message(record_id))
         if parsed.path.startswith("/api/inbox-accounts/") and parsed.path.endswith("/reprocess-range"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("setup", "edit"):
                 return
             account_id = int(parsed.path.split("/")[-2])
             payload = self.read_json()
@@ -392,16 +453,16 @@ class AppHandler(SimpleHTTPRequestHandler):
                 return
             return self.respond_json(create_user(self.read_json(), actor))
         if parsed.path == "/api/customers":
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("master", "edit"):
                 return
             return self.respond_json(create_customer(self.read_json()))
         if parsed.path.startswith("/api/customers/") and parsed.path.endswith("/addresses"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("master", "edit"):
                 return
             customer_id = int(parsed.path.split("/")[-2])
             return self.respond_json(create_customer_address(customer_id, self.read_json()))
         if parsed.path.startswith("/api/customers/") and parsed.path.endswith("/contacts"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("master", "edit"):
                 return
             customer_id = int(parsed.path.split("/")[-2])
             return self.respond_json(create_customer_contact(customer_id, self.read_json()))
@@ -428,68 +489,73 @@ class AppHandler(SimpleHTTPRequestHandler):
             user_id = int(parsed.path.rsplit("/", 1)[-1])
             return self.respond_json(update_user(user_id, self.read_json(), actor))
         if parsed.path.startswith("/api/customer-addresses/"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("master", "edit"):
                 return
             address_id = int(parsed.path.rsplit("/", 1)[-1])
             return self.respond_json(update_customer_address(address_id, self.read_json()))
         if parsed.path.startswith("/api/customer-contacts/"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("master", "edit"):
                 return
             contact_id = int(parsed.path.rsplit("/", 1)[-1])
             return self.respond_json(update_customer_contact(contact_id, self.read_json()))
         if parsed.path.startswith("/api/customers/"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("master", "edit"):
                 return
             customer_id = int(parsed.path.rsplit("/", 1)[-1])
             return self.respond_json(update_customer(customer_id, self.read_json()))
         if parsed.path.startswith("/api/customer-part-xrefs/"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("master", "edit"):
                 return
             xref_id = int(parsed.path.rsplit("/", 1)[-1])
             return self.respond_json(update_customer_part_xref(xref_id, self.read_json()))
         if parsed.path.startswith("/api/products/"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("master", "edit"):
                 return
             product_id = int(parsed.path.rsplit("/", 1)[-1])
             return self.respond_json(update_product(product_id, self.read_json()))
         if parsed.path.startswith("/api/order-types/"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("setup", "edit"):
                 return
             order_type_id = int(parsed.path.rsplit("/", 1)[-1])
             return self.respond_json(update_order_type(order_type_id, self.read_json()))
         if parsed.path.startswith("/api/departments/"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("setup", "edit"):
                 return
             department_id = int(parsed.path.rsplit("/", 1)[-1])
             return self.respond_json(update_department(department_id, self.read_json()))
         if parsed.path.startswith("/api/payment-terms/"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("setup", "edit"):
                 return
             payment_term_id = int(parsed.path.rsplit("/", 1)[-1])
             return self.respond_json(update_payment_term(payment_term_id, self.read_json()))
         if parsed.path.startswith("/api/testing/documents/") and parsed.path.endswith("/golden-answer"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("testing", "edit"):
                 return
             document_id = int(parsed.path.split("/")[-2])
             return self.respond_json(save_golden_answer(document_id, self.read_json()))
         if parsed.path.startswith("/api/testing/documents/"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("testing", "edit"):
                 return
             document_id = int(parsed.path.rsplit("/", 1)[-1])
             return self.respond_json(update_test_document(document_id, self.read_json()))
         if parsed.path.startswith("/api/testing/golden-lines/"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("testing", "edit"):
                 return
             line_id = int(parsed.path.rsplit("/", 1)[-1])
             return self.respond_json(update_golden_line(line_id, self.read_json()))
         if parsed.path.startswith("/api/inbox-accounts/"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("setup", "edit"):
                 return
             if parsed.path.endswith("/config"):
                 account_id = int(parsed.path.split("/")[-2])
                 return self.respond_json(save_inbox_config(account_id, self.read_json()))
             account_id = int(parsed.path.rsplit("/", 1)[-1])
             return self.respond_json(update_inbox_account(account_id, self.read_json()))
+        if parsed.path.startswith("/api/export-destinations/"):
+            if not self.require_admin_tab("setup", "edit"):
+                return
+            destination_id = int(parsed.path.rsplit("/", 1)[-1])
+            return self.respond_json(save_export_destination(self.read_json(), destination_id))
         if parsed.path.startswith("/api/purchase-orders/") and "/lines/" in parsed.path:
             actor = self.require_permission("po_dashboard:edit")
             if not actor:
@@ -519,60 +585,65 @@ class AppHandler(SimpleHTTPRequestHandler):
             user_id = int(parsed.path.rsplit("/", 1)[-1])
             return self.respond_json(deactivate_user(user_id, actor))
         if parsed.path.startswith("/api/customer-addresses/"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("master", "edit"):
                 return
             address_id = int(parsed.path.rsplit("/", 1)[-1])
             return self.respond_json(delete_customer_address(address_id))
         if parsed.path.startswith("/api/customer-contacts/"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("master", "edit"):
                 return
             contact_id = int(parsed.path.rsplit("/", 1)[-1])
             return self.respond_json(delete_customer_contact(contact_id))
         if parsed.path.startswith("/api/customers/"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("master", "edit"):
                 return
             customer_id = int(parsed.path.rsplit("/", 1)[-1])
             return self.respond_json(delete_customer(customer_id))
         if parsed.path.startswith("/api/customer-part-xrefs/"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("master", "edit"):
                 return
             xref_id = int(parsed.path.rsplit("/", 1)[-1])
             return self.respond_json(delete_customer_part_xref(xref_id))
         if parsed.path.startswith("/api/products/"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("master", "edit"):
                 return
             product_id = int(parsed.path.rsplit("/", 1)[-1])
             return self.respond_json(delete_product(product_id))
         if parsed.path.startswith("/api/order-types/"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("setup", "edit"):
                 return
             order_type_id = int(parsed.path.rsplit("/", 1)[-1])
             return self.respond_json(delete_order_type(order_type_id))
         if parsed.path.startswith("/api/departments/"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("setup", "edit"):
                 return
             department_id = int(parsed.path.rsplit("/", 1)[-1])
             return self.respond_json(delete_department(department_id))
         if parsed.path.startswith("/api/payment-terms/"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("setup", "edit"):
                 return
             payment_term_id = int(parsed.path.rsplit("/", 1)[-1])
             return self.respond_json(delete_payment_term(payment_term_id))
         if parsed.path.startswith("/api/testing/documents/"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("testing", "edit"):
                 return
             document_id = int(parsed.path.rsplit("/", 1)[-1])
             return self.respond_json(delete_test_document(document_id))
         if parsed.path.startswith("/api/testing/golden-lines/"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("testing", "edit"):
                 return
             line_id = int(parsed.path.rsplit("/", 1)[-1])
             return self.respond_json(delete_golden_line(line_id))
         if parsed.path.startswith("/api/inbox-accounts/"):
-            if not self.require_permission("admin:view"):
+            if not self.require_admin_tab("setup", "edit"):
                 return
             account_id = int(parsed.path.rsplit("/", 1)[-1])
             return self.respond_json(delete_inbox_account(account_id))
+        if parsed.path.startswith("/api/export-destinations/"):
+            if not self.require_admin_tab("setup", "edit"):
+                return
+            destination_id = int(parsed.path.rsplit("/", 1)[-1])
+            return self.respond_json(delete_export_destination(destination_id))
         if parsed.path.startswith("/api/purchase-orders/") and "/lines/" in parsed.path:
             if not self.require_permission("po_dashboard:edit"):
                 return
@@ -587,16 +658,60 @@ class AppHandler(SimpleHTTPRequestHandler):
 
     def current_user(self) -> dict | None:
         cookie = SimpleCookie(self.headers.get("Cookie"))
-        raw_id = cookie.get("poinbox_user_id")
-        if not raw_id:
+        raw_token = cookie.get(SESSION_COOKIE_NAME)
+        if not raw_token:
             return None
-        try:
-            user_id = int(raw_id.value)
-        except ValueError:
+        token_hash = hash_session_token(raw_token.value)
+        now = datetime.now(timezone.utc)
+        with db() as conn:
+            row = conn.execute(
+                """
+                SELECT us.id AS session_id, us.expires_at, u.*
+                FROM user_sessions us
+                JOIN users u ON u.id = us.user_id
+                WHERE us.token_hash = ? AND us.revoked_at IS NULL AND u.is_active = 1
+                """,
+                (token_hash,),
+            ).fetchone()
+            if not row:
+                return None
+            expires_at = parse_iso_datetime(row["expires_at"])
+            if not expires_at or expires_at <= now:
+                conn.execute("UPDATE user_sessions SET revoked_at = CURRENT_TIMESTAMP WHERE id = ?", (row["session_id"],))
+                conn.commit()
+                return None
+            conn.execute("UPDATE user_sessions SET last_seen_at = CURRENT_TIMESTAMP WHERE id = ?", (row["session_id"],))
+            conn.commit()
+            user = row_to_dict(row)
+        user.pop("session_id", None)
+        user.pop("expires_at", None)
+        return user
+
+    def session_cookie_header(self, token: str, max_age: int | None = None) -> str:
+        parts = [f"{SESSION_COOKIE_NAME}={token}", "Path=/", "SameSite=Lax", "HttpOnly"]
+        if max_age is not None:
+            parts.append(f"Max-Age={max_age}")
+        if SESSION_COOKIE_SECURE:
+            parts.append("Secure")
+        return "; ".join(parts)
+
+    def clear_legacy_cookie_header(self) -> str:
+        parts = ["poinbox_user_id=", "Path=/", "Max-Age=0", "SameSite=Lax", "HttpOnly"]
+        if SESSION_COOKIE_SECURE:
+            parts.append("Secure")
+        return "; ".join(parts)
+
+    def revoke_current_session(self) -> None:
+        cookie = SimpleCookie(self.headers.get("Cookie"))
+        raw_token = cookie.get(SESSION_COOKIE_NAME)
+        if not raw_token:
             return None
         with db() as conn:
-            user = row_to_dict(conn.execute("SELECT * FROM users WHERE id = ? AND is_active = 1", (user_id,)).fetchone())
-        return user
+            conn.execute(
+                "UPDATE user_sessions SET revoked_at = CURRENT_TIMESTAMP WHERE token_hash = ? AND revoked_at IS NULL",
+                (hash_session_token(raw_token.value),),
+            )
+            conn.commit()
 
     def require_permission(self, permission: str) -> dict | None:
         user = self.current_user()
@@ -618,26 +733,69 @@ class AppHandler(SimpleHTTPRequestHandler):
         self.respond_json({"error": "permission_denied", "permission": permission}, status)
         return None
 
+    def require_admin_tab(self, tab_key: str, mode: str = "view") -> dict | None:
+        permission = f"admin:{tab_key}:{'edit' if mode == 'edit' else 'view'}"
+        return self.require_permission(permission)
+
+    def require_any_admin_tab(self, tab_keys: tuple[str, ...], mode: str = "view") -> dict | None:
+        user = self.current_user()
+        action = "edit" if mode == "edit" else "view"
+        permissions = [f"admin:{tab}:{action}" for tab in tab_keys]
+        if user and any(has_permission(user, permission) for permission in permissions):
+            return user
+        status = HTTPStatus.UNAUTHORIZED if not user else HTTPStatus.FORBIDDEN
+        with db() as conn:
+            conn.execute(
+                """
+                INSERT INTO processing_logs (level, message, metadata_json)
+                VALUES ('warning', ?, ?)
+                """,
+                (
+                    "Denied access attempt.",
+                    json.dumps({"permission": "any_admin_tab", "permissions": permissions, "user_id": user.get("id") if user else None, "path": self.path}),
+                ),
+            )
+            conn.commit()
+        self.respond_json({"error": "permission_denied", "permissions": permissions}, status)
+        return None
+
     def login(self) -> None:
         payload = self.read_json()
         email = (payload.get("email") or "").strip().lower()
+        password = payload.get("password") or ""
         with db() as conn:
             user = row_to_dict(conn.execute("SELECT * FROM users WHERE LOWER(email) = ? AND is_active = 1", (email,)).fetchone())
         if not user:
             return self.respond_json({"error": "No active user found for that email."}, HTTPStatus.UNAUTHORIZED)
+        if not verify_password(password, user.get("password_hash")):
+            return self.respond_json({"error": "Invalid email or password."}, HTTPStatus.UNAUTHORIZED)
+        token = new_session_token()
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=SESSION_TTL_HOURS)
+        with db() as conn:
+            conn.execute(
+                """
+                INSERT INTO user_sessions (user_id, token_hash, expires_at)
+                VALUES (?, ?, ?)
+                """,
+                (user["id"], hash_session_token(token), expires_at.isoformat()),
+            )
+            conn.commit()
         body = json.dumps({"user": public_user(user)}, default=str).encode("utf-8")
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Set-Cookie", f"poinbox_user_id={user['id']}; Path=/; SameSite=Lax; HttpOnly")
+        self.send_header("Set-Cookie", self.session_cookie_header(token))
+        self.send_header("Set-Cookie", self.clear_legacy_cookie_header())
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
     def logout(self) -> None:
+        self.revoke_current_session()
         body = json.dumps({"ok": True}).encode("utf-8")
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Set-Cookie", "poinbox_user_id=; Path=/; Max-Age=0; SameSite=Lax; HttpOnly")
+        self.send_header("Set-Cookie", self.session_cookie_header("", 0))
+        self.send_header("Set-Cookie", self.clear_legacy_cookie_header())
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -704,14 +862,96 @@ def db():
     return conn
 
 
+def clean_admin_tab_access_level(value: object) -> str:
+    text = str(value or "no_access").strip().lower()
+    aliases = {
+        "full": "full_access",
+        "edit": "full_access",
+        "full_access": "full_access",
+        "view": "view_only",
+        "view_only": "view_only",
+        "none": "no_access",
+        "no": "no_access",
+        "no_access": "no_access",
+    }
+    return aliases.get(text, "no_access")
+
+
+def default_admin_tab_permissions(user: dict | None) -> dict[str, str]:
+    permissions = {tab: "no_access" for tab in ADMIN_TABS}
+    if not user:
+        return permissions
+    if int(user.get("is_admin") or 0):
+        return {tab: "full_access" for tab in ADMIN_TABS}
+    if int(user.get("can_access_admin") or 0):
+        for tab in ("master", "setup", "testing", "analytics", "erp"):
+            permissions[tab] = "full_access"
+    return permissions
+
+
+def admin_tab_permissions_for_user(user: dict | None) -> dict[str, str]:
+    permissions = default_admin_tab_permissions(user)
+    if not user:
+        return permissions
+    if int(user.get("is_admin") or 0):
+        return permissions
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT tab_key, access_level FROM user_admin_tab_permissions WHERE user_id = ?",
+            (user.get("id"),),
+        ).fetchall()
+    for row in rows:
+        tab = row["tab_key"]
+        if tab in permissions:
+            permissions[tab] = clean_admin_tab_access_level(row["access_level"])
+    if not int(user.get("can_access_admin") or 0):
+        permissions = {tab: "no_access" for tab in ADMIN_TABS}
+    return permissions
+
+
+def save_admin_tab_permissions(conn, user_id: int, permissions: dict | None, is_admin: int, can_access_admin: int) -> None:
+    clean_permissions = default_admin_tab_permissions({"is_admin": is_admin, "can_access_admin": can_access_admin})
+    if permissions:
+        for tab in ADMIN_TABS:
+            if tab in permissions:
+                clean_permissions[tab] = clean_admin_tab_access_level(permissions.get(tab))
+    if is_admin:
+        clean_permissions = {tab: "full_access" for tab in ADMIN_TABS}
+    elif not can_access_admin:
+        clean_permissions = {tab: "no_access" for tab in ADMIN_TABS}
+    for tab, access_level in clean_permissions.items():
+        conn.execute(
+            """
+            INSERT INTO user_admin_tab_permissions (user_id, tab_key, access_level)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id, tab_key) DO UPDATE SET
+                access_level = excluded.access_level,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (user_id, tab, access_level),
+        )
+
+
 def permissions_for(user: dict | None) -> list[str]:
     if not user:
         return []
-    if int(user.get("is_admin") or 0):
-        return ["admin:view", "users:manage", "po_dashboard:view", "po_dashboard:edit"]
     permissions: list[str] = []
-    if int(user.get("can_access_admin") or 0):
+    tab_permissions = admin_tab_permissions_for_user(user)
+    if any(level != "no_access" for level in tab_permissions.values()):
         permissions.append("admin:view")
+    for tab, level in tab_permissions.items():
+        if level in {"view_only", "full_access"}:
+            permissions.append(f"admin:{tab}:view")
+        if level == "full_access":
+            permissions.append(f"admin:{tab}:edit")
+    if tab_permissions.get("users") in {"view_only", "full_access"}:
+        permissions.append("users:view")
+    if tab_permissions.get("users") == "full_access":
+        permissions.append("users:manage")
+    if tab_permissions.get("setup") in {"view_only", "full_access"} or tab_permissions.get("testing") in {"view_only", "full_access"}:
+        permissions.append("integrations:view")
+    if tab_permissions.get("setup") == "full_access" or tab_permissions.get("testing") == "full_access":
+        permissions.append("integrations:manage")
     if int(user.get("can_access_po_dashboard") or 0):
         permissions.append("po_dashboard:view")
         if user.get("po_dashboard_access_level") == "edit":
@@ -742,10 +982,13 @@ def public_user(user: dict | None) -> dict | None:
         "can_access_admin": bool(user.get("can_access_admin")),
         "can_access_po_dashboard": bool(user.get("can_access_po_dashboard")),
         "po_dashboard_access_level": user.get("po_dashboard_access_level"),
+        "password_configured": bool(user.get("password_hash")),
+        "password_reset_required": bool(user.get("password_reset_required")),
         "invited_at": user.get("invited_at"),
         "created_at": user.get("created_at"),
         "updated_at": user.get("updated_at"),
     }
+    clean["admin_tab_permissions"] = admin_tab_permissions_for_user(user)
     clean["permissions"] = permissions_for(user)
     return clean
 
@@ -773,6 +1016,11 @@ def create_user(payload: dict, actor: dict) -> dict:
     name = " ".join(part for part in (first_name, last_name) if part).strip() or (payload.get("name") or "").strip()
     if not email or not first_name or not last_name:
         return {"error": "first_last_and_email_required", "users": list_users()}
+    password = (payload.get("password") or "").strip()
+    generated_password = ""
+    if not password:
+        generated_password = generate_temporary_password()
+        password = generated_password
     is_admin = bool_int(payload.get("is_admin"))
     can_access_admin = bool_int(payload.get("can_access_admin") or is_admin)
     can_access_po_dashboard = bool_int(payload.get("can_access_po_dashboard", True) or is_admin)
@@ -781,16 +1029,30 @@ def create_user(payload: dict, actor: dict) -> dict:
         access_level = "none"
     with db() as conn:
         try:
-            conn.execute(
+            cur = conn.execute(
                 """
                 INSERT INTO users (
                     email, name, first_name, last_name, job_title, is_active, is_admin, can_access_admin,
-                    can_access_po_dashboard, po_dashboard_access_level
+                    can_access_po_dashboard, po_dashboard_access_level, password_hash, password_set_at,
+                    password_reset_required
                 )
-                VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
                 """,
-                (email, name, first_name, last_name, job_title, is_admin, can_access_admin, can_access_po_dashboard, access_level),
+                (
+                    email,
+                    name,
+                    first_name,
+                    last_name,
+                    job_title,
+                    is_admin,
+                    can_access_admin,
+                    can_access_po_dashboard,
+                    access_level,
+                    hash_password(password),
+                    bool_int(bool(generated_password)),
+                ),
             )
+            save_admin_tab_permissions(conn, int(cur.lastrowid), payload.get("admin_tab_permissions"), is_admin, can_access_admin)
         except Exception:
             return {"error": "A user with that email already exists.", "users": list_users()}
         conn.execute(
@@ -801,7 +1063,10 @@ def create_user(payload: dict, actor: dict) -> dict:
             ("User invited/created.", json.dumps({"email": email, "actor_id": actor.get("id")})),
         )
         conn.commit()
-    return {"users": list_users()}
+    result = {"users": list_users()}
+    if generated_password:
+        result["temporary_password"] = generated_password
+    return result
 
 
 def update_user(user_id: int, payload: dict, actor: dict) -> dict:
@@ -865,6 +1130,29 @@ def update_user(user_id: int, payload: dict, actor: dict) -> dict:
                     user_id,
                 ),
             )
+            new_password = (payload.get("new_password") or "").strip()
+            if new_password:
+                conn.execute(
+                    """
+                    UPDATE users
+                    SET password_hash = ?, password_set_at = CURRENT_TIMESTAMP, password_reset_required = 0,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (hash_password(new_password), user_id),
+                )
+                conn.execute(
+                    "UPDATE user_sessions SET revoked_at = CURRENT_TIMESTAMP WHERE user_id = ? AND revoked_at IS NULL",
+                    (user_id,),
+                )
+            if "admin_tab_permissions" in payload or "is_admin" in payload or "can_access_admin" in payload:
+                save_admin_tab_permissions(
+                    conn,
+                    user_id,
+                    payload.get("admin_tab_permissions"),
+                    int(updated.get("is_admin") or 0),
+                    int(updated.get("can_access_admin") or 0),
+                )
         except Exception:
             return {"error": "A user with that email already exists.", "users": list_users()}
         conn.execute(
@@ -884,6 +1172,156 @@ def deactivate_user(user_id: int, actor: dict) -> dict:
 
 def active_admin_count(conn) -> int:
     return conn.execute("SELECT COUNT(*) AS count FROM users WHERE is_active = 1 AND is_admin = 1").fetchone()["count"]
+
+
+MASTER_BRIDGE_TABLES = [
+    ("trading_partner", "Trading Partners"),
+    ("trading_partner_account", "Trading Partner Accounts"),
+    ("trading_partner_site", "Trading Partner Sites"),
+    ("partner_role_assignment", "Partner Roles"),
+    ("product", "Canonical Products"),
+    ("product_org_attributes", "Product Org Attributes"),
+    ("customer_product_alias", "Customer Product Aliases"),
+]
+
+SETUP_REFERENCE_TABLES = [
+    ("organization_unit", "Organization Units"),
+    ("selling_context", "Selling Contexts / Sales Areas"),
+    ("fulfillment_location", "Fulfillment Locations"),
+    ("unit_of_measure", "Units of Measure"),
+    ("uom_alias", "UOM Aliases"),
+    ("uom_conversion", "UOM Conversions"),
+    ("currency", "Currencies"),
+    ("payment_terms", "Payment Terms"),
+    ("shipping_terms", "Shipping Terms"),
+    ("freight_terms", "Freight Terms"),
+    ("delivery_method", "Delivery Methods"),
+    ("price_reference", "Price References"),
+    ("order_document_type", "Order Document Types"),
+    ("line_document_type", "Line Document Types"),
+]
+
+ERP_DIAGNOSTIC_TABLES = [
+    ("erp_system", "ERP Systems"),
+    ("erp_profile", "ERP Profiles"),
+    ("custom_field_definition", "Custom Field Definitions"),
+    ("custom_field_value", "Custom Field Values"),
+    ("external_id_map", "External ID Maps"),
+    ("validation_rule", "Validation Rules"),
+]
+
+CANONICAL_MASTER_TABLES = ERP_DIAGNOSTIC_TABLES[:2] + MASTER_BRIDGE_TABLES + SETUP_REFERENCE_TABLES + ERP_DIAGNOSTIC_TABLES[2:]
+
+
+def canonical_table_counts(conn, table_defs: list[tuple[str, str]]) -> list[dict]:
+    return [
+        {
+            "table": table,
+            "label": label,
+            "count": conn.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()["count"],
+        }
+        for table, label in table_defs
+    ]
+
+
+def list_canonical_master_data() -> dict:
+    with db() as conn:
+        counts = canonical_table_counts(conn, CANONICAL_MASTER_TABLES)
+        groups = {
+            "master_bridge": canonical_table_counts(conn, MASTER_BRIDGE_TABLES),
+            "setup_reference": canonical_table_counts(conn, SETUP_REFERENCE_TABLES),
+            "erp_diagnostics": canonical_table_counts(conn, ERP_DIAGNOSTIC_TABLES),
+        }
+        bridge_counts = {
+            "customers_to_accounts": conn.execute(
+                "SELECT COUNT(*) AS count FROM trading_partner_account WHERE legacy_source_table = 'customers'"
+            ).fetchone()["count"],
+            "addresses_to_sites": conn.execute(
+                "SELECT COUNT(*) AS count FROM trading_partner_site WHERE legacy_source_table = 'customer_addresses'"
+            ).fetchone()["count"],
+            "xrefs_to_aliases": conn.execute(
+                "SELECT COUNT(*) AS count FROM customer_product_alias WHERE legacy_source_table = 'customer_part_xrefs'"
+            ).fetchone()["count"],
+            "products_to_canonical": conn.execute(
+                "SELECT COUNT(*) AS count FROM product WHERE legacy_source_table = 'products'"
+            ).fetchone()["count"],
+            "order_types_to_document_types": conn.execute(
+                "SELECT COUNT(*) AS count FROM order_document_type WHERE legacy_source_table = 'order_types'"
+            ).fetchone()["count"],
+        }
+        samples = {
+            "accounts": rows_to_dicts(
+                conn.execute(
+                    """
+                    SELECT id, account_name, account_number, legacy_source_table, legacy_source_id
+                    FROM trading_partner_account
+                    ORDER BY id DESC LIMIT 5
+                    """
+                ).fetchall()
+            ),
+            "aliases": rows_to_dicts(
+                conn.execute(
+                    """
+                    SELECT cpa.id, tpa.account_name, cpa.customer_product_number,
+                           p.product_number, cpa.legacy_source_table, cpa.legacy_source_id
+                    FROM customer_product_alias cpa
+                    LEFT JOIN trading_partner_account tpa ON tpa.id = cpa.trading_partner_account_id
+                    LEFT JOIN product p ON p.id = cpa.product_id
+                    ORDER BY cpa.id DESC LIMIT 5
+                    """
+                ).fetchall()
+            ),
+            "external_id_maps": rows_to_dicts(
+                conn.execute(
+                    """
+                    SELECT id, canonical_entity_type, canonical_entity_id, external_entity_type,
+                           external_id, external_code, external_name
+                    FROM external_id_map
+                    ORDER BY id DESC LIMIT 5
+                    """
+                ).fetchall()
+            ),
+            "setup_references": rows_to_dicts(
+                conn.execute(
+                    """
+                    SELECT 'Organization Unit' AS surface, name AS display_name, COALESCE(code, org_type) AS detail
+                    FROM organization_unit
+                    UNION ALL
+                    SELECT 'Selling Context', COALESCE(name, channel_code || ' / ' || division_code), COALESCE(channel_code, '') || COALESCE(' / ' || division_code, '')
+                    FROM selling_context
+                    UNION ALL
+                    SELECT 'Fulfillment Location', location_name, COALESCE(location_code, location_type)
+                    FROM fulfillment_location
+                    UNION ALL
+                    SELECT 'Order Document Type', document_type_name, COALESCE(document_type_code, transaction_category)
+                    FROM order_document_type
+                    UNION ALL
+                    SELECT 'Line Document Type', line_type_name, COALESCE(line_type_code, line_category)
+                    FROM line_document_type
+                    UNION ALL
+                    SELECT 'UOM', uom_code, COALESCE(uom_name, uom_class)
+                    FROM unit_of_measure
+                    UNION ALL
+                    SELECT 'Currency', currency_code, currency_name
+                    FROM currency
+                    UNION ALL
+                    SELECT 'Price Reference', name, COALESCE(code, price_reference_type)
+                    FROM price_reference
+                    LIMIT 12
+                    """
+                ).fetchall()
+            ),
+        }
+    return {"counts": counts, "groups": groups, "bridge_counts": bridge_counts, "samples": samples}
+
+
+def run_canonical_master_data_backfill() -> dict:
+    with db() as conn:
+        stats = backfill_canonical_master_data(conn)
+        conn.commit()
+    data = list_canonical_master_data()
+    data["backfill"] = stats
+    return data
 
 
 def list_customers() -> list[dict]:
@@ -2585,6 +3023,7 @@ def get_gmail_oauth_config() -> dict:
         "client_secret_configured": bool(values["client_secret"]),
         "redirect_uri": values["redirect_uri"],
         "scopes": values["scopes"],
+        "encrypted_storage": encrypted_secret_label(),
         "source": {
             "client_id": "database" if setting_value("gmail_client_id") else "env" if GMAIL_CLIENT_ID else "missing",
             "client_secret": "database" if setting_value("gmail_client_secret") else "env" if GMAIL_CLIENT_SECRET else "missing",
@@ -2602,6 +3041,7 @@ def get_outlook_oauth_config() -> dict:
         "tenant": values["tenant"],
         "redirect_uri": values["redirect_uri"],
         "scopes": values["scopes"],
+        "encrypted_storage": encrypted_secret_label(),
         "source": {
             "client_id": "database" if setting_value("outlook_client_id") else "env" if OUTLOOK_CLIENT_ID else "missing",
             "client_secret": "database" if setting_value("outlook_client_secret") else "env" if OUTLOOK_CLIENT_SECRET else "missing",
@@ -2613,31 +3053,40 @@ def get_outlook_oauth_config() -> dict:
 
 
 def save_gmail_oauth_config(payload: dict) -> dict:
-    upsert_setting("gmail_client_id", (payload.get("client_id") or "").strip(), False)
-    if payload.get("client_secret"):
-        upsert_setting("gmail_client_secret", str(payload.get("client_secret")).strip(), True)
-    upsert_setting("gmail_redirect_uri", (payload.get("redirect_uri") or GMAIL_REDIRECT_URI).strip(), False)
-    upsert_setting("gmail_scopes", (payload.get("scopes") or GMAIL_SCOPES).strip(), False)
+    try:
+        upsert_setting("gmail_client_id", (payload.get("client_id") or "").strip(), False)
+        if payload.get("client_secret"):
+            upsert_setting("gmail_client_secret", str(payload.get("client_secret")).strip(), True)
+        upsert_setting("gmail_redirect_uri", (payload.get("redirect_uri") or GMAIL_REDIRECT_URI).strip(), False)
+        upsert_setting("gmail_scopes", (payload.get("scopes") or GMAIL_SCOPES).strip(), False)
+    except RuntimeError as exc:
+        return {"error": str(exc), **get_gmail_oauth_config()}
     return get_gmail_oauth_config()
 
 
 def save_outlook_oauth_config(payload: dict) -> dict:
-    upsert_setting("outlook_client_id", (payload.get("client_id") or "").strip(), False)
-    if payload.get("client_secret"):
-        upsert_setting("outlook_client_secret", str(payload.get("client_secret")).strip(), True)
-    upsert_setting("outlook_tenant", (payload.get("tenant") or OUTLOOK_TENANT).strip() or "common", False)
-    upsert_setting("outlook_redirect_uri", (payload.get("redirect_uri") or OUTLOOK_REDIRECT_URI).strip(), False)
-    upsert_setting("outlook_scopes", (payload.get("scopes") or OUTLOOK_SCOPES).strip(), False)
+    try:
+        upsert_setting("outlook_client_id", (payload.get("client_id") or "").strip(), False)
+        if payload.get("client_secret"):
+            upsert_setting("outlook_client_secret", str(payload.get("client_secret")).strip(), True)
+        upsert_setting("outlook_tenant", (payload.get("tenant") or OUTLOOK_TENANT).strip() or "common", False)
+        upsert_setting("outlook_redirect_uri", (payload.get("redirect_uri") or OUTLOOK_REDIRECT_URI).strip(), False)
+        upsert_setting("outlook_scopes", (payload.get("scopes") or OUTLOOK_SCOPES).strip(), False)
+    except RuntimeError as exc:
+        return {"error": str(exc), **get_outlook_oauth_config()}
     return get_outlook_oauth_config()
 
 
 def setting_value(key: str) -> str:
     with db() as conn:
-        row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
-        return row["value"] if row and row["value"] is not None else ""
+        row = conn.execute("SELECT value, is_sensitive FROM app_settings WHERE key = ?", (key,)).fetchone()
+        if not row or row["value"] is None:
+            return ""
+        return decrypt_secret(row["value"]) if row["is_sensitive"] else row["value"]
 
 
 def upsert_setting(key: str, value: str, is_sensitive: bool) -> None:
+    stored_value = encrypt_secret(value) if is_sensitive and value else value
     with db() as conn:
         conn.execute(
             """
@@ -2646,9 +3095,203 @@ def upsert_setting(key: str, value: str, is_sensitive: bool) -> None:
             ON CONFLICT(key) DO UPDATE SET value = excluded.value, is_sensitive = excluded.is_sensitive,
                 updated_at = CURRENT_TIMESTAMP
             """,
-            (key, value, bool_int(is_sensitive)),
+            (key, stored_value, bool_int(is_sensitive)),
         )
         conn.commit()
+
+
+def clean_choice(value: object, allowed: set[str], default: str) -> str:
+    text = str(value or "").strip().lower()
+    return text if text in allowed else default
+
+
+def get_oracle_ebs_profile() -> dict:
+    with db() as conn:
+        response = oracle_profile_response(conn)
+    response["encrypted_storage"] = encrypted_secret_label()
+    return response
+
+
+def save_oracle_ebs_profile(payload: dict) -> dict:
+    system_name = (payload.get("system_name") or "Oracle EBS").strip()
+    environment = clean_choice(payload.get("environment"), {"sandbox", "uat", "production"}, "sandbox")
+    connection_mode = clean_choice(payload.get("connection_mode"), {"api", "middleware", "file", "db_readonly"}, "api")
+    write_mode = clean_choice(payload.get("write_mode"), {"preview", "entered_only"}, "preview")
+    active_flag = bool_int(payload.get("active_flag", True))
+    settings_fields = [
+        "user_id",
+        "responsibility_id",
+        "resp_application_id",
+        "security_group_id",
+        "org_id",
+        "nls_language",
+        "order_source_id",
+        "order_type_id",
+        "line_type_id",
+        "price_reference_id",
+        "fulfillment_org_id",
+        "endpoint_url",
+        "credential_reference",
+        "api_username",
+    ]
+    settings = {field: str(payload.get(field) or "").strip() for field in settings_fields}
+    settings["nls_language"] = settings["nls_language"] or "AMERICAN"
+    system_config = {
+        "adapter_code": ORACLE_EBS_ORDER_ENTRY_MANIFEST["adapter_code"],
+        "supported_transaction": ORACLE_EBS_ORDER_ENTRY_MANIFEST["supported_transaction"],
+    }
+    with db() as conn:
+        existing_profile = conn.execute(
+            "SELECT * FROM erp_profile WHERE adapter_code = ? ORDER BY updated_at DESC, id DESC LIMIT 1",
+            (ORACLE_EBS_ORDER_ENTRY_MANIFEST["adapter_code"],),
+        ).fetchone()
+        secrets = parse_json_dict(existing_profile["secret_json"] if existing_profile else None)
+        if payload.get("api_password"):
+            try:
+                secrets["api_password"] = encrypt_secret(str(payload.get("api_password")).strip())
+            except RuntimeError as exc:
+                return {"error": str(exc), **oracle_profile_response(conn)}
+        cur = conn.execute(
+            """
+            INSERT INTO erp_system (
+                system_name, erp_family, environment, connection_mode, active_flag, config_json
+            )
+            VALUES (?, 'oracle_ebs', ?, ?, ?, ?)
+            ON CONFLICT(system_name, erp_family, environment) DO UPDATE SET
+                connection_mode = excluded.connection_mode,
+                active_flag = excluded.active_flag,
+                config_json = excluded.config_json,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (system_name, environment, connection_mode, active_flag, json.dumps(system_config, sort_keys=True)),
+        )
+        system = conn.execute(
+            """
+            SELECT id FROM erp_system
+            WHERE system_name = ? AND erp_family = 'oracle_ebs' AND environment = ?
+            """,
+            (system_name, environment),
+        ).fetchone()
+        erp_system_id = int(system["id"] if system else cur.lastrowid)
+        profile_values = (
+            erp_system_id,
+            "Oracle EBS Order Entry",
+            ORACLE_EBS_ORDER_ENTRY_MANIFEST["supported_transaction"],
+            ORACLE_EBS_ORDER_ENTRY_MANIFEST["adapter_code"],
+            "v1",
+            write_mode,
+            "profile_defaults",
+            "canonical_then_adapter",
+            active_flag,
+            json.dumps(settings, sort_keys=True),
+            json.dumps(secrets, sort_keys=True),
+        )
+        if existing_profile:
+            conn.execute(
+                """
+                UPDATE erp_profile
+                SET erp_system_id = ?, profile_name = ?, transaction_type = ?, adapter_code = ?,
+                    profile_version = ?, write_mode = ?, defaulting_strategy = ?, validation_strategy = ?,
+                    active_flag = ?, settings_json = ?, secret_json = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (*profile_values, existing_profile["id"]),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO erp_profile (
+                    erp_system_id, profile_name, transaction_type, adapter_code, profile_version,
+                    write_mode, defaulting_strategy, validation_strategy, active_flag, settings_json, secret_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                profile_values,
+            )
+        conn.commit()
+        response = oracle_profile_response(conn)
+    response["encrypted_storage"] = encrypted_secret_label()
+    return response
+
+
+def preview_oracle_ebs_payload(po_id: int) -> dict:
+    with db() as conn:
+        return oracle_payload_preview(conn, po_id)
+
+
+def list_export_destinations() -> dict:
+    with db() as conn:
+        rows = rows_to_dicts(
+            conn.execute(
+                """
+                SELECT id, name, destination_type, endpoint_url, config_json, is_active,
+                       CASE WHEN COALESCE(secret_json, '') = '' THEN 0 ELSE 1 END AS secret_configured,
+                       created_at, updated_at
+                FROM export_destinations
+                ORDER BY is_active DESC, name COLLATE NOCASE
+                """
+            ).fetchall()
+        )
+    return {"destinations": rows}
+
+
+def save_export_destination(payload: dict, destination_id: int | None = None) -> dict:
+    name = (payload.get("name") or "").strip()
+    destination_type = (payload.get("destination_type") or "csv").strip().lower()
+    if destination_type not in {"csv", "webhook", "erp_placeholder"}:
+        destination_type = "csv"
+    if not name:
+        return {"error": "Destination name is required.", **list_export_destinations()}
+    config_json = json.dumps(payload.get("config") or {}, sort_keys=True)
+    raw_secret = payload.get("secret")
+    try:
+        encrypted_secret = encrypt_secret(json.dumps(raw_secret, sort_keys=True)) if raw_secret else None
+    except RuntimeError as exc:
+        return {"error": str(exc), **list_export_destinations()}
+    endpoint_url = (payload.get("endpoint_url") or "").strip()
+    is_active = bool_int(payload.get("is_active", True))
+    with db() as conn:
+        try:
+            if destination_id:
+                if encrypted_secret:
+                    conn.execute(
+                        """
+                        UPDATE export_destinations
+                        SET name = ?, destination_type = ?, endpoint_url = ?, config_json = ?, secret_json = ?,
+                            is_active = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                        """,
+                        (name, destination_type, endpoint_url, config_json, encrypted_secret, is_active, destination_id),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE export_destinations
+                        SET name = ?, destination_type = ?, endpoint_url = ?, config_json = ?,
+                            is_active = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                        """,
+                        (name, destination_type, endpoint_url, config_json, is_active, destination_id),
+                    )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO export_destinations (name, destination_type, endpoint_url, config_json, secret_json, is_active)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (name, destination_type, endpoint_url, config_json, encrypted_secret, is_active),
+                )
+        except Exception:
+            return {"error": "An export destination with that name already exists.", **list_export_destinations()}
+        conn.commit()
+    return list_export_destinations()
+
+
+def delete_export_destination(destination_id: int) -> dict:
+    with db() as conn:
+        conn.execute("UPDATE export_destinations SET is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (destination_id,))
+        conn.commit()
+    return list_export_destinations()
 
 
 def gmail_oauth_callback(query: str) -> tuple[str, int]:
@@ -2672,6 +3315,8 @@ def gmail_oauth_callback(query: str) -> tuple[str, int]:
             profile = gmail_api_get("/gmail/v1/users/me/profile", access_token)
             email = profile.get("emailAddress") or ""
             expires_at = token_expiry_iso(token.get("expires_in", 3600))
+            stored_access_token = encrypt_secret(access_token)
+            stored_refresh_token = encrypt_secret(refresh_token) if refresh_token else None
             existing = conn.execute("SELECT id, refresh_token FROM inbox_accounts WHERE provider = 'gmail' AND connected_email = ?", (email,)).fetchone()
             if existing:
                 conn.execute(
@@ -2683,7 +3328,7 @@ def gmail_oauth_callback(query: str) -> tuple[str, int]:
                         is_enabled = 1, next_sync_at = COALESCE(next_sync_at, ?), updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                     """,
-                    (access_token, refresh_token, expires_at, token.get("scope") or "", email, calculate_next_sync_at(24, "02:00"), existing["id"]),
+                    (stored_access_token, stored_refresh_token, expires_at, token.get("scope") or "", email, calculate_next_sync_at(24, "02:00"), existing["id"]),
                 )
                 account_id = existing["id"]
             else:
@@ -2697,7 +3342,7 @@ def gmail_oauth_callback(query: str) -> tuple[str, int]:
                     )
                     VALUES ('gmail', ?, ?, ?, 'INBOX', 'connected', ?, ?, ?, ?, 1, 0, 24, '02:00', ?, ?)
                     """,
-                    (f"Gmail - {email}", email, email, access_token, refresh_token, expires_at, token.get("scope") or "", calculate_next_sync_at(24, "02:00"), state_row["user_id"]),
+                    (f"Gmail - {email}", email, email, stored_access_token, stored_refresh_token, expires_at, token.get("scope") or "", calculate_next_sync_at(24, "02:00"), state_row["user_id"]),
                 )
                 account_id = int(cur.lastrowid)
             refresh_inbox_labels(conn, account_id)
@@ -2736,6 +3381,8 @@ def outlook_oauth_callback(query: str) -> tuple[str, int]:
             email = profile.get("mail") or profile.get("userPrincipalName") or ""
             display_name = profile.get("displayName") or email
             expires_at = token_expiry_iso(token.get("expires_in", 3600))
+            stored_access_token = encrypt_secret(access_token)
+            stored_refresh_token = encrypt_secret(refresh_token) if refresh_token else None
             existing = conn.execute("SELECT id, refresh_token FROM inbox_accounts WHERE provider = 'outlook' AND connected_email = ?", (email,)).fetchone()
             if existing:
                 conn.execute(
@@ -2748,7 +3395,7 @@ def outlook_oauth_callback(query: str) -> tuple[str, int]:
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                     """,
-                    (f"Outlook - {display_name}", access_token, refresh_token, expires_at, token.get("scope") or "", email, calculate_next_sync_at(24, "02:00"), existing["id"]),
+                    (f"Outlook - {display_name}", stored_access_token, stored_refresh_token, expires_at, token.get("scope") or "", email, calculate_next_sync_at(24, "02:00"), existing["id"]),
                 )
                 account_id = existing["id"]
             else:
@@ -2762,7 +3409,7 @@ def outlook_oauth_callback(query: str) -> tuple[str, int]:
                     )
                     VALUES ('outlook', ?, ?, ?, 'Inbox', 'connected', ?, ?, ?, ?, 1, 0, 24, '02:00', ?, ?)
                     """,
-                    (f"Outlook - {display_name}", email, email, access_token, refresh_token, expires_at, token.get("scope") or "", calculate_next_sync_at(24, "02:00"), state_row["user_id"]),
+                    (f"Outlook - {display_name}", email, email, stored_access_token, stored_refresh_token, expires_at, token.get("scope") or "", calculate_next_sync_at(24, "02:00"), state_row["user_id"]),
                 )
                 account_id = int(cur.lastrowid)
             refresh_outlook_folders(conn, account_id)
@@ -3577,7 +4224,7 @@ def get_gmail_access_token(conn, inbox_account_id: int) -> str:
     account = row_to_dict(conn.execute("SELECT * FROM inbox_accounts WHERE id = ?", (inbox_account_id,)).fetchone())
     if not account:
         raise ValueError("Inbox account not found.")
-    token = account.get("access_token")
+    token = decrypt_secret(account.get("access_token"))
     expires_at = parse_iso_datetime(account.get("token_expires_at"))
     if token and expires_at and expires_at > datetime.now(timezone.utc) + timedelta(minutes=5):
         return token
@@ -3585,7 +4232,7 @@ def get_gmail_access_token(conn, inbox_account_id: int) -> str:
 
 
 def refresh_gmail_token(conn, account: dict) -> str:
-    refresh_token = account.get("refresh_token")
+    refresh_token = decrypt_secret(account.get("refresh_token"))
     if not refresh_token:
         raise ValueError("Gmail account has no refresh token. Reconnect Gmail.")
     config = gmail_oauth_values()
@@ -3619,7 +4266,7 @@ def refresh_gmail_token(conn, account: dict) -> str:
             sync_status = 'connected', updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
         """,
-        (access_token, token_expiry_iso(data.get("expires_in", 3600)), data.get("scope"), account["id"]),
+        (encrypt_secret(access_token), token_expiry_iso(data.get("expires_in", 3600)), data.get("scope"), account["id"]),
     )
     conn.commit()
     return access_token
@@ -3629,7 +4276,7 @@ def get_outlook_access_token(conn, inbox_account_id: int) -> str:
     account = row_to_dict(conn.execute("SELECT * FROM inbox_accounts WHERE id = ?", (inbox_account_id,)).fetchone())
     if not account:
         raise ValueError("Inbox account not found.")
-    token = account.get("access_token")
+    token = decrypt_secret(account.get("access_token"))
     expires_at = parse_iso_datetime(account.get("token_expires_at"))
     if token and expires_at and expires_at > datetime.now(timezone.utc) + timedelta(minutes=5):
         return token
@@ -3637,7 +4284,7 @@ def get_outlook_access_token(conn, inbox_account_id: int) -> str:
 
 
 def refresh_outlook_token(conn, account: dict) -> str:
-    refresh_token = account.get("refresh_token")
+    refresh_token = decrypt_secret(account.get("refresh_token"))
     if not refresh_token:
         raise ValueError("Outlook account has no refresh token. Reconnect Outlook.")
     config = outlook_oauth_values()
@@ -3674,7 +4321,13 @@ def refresh_outlook_token(conn, account: dict) -> str:
             updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
         """,
-        (access_token, data.get("refresh_token"), token_expiry_iso(data.get("expires_in", 3600)), data.get("scope"), account["id"]),
+        (
+            encrypt_secret(access_token),
+            encrypt_secret(data.get("refresh_token")) if data.get("refresh_token") else None,
+            token_expiry_iso(data.get("expires_in", 3600)),
+            data.get("scope"),
+            account["id"],
+        ),
     )
     conn.commit()
     return access_token
@@ -4766,6 +5419,7 @@ def save_customer_part_xref(payload: dict) -> None:
     customer_part = (payload.get("customer_part_number") or "").strip()
     customer_part_revision = (payload.get("customer_part_revision") or "").strip()
     internal_part = (payload.get("internal_part_number") or "").strip()
+    has_internal_part_revision = "internal_part_revision" in payload
     internal_part_revision = (payload.get("internal_part_revision") or "").strip()
     if not customer_name or not customer_part or not internal_part:
         raise ValueError("customer_name, customer_part_number, and internal_part_number are required")
@@ -4780,14 +5434,24 @@ def save_customer_part_xref(payload: dict) -> None:
             (customer_name, customer_part, customer_part_revision),
         ).fetchone()
         if existing:
-            conn.execute(
-                """
-                UPDATE customer_part_xrefs
-                SET internal_part_number = ?, internal_part_revision = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                (internal_part, internal_part_revision, existing["id"]),
-            )
+            if has_internal_part_revision:
+                conn.execute(
+                    """
+                    UPDATE customer_part_xrefs
+                    SET internal_part_number = ?, internal_part_revision = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (internal_part, internal_part_revision, existing["id"]),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE customer_part_xrefs
+                    SET internal_part_number = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (internal_part, existing["id"]),
+                )
         else:
             conn.execute(
                 """
@@ -5242,6 +5906,7 @@ def run_due_background_syncs() -> None:
 
 
 def main() -> None:
+    validate_production_config()
     STORAGE_DIR.mkdir(parents=True, exist_ok=True)
     SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
     with db():

@@ -1,0 +1,184 @@
+:root {
+  --ink: #102033;
+  --muted: #516072;
+  --line: #d9e2ec;
+  --blue: #2563eb;
+  --orange: #f97316;
+  --bg: #f7fafc;
+  --surface: #ffffff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+}
+
+.site-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 18px min(6vw, 72px);
+  background: rgba(255, 255, 255, 0.94);
+  border-bottom: 1px solid var(--line);
+}
+
+.brand,
+nav,
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.brand {
+  color: var(--ink);
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.brand img {
+  width: 40px;
+  height: 40px;
+}
+
+nav a,
+.secondary {
+  color: var(--muted);
+  text-decoration: none;
+  font-weight: 600;
+}
+
+.hero {
+  position: relative;
+  display: flex;
+  align-items: center;
+  min-height: 76vh;
+  padding: min(10vw, 110px) min(6vw, 72px) 72px;
+  overflow: hidden;
+  background:
+    url("../public/assets/brand/goatclimbingmountainstatic-220.png") right min(8vw, 90px) center / min(34vw, 360px) auto no-repeat,
+    var(--bg);
+}
+
+.hero-copy {
+  max-width: 760px;
+}
+
+.eyebrow {
+  color: var(--orange);
+  font-weight: 700;
+  text-transform: uppercase;
+  font-size: 13px;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin-top: 0;
+}
+
+h1 {
+  font-size: 64px;
+  line-height: 1;
+  max-width: 850px;
+}
+
+h2 {
+  font-size: 34px;
+}
+
+p {
+  color: var(--muted);
+  font-size: 18px;
+  line-height: 1.55;
+}
+
+.primary,
+.secondary {
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+  padding: 0 18px;
+  border-radius: 6px;
+}
+
+.primary {
+  background: var(--blue);
+  color: #fff;
+  text-decoration: none;
+  font-weight: 700;
+}
+
+.secondary {
+  border: 1px solid var(--line);
+  background: var(--surface);
+}
+
+article,
+.trust {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 12px 36px rgba(16, 32, 51, 0.08);
+}
+
+.band {
+  padding: 64px min(6vw, 72px);
+}
+
+.steps {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 18px;
+}
+
+article {
+  padding: 22px;
+}
+
+article span {
+  display: inline-grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  margin-bottom: 18px;
+  border-radius: 50%;
+  background: #e8f0ff;
+  color: var(--blue);
+  font-weight: 800;
+}
+
+.trust {
+  margin: 0 min(6vw, 72px) 72px;
+  padding: 32px;
+}
+
+@media (max-width: 860px) {
+  .site-header,
+  .hero {
+    background-position: right -30px bottom 18px;
+    background-size: 210px auto;
+  }
+
+  .site-header,
+  nav {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .steps {
+    grid-template-columns: 1fr;
+  }
+
+  h1 {
+    font-size: 42px;
+  }
+}

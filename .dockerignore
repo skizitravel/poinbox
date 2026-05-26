@@ -1,0 +1,14 @@
+.env
+.env.local
+.env.production
+.env.*.local
+data/
+storage/
+samples/inbox/uploaded/
+samples/test-corpus/
+tokens/
+*.token.json
+*.log
+__pycache__/
+*.pyc
+.git/

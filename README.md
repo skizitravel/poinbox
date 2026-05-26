@@ -42,7 +42,8 @@ http://127.0.0.1:8000
 Log in with the seeded local admin unless you changed `.env.local`:
 
 ```text
-admin@example.com
+Email: admin@example.com
+Password: admin
 ```
 
 Click **Import Samples** to open the upload dialog. You can drag `.pdf`, `.txt`, `.eml`, `.xlsx`, or `.docx` files into the dialog, click **Select File**, or use **Import Existing Sample Folder** to process files already in `samples/inbox`.
@@ -89,9 +90,14 @@ The initial admin user is created automatically if the `users` table is empty:
 ```text
 INITIAL_ADMIN_EMAIL=admin@example.com
 INITIAL_ADMIN_NAME=Local Admin
+INITIAL_ADMIN_PASSWORD=admin
 ```
 
-This is MVP local authentication. It is useful for testing roles and review UX, but should be replaced with proper production auth before real deployment.
+Local development defaults to the `admin` password when `INITIAL_ADMIN_PASSWORD` is not set. Production first boot requires a real `INITIAL_ADMIN_PASSWORD`, and login uses password hashes plus expiring session cookies.
+
+Admin-entered OpenAI/Gmail/Outlook secrets are stored encrypted at rest when saved through the app. Set a stable `ENCRYPTION_KEY` for any deployed instance. In production (`APP_ENV=production`), the app fails fast if `ENCRYPTION_KEY` is missing.
+
+For single-tenant deployment notes, see `docs/DEPLOYMENT.md`.
 
 ## Users And Access
 
@@ -260,7 +266,7 @@ To enable AI extraction from the app, use **Admin > Testing > OpenAI Extraction 
 - turn **Use AI extraction** on
 - save the configuration
 
-The API key is stored locally for this MVP and is never returned to the browser after saving. The panel only shows whether a key is configured. Leave the API key field blank when saving if you want to keep the existing key.
+The API key is stored encrypted at rest in the instance database and is never returned to the browser after saving. The panel only shows whether a key is configured. Leave the API key field blank when saving if you want to keep the existing key.
 
 `.env.local` still works as a fallback for developers:
 
@@ -291,7 +297,7 @@ AI extraction behavior:
 - if AI is enabled but no key is configured, the app falls back to rule-based extraction and records a note
 - **AI Text** evaluation uses the saved OpenAI configuration
 - **AI With Prior Examples** evaluation also includes reviewed corrections from the feedback loop as guidance
-- production deployments should replace local SQLite/API-key storage with encrypted managed secret storage
+- production deployments must set a stable `ENCRYPTION_KEY`; future multi-tenant SaaS should move secrets to managed secret storage
 
 Date behavior:
 
@@ -376,7 +382,7 @@ OUTLOOK_REDIRECT_URI=http://127.0.0.1:8000/api/oauth/outlook/callback
 OUTLOOK_SCOPES=offline_access User.Read Mail.Read
 ```
 
-Manual sync comes first. Gmail Pub/Sub push notifications are intentionally not part of this MVP because they require more Google Cloud setup. Token storage in SQLite is MVP-only and should be replaced with encrypted/managed secret storage before production.
+Manual sync comes first. Gmail Pub/Sub push notifications are intentionally not part of this MVP because they require more Google Cloud setup. OAuth tokens entered through the Admin flow are stored encrypted at rest in SQLite for the single-tenant pilot.
 
 Inbox reliability has been expanded with richer sync run details, message-level records, health badges, retry/reprocess hooks, and clearer auth/attachment failure status. Gmail history sync, Gmail Pub/Sub, Outlook delta sync, durable production scheduling, and encrypted token storage remain planned production hardening items.
 
@@ -418,7 +424,7 @@ https://YOUR-CODESPACE-8000.app.github.dev/api/oauth/outlook/callback
 
 5. Copy the client ID, client secret, tenant, redirect URI, and scopes into the Outlook config panel.
 
-If a Microsoft client secret was pasted into chat, committed, or otherwise exposed, rotate it before using it. Local SQLite token storage is MVP-only; production should use encrypted managed secret storage.
+If a Microsoft client secret was pasted into chat, committed, or otherwise exposed, rotate it before using it. Set a stable `ENCRYPTION_KEY` before storing production tokens.
 
 Outlook delta sync is planned later. The app keeps the existing `delta_token` field available for a future Microsoft Graph `/me/mailFolders/{id}/messages/delta` implementation, but manual sync is the supported path in this MVP.
 
@@ -426,7 +432,7 @@ Outlook delta sync is planned later. The app keeps the existing `delta_token` fi
 
 The app currently ships with a connector interface and local sample connector. Gmail and Outlook manual sync now run through provider-specific API helpers in `server/app.py` and map live messages into the same `IncomingEmail` and `IncomingAttachment` structures used by sample import.
 
-The next production-grade inbox steps are encrypted token storage, hardened background scheduling, Microsoft Graph delta sync, and provider-specific shared mailbox handling.
+The next production-grade inbox steps are hardened background scheduling, Microsoft Graph delta sync, provider-specific shared mailbox handling, and eventually managed secret storage for multi-tenant SaaS.
 
 ## Project Layout
 

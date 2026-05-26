@@ -4,6 +4,7 @@ import os
 from dataclasses import dataclass
 
 from server.config import DATABASE_PATH, OPENAI_MODEL, USE_OPENAI_EXTRACTION
+from server.crypto_utils import decrypt_secret, encrypt_secret, encrypted_secret_label
 from server.db import connect, initialize
 
 
@@ -21,13 +22,14 @@ class OpenAIExtractionConfig:
 
 
 def get_app_setting(conn, key: str, default: str | None = None) -> str | None:
-    row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
+    row = conn.execute("SELECT value, is_sensitive FROM app_settings WHERE key = ?", (key,)).fetchone()
     if row and row["value"] is not None:
-        return row["value"]
+        return decrypt_secret(row["value"]) if row["is_sensitive"] else row["value"]
     return default
 
 
 def set_app_setting(conn, key: str, value: str, is_sensitive: bool = False) -> None:
+    stored_value = encrypt_secret(value) if is_sensitive and value else value
     conn.execute(
         """
         INSERT INTO app_settings (key, value, is_sensitive)
@@ -35,7 +37,7 @@ def set_app_setting(conn, key: str, value: str, is_sensitive: bool = False) -> N
         ON CONFLICT(key) DO UPDATE SET value = excluded.value, is_sensitive = excluded.is_sensitive,
             updated_at = CURRENT_TIMESTAMP
         """,
-        (key, value, 1 if is_sensitive else 0),
+        (key, stored_value, 1 if is_sensitive else 0),
     )
 
 
@@ -51,6 +53,7 @@ def get_openai_extraction_config() -> dict:
         "api_key_configured": config.api_key_configured,
         "model": config.model,
         "use_ai_extraction": config.use_ai_extraction,
+        "encrypted_storage": encrypted_secret_label(),
     }
 
 
@@ -61,11 +64,14 @@ def save_openai_extraction_config(payload: dict) -> dict:
     with connect(DATABASE_PATH) as conn:
         initialize(conn)
         api_key = (payload.get("api_key") or "").strip()
-        if api_key:
-            set_app_setting(conn, OPENAI_API_KEY_SETTING, api_key, True)
-        set_app_setting(conn, OPENAI_MODEL_SETTING, model, False)
-        set_app_setting(conn, OPENAI_USE_AI_SETTING, "1" if bool(payload.get("use_ai_extraction")) else "0", False)
-        conn.commit()
+        try:
+            if api_key:
+                set_app_setting(conn, OPENAI_API_KEY_SETTING, api_key, True)
+            set_app_setting(conn, OPENAI_MODEL_SETTING, model, False)
+            set_app_setting(conn, OPENAI_USE_AI_SETTING, "1" if bool(payload.get("use_ai_extraction")) else "0", False)
+            conn.commit()
+        except RuntimeError as exc:
+            return {"error": str(exc), **get_openai_extraction_config()}
     return get_openai_extraction_config()
 
 

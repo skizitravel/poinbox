@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Mountain Goat | Purchase Order Intake Automation</title>
+    <link rel="icon" type="image/png" sizes="32x32" href="../public/assets/brand/favicon-32.png" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="./index.html" aria-label="Mountain Goat home">
+        <img src="../public/assets/brand/icon-mountain-goat-head-64.png" alt="" />
+        <span>Mountain Goat</span>
+      </a>
+      <nav>
+        <a href="#how">How it works</a>
+        <a href="#security">Security</a>
+        <a href="https://app.mountaingoat.ai">App login</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">PO intake for B2B operations teams</p>
+          <h1>Turn emailed purchase orders into clean order data.</h1>
+          <p>
+            Mountain Goat helps manufacturers and distributors capture inbound POs, validate customer and item data,
+            route exceptions, and export reviewed orders without forcing every customer into EDI.
+          </p>
+          <div class="actions">
+            <a class="primary" href="mailto:hello@mountaingoat.ai">Request a demo</a>
+            <a class="secondary" href="https://app.mountaingoat.ai">App login</a>
+          </div>
+        </div>
+      </section>
+
+      <section class="band" id="how">
+        <h2>How it works</h2>
+        <div class="steps">
+          <article>
+            <span>1</span>
+            <h3>Connect the shared inbox</h3>
+            <p>An Admin connects Gmail or Outlook once. Operators work from the same inbound PO queue.</p>
+          </article>
+          <article>
+            <span>2</span>
+            <h3>Extract and validate</h3>
+            <p>PO headers and lines are parsed, matched against customer and item data, and checked for gaps.</p>
+          </article>
+          <article>
+            <span>3</span>
+            <h3>Review exceptions</h3>
+            <p>Low-confidence fields, product mismatches, and duplicate risks are routed into an operator queue.</p>
+          </article>
+          <article>
+            <span>4</span>
+            <h3>Export clean orders</h3>
+            <p>Reviewed orders can be exported as CSV now, with ERP destinations prepared for customer-specific rollout.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="band trust" id="security">
+        <h2>Built for controlled customer pilots</h2>
+        <p>
+          Mountain Goat keeps code and configuration separate from customer data. Runtime databases, OAuth tokens,
+          API keys, and uploaded POs stay out of source control, and Admin-entered secrets are encrypted at rest.
+        </p>
+      </section>
+    </main>
+  </body>
+</html>

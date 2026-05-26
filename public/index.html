@@ -3,15 +3,19 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>POInbox PO Intake</title>
+    <title>Customer Purchase Orders</title>
+    <link rel="icon" type="image/png" sizes="32x32" href="/assets/brand/favicon-32.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/assets/brand/favicon-180.png" />
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
     <section class="login-screen" id="loginView">
       <div class="login-card">
-        <h1>PO Intake Login</h1>
-        <p>Enter the email for an active user profile.</p>
+        <img class="login-brand-logo" src="/assets/brand/logo-mountain-goat-one-color-240.png" alt="Mountain Goat" />
+        <h1>Mountain Goat</h1>
+        <p>Sign in to review purchase orders, exceptions, and clean structured data.</p>
         <input id="loginEmail" type="email" placeholder="admin@example.com" />
+        <input id="loginPassword" type="password" placeholder="Password" autocomplete="current-password" />
         <button id="loginBtn">Log In</button>
         <div class="upload-message" id="loginMessage"></div>
       </div>
@@ -19,9 +23,12 @@
 
     <div class="app-shell hidden" id="appShell">
     <header>
-      <div>
-        <h1>PO Intake Queue</h1>
-        <p>Shared inbox purchase order detection, extraction, and review.</p>
+      <div class="brand-lockup">
+        <img class="brand-icon" src="/assets/brand/icon-mountain-goat-head-64.png" alt="" aria-hidden="true" />
+        <div>
+          <h1>Customer Purchase Orders</h1>
+          <p>No mess, no stress. Everything you need is right here.</p>
+        </div>
       </div>
       <div class="actions">
         <span class="user-pill" id="currentUserPill"></span>
@@ -31,7 +38,7 @@
           <button class="secondary" id="adminViewBtn">Admin</button>
         </div>
         <button id="syncBtn" title="Connector stub for Gmail or Outlook">Sync Inbox</button>
-        <button id="importBtn">Import Samples</button>
+        <button id="importBtn">Import POs</button>
       </div>
     </header>
 
@@ -93,7 +100,7 @@
                 <th>Age</th>
                 <th>Owner</th>
                 <th>Created</th>
-                <th></th>
+                <th>Actions</th>
               </tr>
             </thead>
             <tbody id="exceptionRows"></tbody>
@@ -118,7 +125,7 @@
                 <th>Total</th>
                 <th>Confidence</th>
                 <th>Updated</th>
-                <th></th>
+                <th>Actions</th>
               </tr>
             </thead>
             <tbody id="poRows"></tbody>
@@ -126,7 +133,11 @@
         </div>
 
         <aside class="detail-panel" id="detail">
-          <div class="empty-state">Select a purchase order to review extracted fields and source text.</div>
+          <div class="empty-state branded-empty">
+            <img src="/assets/brand/mascot-mountain-goat-default-240.png" alt="" aria-hidden="true" />
+            <strong>Here&rsquo;s the smartest route.</strong>
+            <span>Select a purchase order to review extracted fields and source text.</span>
+          </div>
         </aside>
       </section>
 
@@ -143,6 +154,7 @@
         <button class="secondary" id="adminTabSetupBtn">Setup</button>
         <button class="secondary" id="adminTabTestingBtn">Testing</button>
         <button class="secondary" id="adminTabAnalyticsBtn">Analytics</button>
+        <button class="secondary" id="adminTabErpBtn">ERP</button>
       </nav>
 
       <section class="admin-tab-pane" id="adminTabUsers">
@@ -159,6 +171,7 @@
           <input id="inviteLastName" placeholder="Last name" />
           <input id="inviteJobTitle" placeholder="Job title" />
           <input id="inviteEmail" type="email" placeholder="Email" />
+          <input id="invitePassword" type="password" placeholder="Temporary password (optional)" autocomplete="new-password" />
           <button id="inviteUserBtn">Invite User</button>
         </div>
         <div class="admin-table-wrap users-table-wrap">
@@ -171,7 +184,6 @@
                 <th>Email</th>
                 <th>Active</th>
                 <th>Admin</th>
-                <th>Admin Page</th>
                 <th>PO Dashboard</th>
                 <th>PO Access</th>
                 <th>Created</th>
@@ -234,13 +246,13 @@
           </div>
           <div class="upload-message" id="xrefMessage"></div>
           <div class="admin-form">
-              <input id="xrefCustomer" placeholder="Customer" />
+              <input id="xrefCustomer" list="xrefCustomerOptions" placeholder="Search customer" />
               <input id="xrefCustomerPart" placeholder="Customer part #" />
               <input id="xrefCustomerRev" placeholder="Customer rev" />
               <input id="xrefInternalPart" placeholder="Internal part #" />
-              <input id="xrefInternalRev" placeholder="Internal rev" />
               <button id="addXrefBtn">Add / Update</button>
           </div>
+          <datalist id="xrefCustomerOptions"></datalist>
           <div class="admin-table-wrap">
             <table>
               <thead>
@@ -249,7 +261,6 @@
                   <th>Customer Part #</th>
                   <th>Cust Rev</th>
                   <th>Internal Part #</th>
-                  <th>Int Rev</th>
                   <th></th>
                 </tr>
               </thead>
@@ -293,11 +304,42 @@
             </table>
           </div>
         </div>
+        <div class="admin-panel">
+          <div class="admin-head">
+            <div>
+              <h2>Master Data Bridge</h2>
+              <p>ERP-neutral customer, product, site, and alias records generated from the existing MVP master data.</p>
+            </div>
+            <div class="actions">
+              <button class="secondary" id="canonicalBackfillBtn">Refresh Backfill</button>
+            </div>
+          </div>
+          <div class="upload-message" id="canonicalMasterDataMessage"></div>
+          <div class="admin-table-wrap small-table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Bridge Surface</th>
+                  <th>Rows</th>
+                </tr>
+              </thead>
+              <tbody id="canonicalMasterDataRows"></tbody>
+            </table>
+          </div>
+          <div class="section-title">Compatibility Bridge</div>
+          <div id="canonicalBridgeRows" class="mini-list"></div>
+          <div class="section-title">Recent Aliases</div>
+          <div id="canonicalAliasRows" class="mini-list"></div>
+        </div>
       </section>
       </section>
 
       <section class="admin-tab-pane hidden" id="adminTabSetup">
       <section class="admin-grid single-admin-grid">
+        <div class="admin-section-banner">
+          <h2>Order Defaults</h2>
+          <p>Configure dropdowns and routing defaults that shape PO review without changing extracted PO data.</p>
+        </div>
         <div class="admin-panel">
           <div class="admin-head">
             <div>
@@ -346,6 +388,10 @@
             </table>
           </div>
         </div>
+        <div class="admin-section-banner">
+          <h2>Commercial Terms</h2>
+          <p>Reference terms used to validate, default, and normalize customer purchase orders.</p>
+        </div>
         <div class="admin-panel">
           <div class="admin-head">
             <div>
@@ -369,6 +415,202 @@
               <tbody id="paymentTermRows"></tbody>
             </table>
           </div>
+        </div>
+        <div class="admin-panel">
+          <div class="admin-head">
+            <div>
+              <h2>ERP Reference Data</h2>
+              <p>ERP-neutral setup lists for orgs, sales areas, locations, UOMs, currencies, terms, document types, and price references.</p>
+            </div>
+          </div>
+          <div class="admin-table-wrap small-table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Reference Surface</th>
+                  <th>Rows</th>
+                </tr>
+              </thead>
+              <tbody id="setupReferenceRows"></tbody>
+            </table>
+          </div>
+          <div class="section-title">Recent Reference Values</div>
+          <div id="setupReferenceSamples" class="mini-list"></div>
+        </div>
+        <div class="admin-section-banner">
+          <h2>Inbox Connections</h2>
+          <p>Configure mailbox access and sync behavior used by ingestion.</p>
+        </div>
+        <div class="admin-panel integration-admin-panel">
+          <div class="admin-head">
+            <div>
+              <h2>Inbox Connections</h2>
+              <p>Connect Gmail or Outlook, then configure mailbox folders, attachment handling, and sync timing.</p>
+            </div>
+            <div class="actions">
+              <button class="secondary" id="connectGmailBtn">Connect Gmail</button>
+              <button class="secondary" id="connectOutlookBtn">Connect Outlook</button>
+            </div>
+          </div>
+          <div class="upload-message" id="inboxSetupMessage"></div>
+          <div class="admin-form">
+            <input id="inboxDisplayName" placeholder="Display name" />
+            <input id="inboxMonitoredEmail" placeholder="Monitored email" />
+            <input id="inboxFolder" placeholder="Folder/label" value="INBOX" />
+            <button id="addInboxAccountBtn">Add Test Account</button>
+          </div>
+          <div class="admin-table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Provider</th>
+                  <th>Name</th>
+                  <th>Monitored</th>
+                  <th>Folder</th>
+                  <th>Enabled</th>
+                  <th>Status</th>
+                  <th>Last Sync</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="inboxAccountRows"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="admin-section-banner">
+          <h2>Output / Export Configuration</h2>
+          <p>Configure downstream output targets separately from ERP adapter profiles.</p>
+        </div>
+        <div class="admin-panel integration-admin-panel">
+          <div class="admin-head">
+            <div>
+              <h2>Export Destinations</h2>
+              <p>Prepare future ERP or webhook order export destinations without enabling live write-back.</p>
+            </div>
+          </div>
+          <div class="upload-message" id="exportDestinationMessage"></div>
+          <div class="admin-form">
+            <input id="exportDestinationName" placeholder="Destination name" />
+            <select id="exportDestinationType">
+              <option value="csv">CSV</option>
+              <option value="webhook">Webhook</option>
+              <option value="erp_placeholder">ERP Placeholder</option>
+            </select>
+            <input id="exportDestinationUrl" placeholder="Endpoint URL (optional)" />
+            <input id="exportDestinationSecret" type="password" placeholder="Secret/token (optional)" autocomplete="new-password" />
+            <button id="saveExportDestinationBtn">Add Destination</button>
+          </div>
+          <div class="admin-table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Type</th>
+                  <th>Endpoint</th>
+                  <th>Secret</th>
+                  <th>Status</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="exportDestinationRows"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+      </section>
+
+      <section class="admin-tab-pane hidden" id="adminTabErp">
+      <section class="admin-grid">
+        <div class="admin-panel integration-admin-panel">
+          <div class="admin-head">
+            <div>
+              <h2>ERP</h2>
+              <p>Configure ERP adapter profiles without changing canonical master-data shapes.</p>
+            </div>
+            <div class="actions">
+              <button class="secondary active-admin-tab" id="erpOracleEbsSubtabBtn" type="button">Oracle EBS</button>
+            </div>
+          </div>
+          <div class="upload-message" id="oracleEbsMessage"></div>
+          <div id="oracleEbsStatus" class="summary compact-summary"></div>
+          <div class="section-title">Oracle EBS Profile</div>
+          <div class="grid">
+            <div class="field"><label>System Name</label><input id="oracleSystemName" placeholder="Oracle EBS" /></div>
+            <div class="field"><label>Environment</label>
+              <select id="oracleEnvironment">
+                <option value="sandbox">Sandbox</option>
+                <option value="uat">UAT</option>
+                <option value="production">Production</option>
+              </select>
+            </div>
+            <div class="field"><label>Connection Mode</label>
+              <select id="oracleConnectionMode">
+                <option value="api">API</option>
+                <option value="middleware">Middleware</option>
+                <option value="file">File</option>
+                <option value="db_readonly">DB Read Only</option>
+              </select>
+            </div>
+            <div class="field"><label>Write Mode</label>
+              <select id="oracleWriteMode">
+                <option value="preview">Preview Only</option>
+                <option value="entered_only">Entered Only</option>
+              </select>
+            </div>
+            <label class="check-field"><input id="oracleActiveFlag" type="checkbox" /> Active</label>
+          </div>
+          <div class="section-title">EBS Context</div>
+          <div class="grid">
+            <div class="field"><label>User ID</label><input id="oracleUserId" /></div>
+            <div class="field"><label>Responsibility ID</label><input id="oracleResponsibilityId" /></div>
+            <div class="field"><label>Resp Application ID</label><input id="oracleRespApplicationId" /></div>
+            <div class="field"><label>Security Group ID</label><input id="oracleSecurityGroupId" /></div>
+            <div class="field"><label>Org ID</label><input id="oracleOrgId" /></div>
+            <div class="field"><label>NLS Language</label><input id="oracleNlsLanguage" placeholder="AMERICAN" /></div>
+          </div>
+          <div class="section-title">Order Defaults</div>
+          <div class="grid">
+            <div class="field"><label>Order Source ID</label><input id="oracleOrderSourceId" /></div>
+            <div class="field"><label>Order Type ID</label><input id="oracleOrderTypeId" /></div>
+            <div class="field"><label>Line Type ID</label><input id="oracleLineTypeId" /></div>
+            <div class="field"><label>Price Reference ID</label><input id="oraclePriceReferenceId" /></div>
+            <div class="field"><label>Fulfillment Org ID</label><input id="oracleFulfillmentOrgId" /></div>
+          </div>
+          <div class="section-title">Endpoint And Credentials</div>
+          <div class="grid">
+            <div class="field wide"><label>Endpoint / Middleware URL</label><input id="oracleEndpointUrl" /></div>
+            <div class="field"><label>Credential Reference</label><input id="oracleCredentialReference" /></div>
+            <div class="field"><label>API Username</label><input id="oracleApiUsername" autocomplete="off" /></div>
+            <div class="field"><label>API Password</label><input id="oracleApiPassword" type="password" placeholder="Leave blank to keep existing secret" autocomplete="new-password" /></div>
+          </div>
+          <div class="modal-actions">
+            <button id="saveOracleEbsProfileBtn">Save Oracle EBS Profile</button>
+          </div>
+        </div>
+        <div class="admin-panel">
+          <div class="admin-head">
+            <div>
+              <h2>Oracle EBS Adapter Manifest</h2>
+              <p>Backend-owned adapter capabilities and canonical-to-Oracle mappings.</p>
+            </div>
+          </div>
+          <div id="oracleManifestSummary" class="summary compact-summary"></div>
+          <div class="section-title">External ID Mapping Counts</div>
+          <div id="oracleMappingSummary" class="mini-list"></div>
+          <div class="section-title">ERP Integration Diagnostics</div>
+          <div class="admin-table-wrap small-table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Diagnostic Surface</th>
+                  <th>Rows</th>
+                </tr>
+              </thead>
+              <tbody id="erpDiagnosticRows"></tbody>
+            </table>
+          </div>
+          <div class="section-title">Recent External ID Maps</div>
+          <div id="erpExternalMapSamples" class="mini-list"></div>
         </div>
       </section>
       </section>
@@ -439,7 +681,7 @@
           </div>
         </div>
 
-        <div class="admin-panel">
+        <div class="admin-panel integration-admin-panel">
           <div class="admin-head">
             <div>
               <h2>OpenAI Extraction Configuration</h2>
@@ -518,43 +760,7 @@
             </table>
           </div>
         </div>
-        <div class="admin-panel">
-          <div class="admin-head">
-            <div>
-              <h2>Inbox Connections</h2>
-              <p>Connect Gmail or Outlook for manual sync testing.</p>
-            </div>
-            <div class="actions">
-              <button class="secondary" id="connectGmailBtn">Connect Gmail</button>
-              <button class="secondary" id="connectOutlookBtn">Connect Outlook</button>
-            </div>
-          </div>
-          <div class="admin-form">
-            <input id="inboxDisplayName" placeholder="Display name" />
-            <input id="inboxMonitoredEmail" placeholder="Monitored email" />
-            <input id="inboxFolder" placeholder="Folder/label" value="INBOX" />
-            <button id="addInboxAccountBtn">Add Test Account</button>
-          </div>
-          <div class="admin-table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Provider</th>
-                  <th>Name</th>
-                  <th>Monitored</th>
-                  <th>Folder</th>
-                  <th>Enabled</th>
-                  <th>Status</th>
-                  <th>Last Sync</th>
-                  <th></th>
-                </tr>
-              </thead>
-              <tbody id="inboxAccountRows"></tbody>
-            </table>
-          </div>
-        </div>
-
-        <div class="admin-panel">
+        <div class="admin-panel integration-admin-panel">
           <div class="admin-head">
             <div>
               <h2>Gmail OAuth App Configuration</h2>
@@ -573,7 +779,7 @@
           </div>
         </div>
 
-        <div class="admin-panel">
+        <div class="admin-panel integration-admin-panel">
           <div class="admin-head">
             <div>
               <h2>Outlook / Microsoft Graph Configuration</h2>
@@ -593,7 +799,7 @@
           </div>
         </div>
 
-        <div class="admin-panel">
+        <div class="admin-panel integration-admin-panel">
           <div class="admin-head">
             <div>
               <h2>Inbox Detection Testing</h2>
@@ -677,7 +883,7 @@
       <section class="modal" role="dialog" aria-modal="true" aria-labelledby="uploadTitle">
         <div class="modal-head">
           <div>
-            <h2 id="uploadTitle">Import Samples</h2>
+            <h2 id="uploadTitle">Import Purchase Orders</h2>
             <p>Upload PO samples or import files already in the sample inbox folder.</p>
           </div>
           <button class="icon-btn" id="closeUploadBtn" title="Close">×</button>
@@ -685,8 +891,9 @@
 
         <div class="drop-zone" id="dropZone">
           <input id="fileInput" type="file" accept=".pdf,.txt,.eml,.xlsx,.docx" multiple hidden />
+          <img class="drop-mascot" src="/assets/brand/goatclimbingmountainstatic-220.png" alt="" aria-hidden="true" />
           <div class="drop-title">Drop files here</div>
-          <div class="drop-copy">PDF, TXT, or EML files. Multiple files are supported.</div>
+          <div class="drop-copy">PDF, TXT, EML, XLSX, or DOCX files. Multiple files are supported.</div>
           <button class="secondary" id="selectFileBtn">Select File</button>
         </div>
 
@@ -714,6 +921,25 @@
           <button id="exportHeaderBtn">Header Only</button>
           <button id="exportLinesBtn">Header + Lines</button>
           <button class="secondary" id="cancelExportBtn">Cancel</button>
+        </div>
+      </section>
+    </div>
+
+    <div class="modal-backdrop hidden" id="poEntryModal" aria-hidden="true">
+      <section class="modal po-entry-modal" role="dialog" aria-modal="true" aria-labelledby="poEntryTitle">
+        <div class="modal-head po-entry-head">
+          <div>
+            <h2 id="poEntryTitle">PO Entry View</h2>
+            <p>Review the source document and editable order fields side by side.</p>
+          </div>
+          <div class="modal-actions po-entry-actions">
+            <button id="savePoEntryBtn">Save</button>
+            <button class="icon-btn" id="closePoEntryBtn" title="Close">x</button>
+          </div>
+        </div>
+        <div class="po-entry-body">
+          <section class="po-entry-source" id="poEntrySource"></section>
+          <section class="po-entry-detail detail-panel" id="poEntryDetail"></section>
         </div>
       </section>
     </div>
@@ -771,17 +997,73 @@
           <div class="field"><label>Last Name</label><input id="editUserLastName" /></div>
           <div class="field"><label>Job Title</label><input id="editUserJobTitle" /></div>
           <div class="field"><label>Email</label><input id="editUserEmail" type="email" /></div>
+          <div class="field wide"><label>Set New Password</label><input id="editUserPassword" type="password" placeholder="Leave blank to keep current password" autocomplete="new-password" /></div>
           <label class="check-field"><input id="editUserActive" type="checkbox" /> Active</label>
-          <label class="check-field"><input id="editUserAdmin" type="checkbox" /> Admin</label>
-          <label class="check-field"><input id="editUserAdminAccess" type="checkbox" /> Admin Page</label>
-          <label class="check-field"><input id="editUserDashboardAccess" type="checkbox" /> PO Dashboard</label>
-          <div class="field"><label>PO Access</label>
-            <select id="editUserPoLevel">
-              <option value="none">None</option>
-              <option value="view_only">View Only</option>
-              <option value="edit">Edit</option>
-            </select>
-          </div>
+          <section class="permission-section wide">
+            <div class="section-title">Permissions</div>
+            <div class="permission-grid">
+              <label class="check-field"><input id="editUserAdmin" type="checkbox" /> Full Admin</label>
+              <label class="check-field"><input id="editUserAdminAccess" type="checkbox" /> Select Admin Permissions</label>
+              <label class="check-field"><input id="editUserDashboardAccess" type="checkbox" /> PO Dashboard</label>
+              <div class="field"><label>PO Access</label>
+                <select id="editUserPoLevel">
+                  <option value="none">None</option>
+                  <option value="view_only">View Only</option>
+                  <option value="edit">Edit</option>
+                </select>
+              </div>
+            </div>
+            <div class="admin-permission-menu hidden" id="adminPermissionMenu">
+              <div class="permission-row">
+                <span>Users &amp; Access</span>
+                <select id="adminPermUsers">
+                  <option value="full_access">Full Access</option>
+                  <option value="view_only">View Only</option>
+                  <option value="no_access">No Access</option>
+                </select>
+              </div>
+              <div class="permission-row">
+                <span>Master Data</span>
+                <select id="adminPermMaster">
+                  <option value="full_access">Full Access</option>
+                  <option value="view_only">View Only</option>
+                  <option value="no_access">No Access</option>
+                </select>
+              </div>
+              <div class="permission-row">
+                <span>Setup</span>
+                <select id="adminPermSetup">
+                  <option value="full_access">Full Access</option>
+                  <option value="view_only">View Only</option>
+                  <option value="no_access">No Access</option>
+                </select>
+              </div>
+              <div class="permission-row">
+                <span>Testing</span>
+                <select id="adminPermTesting">
+                  <option value="full_access">Full Access</option>
+                  <option value="view_only">View Only</option>
+                  <option value="no_access">No Access</option>
+                </select>
+              </div>
+              <div class="permission-row">
+                <span>Analytics</span>
+                <select id="adminPermAnalytics">
+                  <option value="full_access">Full Access</option>
+                  <option value="view_only">View Only</option>
+                  <option value="no_access">No Access</option>
+                </select>
+              </div>
+              <div class="permission-row">
+                <span>ERP</span>
+                <select id="adminPermErp">
+                  <option value="full_access">Full Access</option>
+                  <option value="view_only">View Only</option>
+                  <option value="no_access">No Access</option>
+                </select>
+              </div>
+            </div>
+          </section>
         </div>
         <div class="upload-message" id="userModalMessage"></div>
         <div class="modal-actions">

@@ -17,12 +17,16 @@ let inboxMessageRecords = [];
 let gmailConfig = {};
 let outlookConfig = {};
 let openaiConfig = {};
+let exportDestinations = [];
 let currentInboxConfig = null;
 let configuringInboxId = null;
 let extractionLearning = { summary: {}, recent_feedback: [], recent_failures: [], corrected_fields: [], corrections_by_customer: [] };
 let reviewTasks = [];
 let reviewTaskUsers = [];
 let operationsMetrics = {};
+let canonicalMasterData = { counts: [], bridge_counts: {}, samples: {} };
+let oracleEbsConfig = { manifest: null, profile: null, mapping_summary: {} };
+let oraclePayloadPreview = null;
 let currentUser = null;
 let activeAdminTab = "users";
 let editingUserId = null;
@@ -34,6 +38,7 @@ let pendingReviewAction = null;
 let editingGoldenDocumentId = null;
 let currentGoldenAnswer = null;
 let manualSyncInboxId = null;
+let poEntryOpen = false;
 
 const statuses = ["Received", "Needs Review", "Booked", "Rejected"];
 const headerFields = [
@@ -79,6 +84,23 @@ const addressLabels = {
   country: "Country",
   zip_code: "Zip Code",
 };
+const adminTabs = ["users", "master", "setup", "testing", "analytics", "erp"];
+const adminTabLabels = {
+  users: "Users & Access",
+  master: "Master Data",
+  setup: "Setup",
+  testing: "Testing",
+  analytics: "Analytics",
+  erp: "ERP",
+};
+const adminPermissionSelectIds = {
+  users: "adminPermUsers",
+  master: "adminPermMaster",
+  setup: "adminPermSetup",
+  testing: "adminPermTesting",
+  analytics: "adminPermAnalytics",
+  erp: "adminPermErp",
+};
 
 async function api(path, options = {}) {
   const { skipAuthRedirect = false, ...fetchOptions } = options;
@@ -97,6 +119,19 @@ async function api(path, options = {}) {
   return res.json();
 }
 
+async function safeApi(path, fallback) {
+  try {
+    return await api(path);
+  } catch (error) {
+    console.warn(`Admin data load skipped ${path}:`, error);
+    return fallback;
+  }
+}
+
+function canonicalFallbackData() {
+  return { counts: [], groups: { master_bridge: [], setup_reference: [], erp_diagnostics: [] }, bridge_counts: {}, samples: {} };
+}
+
 function hasPermission(permission) {
   return Boolean(currentUser?.permissions?.includes(permission));
 }
@@ -113,8 +148,44 @@ function canViewAdmin() {
   return hasPermission("admin:view");
 }
 
+function adminTabAccess(tab) {
+  const explicit = currentUser?.admin_tab_permissions?.[tab];
+  if (explicit) return explicit;
+  if (!currentUser) return "no_access";
+  if (currentUser.is_admin) return "full_access";
+  if (hasPermission(`admin:${tab}:edit`)) return "full_access";
+  if (hasPermission(`admin:${tab}:view`)) return "view_only";
+  if (tab === "users") return hasPermission("users:manage") ? "full_access" : "no_access";
+  if (currentUser.can_access_admin || hasPermission("admin:view")) return "full_access";
+  return "no_access";
+}
+
+function canViewAdminTab(tab) {
+  return ["view_only", "full_access"].includes(adminTabAccess(tab));
+}
+
+function canEditAdminTab(tab) {
+  return adminTabAccess(tab) === "full_access";
+}
+
+function firstAvailableAdminTab() {
+  return adminTabs.find((tab) => canViewAdminTab(tab)) || "";
+}
+
+function canViewUsers() {
+  return hasPermission("users:view") || hasPermission("users:manage");
+}
+
 function canManageUsers() {
   return hasPermission("users:manage");
+}
+
+function canViewIntegrations() {
+  return hasPermission("integrations:view");
+}
+
+function canManageIntegrations() {
+  return hasPermission("integrations:manage");
 }
 
 function setMessage(selector, message, kind = "") {
@@ -167,7 +238,10 @@ async function loadPOs() {
           <td>${money(row.total_value, row.currency)}</td>
           <td>${pct(row.extraction_confidence)}</td>
           <td>${safe(row.updated_at)}</td>
-          <td>${canEditDashboard() ? `<button class="danger table-action" onclick="deletePO(event, ${row.id})">Delete</button>` : ""}</td>
+          <td>
+            <button class="secondary table-action" onclick="openPoEntryView(event, ${row.id})">PO Entry View</button>
+            ${canEditDashboard() ? `<button class="danger table-action" onclick="deletePO(event, ${row.id})">Delete</button>` : ""}
+          </td>
         </tr>
       `;
     })
@@ -175,23 +249,29 @@ async function loadPOs() {
 }
 
 async function openDetail(id, mark = true) {
+  if (Number(selectedId || 0) !== Number(id)) oraclePayloadPreview = null;
   currentDetail = await api(`/api/purchase-orders/${id}`);
   orderTypes = currentDetail.order_types || orderTypes;
   if (mark) selectedId = id;
   renderDetail();
+  if (poEntryOpen) renderPoEntryModal();
   await loadPOs();
 }
 
 function renderDetail() {
+  document.querySelector("#detail").innerHTML = renderDetailHtml();
+}
+
+function renderDetailHtml(context = "") {
   const po = currentDetail.purchase_order;
-  const source = currentDetail.attachment?.extracted_text || currentDetail.email?.body_text || "";
+  const source = sourceTextForCurrentDetail();
   const editActions = canEditDashboard()
-    ? `<button class="secondary" onclick="savePO()">Save Header</button>
+    ? `<button class="secondary" onclick="savePO('${context}')">Save Header</button>
       <button class="secondary" onclick="markExtractionReviewed()">Mark Extraction Reviewed</button>
       <button onclick="quickStatus('Booked')">Mark Booked</button>
       <button class="danger" onclick="quickStatus('Rejected')">Reject</button>`
     : '<span class="view-only-note">View Only</span>';
-  document.querySelector("#detail").innerHTML = `
+  return `
     <div class="detail-head">
       <div>
         <h2>${safe(po.po_number) || "Purchase Order"}</h2>
@@ -200,12 +280,12 @@ function renderDetail() {
       </div>
       <div class="detail-status">
         ${!canEditDashboard() ? '<span class="badge ViewOnly">View Only</span>' : ""}${badge(po.status)}
-        <div class="detail-top-actions">${renderViewPoButton()}</div>
+        <div class="detail-top-actions">${renderDetailTopActions(context)}</div>
       </div>
     </div>
-    <div class="grid">${headerFields.map((field) => renderField(po, field, "po")).join("")}</div>
-    ${renderStructuredAddressSection("bill_to", "Bill-To Address", "bill_to_address_structured_json", "bill_to_address")}
-    ${renderStructuredAddressSection("ship_to", "Ship-To Address", "ship_to_address_structured_json", "ship_to_address")}
+    <div class="grid">${headerFields.map((field) => renderField(po, field, "po", context)).join("")}</div>
+    ${renderStructuredAddressSection("bill_to", "Bill-To Address", "bill_to_address_structured_json", "bill_to_address", context)}
+    ${renderStructuredAddressSection("ship_to", "Ship-To Address", "ship_to_address_structured_json", "ship_to_address", context)}
     <div class="muted-panel">Corrections captured for learning: ${po.extraction_feedback_count || 0}. Reviewed: ${po.extraction_reviewed_at ? safe(po.extraction_reviewed_at) : "Not reviewed"}.</div>
     <div class="line-actions">
       <button class="secondary" onclick="openAcknowledgmentDraft()">Draft Acknowledgment</button>
@@ -213,12 +293,13 @@ function renderDetail() {
     </div>
 
     <div class="section-title">Line Items</div>
-    <div id="lines">${currentDetail.lines.map(renderLine).join("")}</div>
+    <div id="${scopedId("lines", context)}">${currentDetail.lines.map((line) => renderLine(line, context)).join("")}</div>
     ${canEditDashboard() ? '<button class="secondary" onclick="addLine()">Add Line</button>' : ""}
 
     ${renderMasterDataReviews()}
     ${renderDetailExceptions()}
     ${renderDuplicateCandidates()}
+    ${renderOraclePreviewPanel()}
     ${renderSourceEvidencePanel()}
     ${renderAuditTrail()}
 
@@ -230,9 +311,17 @@ function renderDetail() {
   `;
 }
 
-function renderField(record, field, prefix) {
+function scopedId(id, context = "") {
+  return context ? `${context}_${id}` : id;
+}
+
+function sourceTextForCurrentDetail() {
+  return currentDetail?.attachment?.extracted_text || currentDetail?.email?.body_text || "";
+}
+
+function renderField(record, field, prefix, context = "") {
   const [key, label, type = "text", size = ""] = field;
-  const id = `${prefix}_${key}`;
+  const id = scopedId(`${prefix}_${key}`, context);
   const confidence = confidenceFor(record, key);
   const review = confidence < 0.7 ? "review" : "";
   const reviewNote = confidence < 0.7 ? '<div class="review-note">Review</div>' : "";
@@ -400,7 +489,7 @@ function renderFieldContextualAction(key) {
   return `<div class="field-inline-action"><button class="secondary table-action" onclick="openConfirmedOrderView()">Confirmed Order View</button></div>`;
 }
 
-function renderStructuredAddressSection(prefix, title, jsonKey, textKey) {
+function renderStructuredAddressSection(prefix, title, jsonKey, textKey, context = "") {
   const po = currentDetail.purchase_order;
   const structured = structuredAddressFor(po, jsonKey, textKey);
   return `
@@ -408,7 +497,7 @@ function renderStructuredAddressSection(prefix, title, jsonKey, textKey) {
     <div class="address-grid">
       ${addressKeys
         .map((key) => {
-          const id = `po_${prefix}_${key}`;
+          const id = scopedId(`po_${prefix}_${key}`, context);
           if (!canEditDashboard()) {
             return `<div class="field"><label>${addressLabels[key]}</label><div class="readonly-value">${safe(structured[key])}</div></div>`;
           }
@@ -430,10 +519,10 @@ function structuredAddressFor(po, jsonKey, textKey) {
   return structured;
 }
 
-function readStructuredAddress(prefix) {
+function readStructuredAddress(prefix, context = "") {
   const output = {};
   for (const key of addressKeys) {
-    output[key] = document.querySelector(`#po_${prefix}_${key}`)?.value.trim() || "";
+    output[key] = document.querySelector(`#${scopedId(`po_${prefix}_${key}`, context)}`)?.value.trim() || "";
   }
   return output;
 }
@@ -444,12 +533,12 @@ function renderInlineMasterDataAction(type) {
   if (!review) return "";
   const action = reviewActionLabel(review.review_type);
   const blocked = actionBlockedByMissingCustomer(review);
-  const canAct = canViewAdmin() && !blocked;
+  const canAct = canEditAdminTab("master") && !blocked;
   return `
     <div class="inline-master-action">
       <span>${safe(review.message)}</span>
       ${canAct ? `<button class="secondary table-action" onclick="startMasterDataReviewAction(${review.id})">${action}</button>` : ""}
-      ${!canViewAdmin() ? '<span class="view-only-note">Master data review needed</span>' : ""}
+      ${!canViewAdminTab("master") ? '<span class="view-only-note">Master data review needed</span>' : ""}
       ${blocked ? '<span class="review-note">Add Customer first</span>' : ""}
     </div>
   `;
@@ -487,18 +576,126 @@ function renderViewPoButton() {
   return `<button class="secondary" disabled>No PDF available</button>`;
 }
 
-function renderLine(line) {
+function renderDetailTopActions(context = "") {
+  const entryButton = context ? "" : `<button class="secondary" onclick="openPoEntryView(event, ${currentDetail.purchase_order.id})">PO Entry View</button>`;
+  const oracleButton = !context && canEditAdminTab("erp") ? `<button class="secondary" onclick="previewOracleEbsPayload(event)">Oracle Preview</button>` : "";
+  return `${renderViewPoButton()}${entryButton}${oracleButton}`;
+}
+
+async function previewOracleEbsPayload(event) {
+  if (event) event.stopPropagation();
+  if (!selectedId || !canEditAdminTab("erp")) return;
+  oraclePayloadPreview = { loading: true };
+  renderDetail();
+  try {
+    oraclePayloadPreview = await api(`/api/purchase-orders/${selectedId}/erp/oracle-ebs/preview`, { method: "POST", body: JSON.stringify({}) });
+  } catch (error) {
+    oraclePayloadPreview = { error: error.message || "Oracle EBS preview failed." };
+  }
+  renderDetail();
+}
+
+function renderOraclePreviewPanel() {
+  if (!oraclePayloadPreview) return "";
+  if (oraclePayloadPreview.loading) {
+    return `<div class="section-title">Oracle EBS Payload Preview</div><div class="muted-panel">Generating Oracle EBS preview...</div>`;
+  }
+  if (oraclePayloadPreview.error) {
+    return `<div class="section-title">Oracle EBS Payload Preview</div><div class="muted-panel error">${safe(oraclePayloadPreview.error)}</div>`;
+  }
+  const messages = oraclePayloadPreview.validation?.messages || [];
+  const payload = oraclePayloadPreview.payload || {};
+  return `
+    <div class="section-title">Oracle EBS Payload Preview</div>
+    <div class="review-list">
+      ${
+        messages.length
+          ? messages
+              .map((item) => `<div class="review-item ${item.severity === "error" ? "critical" : "warning"}"><strong>${safe(item.severity)}</strong> ${safe(item.message)} <span class="muted-line">${safe(item.field)}</span></div>`)
+              .join("")
+          : '<div class="muted-panel">Canonical draft validated for Oracle EBS preview.</div>'
+      }
+    </div>
+    <div class="muted-panel">Preview only. No Oracle order was created, booked, exported, or changed.</div>
+    <div class="source">${safe(JSON.stringify(payload, null, 2))}</div>
+  `;
+}
+
+function renderLine(line, context = "") {
   return `
     <div class="line-card" data-line-id="${line.id}">
       <div class="grid">
-        ${lineFields.map((field) => renderField(line, field, `line_${line.id}`)).join("")}
+        ${lineFields.map((field) => renderField(line, field, `line_${line.id}`, context)).join("")}
       </div>
       ${canEditDashboard() ? `<div class="line-actions">
-        <button class="secondary" onclick="saveLine(${line.id})">Save Line</button>
+        <button class="secondary" onclick="saveLine(${line.id}, '${context}')">Save Line</button>
         <button class="danger" onclick="deleteLine(${line.id})">Delete</button>
       </div>` : ""}
     </div>
   `;
+}
+
+async function openPoEntryView(event, id = selectedId) {
+  if (event) event.stopPropagation();
+  if (!id) return;
+  if (!currentDetail || Number(currentDetail.purchase_order?.id) !== Number(id)) {
+    await openDetail(id);
+  } else {
+    selectedId = id;
+  }
+  poEntryOpen = true;
+  renderPoEntryModal();
+  document.querySelector("#poEntryModal").classList.remove("hidden");
+  document.querySelector("#poEntryModal").setAttribute("aria-hidden", "false");
+}
+
+function closePoEntryView() {
+  poEntryOpen = false;
+  document.querySelector("#poEntryModal").classList.add("hidden");
+  document.querySelector("#poEntryModal").setAttribute("aria-hidden", "true");
+}
+
+function renderPoEntryModal() {
+  if (!currentDetail) return;
+  const po = currentDetail.purchase_order || {};
+  document.querySelector("#poEntryTitle").textContent = `PO Entry View${po.po_number ? ` - ${po.po_number}` : ""}`;
+  document.querySelector("#savePoEntryBtn").classList.toggle("hidden", !canEditDashboard());
+  document.querySelector("#poEntrySource").innerHTML = renderPoEntrySource();
+  document.querySelector("#poEntryDetail").innerHTML = renderDetailHtml("entry");
+}
+
+function renderPoEntrySource() {
+  const attachment = currentDetail.attachment || {};
+  const filename = attachment.original_filename || attachment.filename || "Source document";
+  if (attachment.id && String(filename).toLowerCase().endsWith(".pdf")) {
+    return `
+      <div class="section-title">${safe(filename)}</div>
+      <iframe class="po-entry-pdf" title="PO source file" src="/api/attachments/${attachment.id}/view"></iframe>
+    `;
+  }
+  const source = sourceTextForCurrentDetail();
+  return `
+    <div class="section-title">${safe(filename)}</div>
+    <pre class="source po-entry-source-text">${safe(source || "No PDF or source text available for this purchase order.")}</pre>
+  `;
+}
+
+async function savePoEntry() {
+  if (!canEditDashboard() || !selectedId || !currentDetail) return;
+  document.querySelector("#savePoEntryBtn").disabled = true;
+  try {
+    await savePO("entry", false);
+    for (const line of currentDetail.lines || []) {
+      await saveLine(line.id, "entry", false);
+    }
+    currentDetail = await api(`/api/purchase-orders/${selectedId}`);
+    orderTypes = currentDetail.order_types || orderTypes;
+    renderDetail();
+    renderPoEntryModal();
+    await Promise.all([loadPOs(), loadSummary(), loadLogs(), loadReviewTasks()]);
+  } finally {
+    document.querySelector("#savePoEntryBtn").disabled = false;
+  }
 }
 
 function renderMasterDataReviews() {
@@ -521,7 +718,7 @@ function renderMasterDataReviews() {
 
 function renderMasterDataReview(review) {
   const suggested = review.suggested_value || parseJson(review.suggested_value_json);
-  const disabled = !canViewAdmin() || review.status !== "open" || actionBlockedByMissingCustomer(review);
+  const disabled = !canEditAdminTab("master") || review.status !== "open" || actionBlockedByMissingCustomer(review);
   const action = reviewActionLabel(review.review_type);
   return `
     <div class="master-review-item ${review.status}">
@@ -533,7 +730,7 @@ function renderMasterDataReview(review) {
       </div>
       <div class="review-actions">
         <span class="badge ${review.status === "open" ? "NeedsReview" : "Booked"}">${safe(review.status)}</span>
-        ${action && canViewAdmin() && review.status === "open" ? `<button class="secondary" ${disabled ? "disabled" : ""} onclick="startMasterDataReviewAction(${review.id})">${action}</button>` : ""}
+        ${action && canEditAdminTab("master") && review.status === "open" ? `<button class="secondary" ${disabled ? "disabled" : ""} onclick="startMasterDataReviewAction(${review.id})">${action}</button>` : ""}
       </div>
     </div>
   `;
@@ -582,7 +779,7 @@ function parseJson(text) {
 
 async function startMasterDataReviewAction(reviewId) {
   const review = (currentDetail.master_data_reviews || []).find((item) => Number(item.id) === Number(reviewId));
-  if (!review || !canViewAdmin()) return;
+  if (!review || !canEditAdminTab("master")) return;
   const suggested = review.suggested_value || parseJson(review.suggested_value_json);
   pendingReviewAction = { reviewId, type: review.review_type };
   if (review.review_type === "customer") {
@@ -623,13 +820,13 @@ async function resolveMasterDataReview(reviewId, payload = {}) {
   if (selectedId) renderDetail();
 }
 
-async function savePO() {
+async function savePO(context = "", shouldRefresh = true) {
   if (!canEditDashboard()) return;
-  const payload = readFields(headerFields, "po");
-  payload.bill_to_address_structured_json = readStructuredAddress("bill_to");
-  payload.ship_to_address_structured_json = readStructuredAddress("ship_to");
+  const payload = readFields(headerFields, "po", context);
+  payload.bill_to_address_structured_json = readStructuredAddress("bill_to", context);
+  payload.ship_to_address_structured_json = readStructuredAddress("ship_to", context);
   await api(`/api/purchase-orders/${selectedId}`, { method: "PUT", body: JSON.stringify(payload) });
-  await refresh();
+  if (shouldRefresh) await refresh();
 }
 
 async function markExtractionReviewed() {
@@ -644,11 +841,11 @@ async function quickStatus(status) {
   await refresh();
 }
 
-async function saveLine(id) {
+async function saveLine(id, context = "", shouldRefresh = true) {
   if (!canEditDashboard()) return;
-  const payload = readFields(lineFields, `line_${id}`);
+  const payload = readFields(lineFields, `line_${id}`, context);
   await api(`/api/purchase-orders/${selectedId}/lines/${id}`, { method: "PUT", body: JSON.stringify(payload) });
-  await refresh();
+  if (shouldRefresh) await refresh();
 }
 
 async function deleteLine(id) {
@@ -676,16 +873,17 @@ async function deletePO(event, id) {
   if (selectedId === id) {
     selectedId = null;
     currentDetail = null;
-    document.querySelector("#detail").innerHTML = '<div class="empty-state">Select a purchase order to review extracted fields and source text.</div>';
+    document.querySelector("#detail").innerHTML =
+      '<div class="empty-state branded-empty"><img src="/assets/brand/mascot-mountain-goat-default-240.png" alt="" aria-hidden="true" /><strong>Here&rsquo;s the smartest route.</strong><span>Select a purchase order to review extracted fields and source text.</span></div>';
   }
   await Promise.all([loadSummary(), loadPOs(), loadLogs()]);
 }
 
-function readFields(fields, prefix) {
+function readFields(fields, prefix, context = "") {
   const payload = {};
   for (const [key, , type = "text"] of fields) {
     if (type === "readonly" || type === "lineTotal") continue;
-    const value = document.querySelector(`#${prefix}_${key}`).value;
+    const value = document.querySelector(`#${scopedId(`${prefix}_${key}`, context)}`).value;
     payload[key] = type === "number" && value !== "" ? Number(value) : normalizeFieldValue(type, value);
   }
   return payload;
@@ -721,7 +919,7 @@ async function switchView(view) {
   admin.classList.toggle("hidden", view !== "admin");
   if (view === "admin") {
     await loadAdminData();
-    switchAdminTab(canManageUsers() ? "users" : activeAdminTab);
+    switchAdminTab(canViewAdminTab(activeAdminTab) ? activeAdminTab : firstAvailableAdminTab());
   } else if (view === "dashboard") {
     await refresh();
   }
@@ -729,41 +927,113 @@ async function switchView(view) {
 
 async function loadAdminData() {
   if (!canViewAdmin()) return;
-  const requests = [api("/api/order-types"), api("/api/customer-part-xrefs"), api("/api/customers"), api("/api/departments"), api("/api/payment-terms")];
-  requests.push(api("/api/products"));
-  if (canManageUsers()) requests.push(api("/api/users"));
-  const [orderTypeData, xrefData, customerData, departmentData, paymentTermData, productData, userData] = await Promise.all(requests);
+  const canViewCanonicalDiagnostics = canViewAdminTab("master") || canViewAdminTab("setup") || canViewAdminTab("erp");
+  const [
+    orderTypeData,
+    departmentData,
+    paymentTermData,
+    inboxData,
+    exportDestinationData,
+    xrefData,
+    customerData,
+    productData,
+    canonicalData,
+    userData,
+    reportingData,
+    oracleEbsData,
+  ] = await Promise.all([
+    canViewAdminTab("setup") ? safeApi("/api/order-types", []) : Promise.resolve([]),
+    canViewAdminTab("setup") ? safeApi("/api/departments", []) : Promise.resolve([]),
+    canViewAdminTab("setup") ? safeApi("/api/payment-terms", []) : Promise.resolve([]),
+    canViewAdminTab("setup") ? safeApi("/api/inbox-accounts", { accounts: [], sync_runs: [] }) : Promise.resolve({ accounts: [], sync_runs: [] }),
+    canViewAdminTab("setup") ? safeApi("/api/export-destinations", { destinations: [] }) : Promise.resolve({ destinations: [] }),
+    canViewAdminTab("master") ? safeApi("/api/customer-part-xrefs", []) : Promise.resolve([]),
+    canViewAdminTab("master") ? safeApi("/api/customers", []) : Promise.resolve([]),
+    canViewAdminTab("master") ? safeApi("/api/products", { products: [] }) : Promise.resolve({ products: [] }),
+    canViewCanonicalDiagnostics ? safeApi("/api/canonical-master-data", canonicalFallbackData()) : Promise.resolve(canonicalFallbackData()),
+    canViewUsers() ? safeApi("/api/users", []) : Promise.resolve([]),
+    canViewAdminTab("analytics") ? safeApi("/api/reporting/operations", {}) : Promise.resolve({}),
+    canViewAdminTab("erp") ? safeApi("/api/erp/oracle-ebs", { manifest: null, profile: null, mapping_summary: {} }) : Promise.resolve({ manifest: null, profile: null, mapping_summary: {} }),
+  ]);
   orderTypes = orderTypeData;
-  xrefs = xrefData;
-  customers = customerData;
   departments = departmentData;
   paymentTerms = paymentTermData;
+  inboxAccounts = inboxData.accounts || [];
+  inboxSyncRuns = inboxData.sync_runs || [];
+  exportDestinations = exportDestinationData.destinations || [];
+  xrefs = xrefData;
+  customers = customerData;
   products = productData.products || [];
-  users = userData || [];
-  document.querySelector("#usersPanel").classList.toggle("hidden", !canManageUsers());
-  document.querySelector("#adminTabUsersBtn").classList.toggle("hidden", !canManageUsers());
+  canonicalMasterData = canonicalData || canonicalFallbackData();
+  users = userData;
+  operationsMetrics = reportingData || {};
+  oracleEbsConfig = oracleEbsData || { manifest: null, profile: null, mapping_summary: {} };
+  configureAdminAccessUi();
   renderOrderTypes();
   renderXrefs();
   renderUsers();
   renderCustomers();
   renderProducts();
+  renderCanonicalMasterData();
+  renderSetupReferenceData();
   renderDepartments();
   renderPaymentTerms();
-  await loadTestingData();
+  renderInboxAccounts(inboxData.gmail_configured, inboxData.outlook_configured);
+  renderSyncRuns();
+  renderExportDestinations();
+  renderOperationsMetrics();
+  renderOracleEbsProfile();
+  renderErpDiagnostics();
+  if (canViewAdminTab("testing")) {
+    await loadTestingData();
+  } else {
+    testDocuments = [];
+    evaluationData = { run: null, results: [] };
+    inboxDetectionResults = [];
+    inboxMessageRecords = [];
+  }
+  applyAdminPaneReadonlyStates();
 }
 
 function switchAdminTab(tab) {
-  if (tab === "users" && !canManageUsers()) tab = "master";
+  if (!tab || !canViewAdminTab(tab)) tab = firstAvailableAdminTab();
+  if (!tab) return;
   activeAdminTab = tab;
-  const tabs = ["users", "master", "setup", "testing", "analytics"];
-  for (const name of tabs) {
+  for (const name of adminTabs) {
     document.querySelector(`#adminTab${capitalize(name)}`).classList.toggle("hidden", name !== tab);
     document.querySelector(`#adminTab${capitalize(name)}Btn`).classList.toggle("active-admin-tab", name === tab);
   }
+  applyAdminPaneReadonlyStates();
 }
 
 function capitalize(value) {
   return value.charAt(0).toUpperCase() + value.slice(1);
+}
+
+function configureAdminAccessUi() {
+  for (const tab of adminTabs) {
+    const canView = canViewAdminTab(tab);
+    document.querySelector(`#adminTab${capitalize(tab)}Btn`).classList.toggle("hidden", !canView);
+    if (!canView) document.querySelector(`#adminTab${capitalize(tab)}`).classList.add("hidden");
+  }
+  document.querySelector("#usersPanel").classList.toggle("hidden", !canViewUsers());
+}
+
+function applyAdminPaneReadonlyStates() {
+  for (const tab of adminTabs) {
+    const pane = document.querySelector(`#adminTab${capitalize(tab)}`);
+    if (!pane || !canViewAdminTab(tab)) continue;
+    const readonly = !canEditAdminTab(tab);
+    pane.classList.toggle("admin-view-only-pane", readonly);
+    if (!readonly) continue;
+    for (const control of pane.querySelectorAll("input, textarea, select, button")) {
+      if (control.type === "hidden") continue;
+      const label = (control.textContent || control.value || control.id || "").trim().toLowerCase();
+      const id = control.id || "";
+      const isReadAction = label.startsWith("download") || id.toLowerCase().includes("download");
+      control.disabled = !isReadAction;
+    }
+  }
 }
 
 function renderOrderTypes() {
@@ -801,39 +1071,32 @@ function renderDepartments() {
 }
 
 async function loadTestingData() {
-  if (!canViewAdmin()) return;
-  const [documentsData, evaluationsData, inboxData, gmailData, outlookData, openaiData, detectionData, learningData, reportingData] = await Promise.all([
+  if (!canViewAdminTab("testing")) return;
+  const [documentsData, evaluationsData, gmailData, outlookData, openaiData, detectionData, learningData] = await Promise.all([
     api("/api/testing/documents"),
     api("/api/testing/evaluations"),
-    api("/api/inbox-accounts"),
     api("/api/gmail-oauth-config"),
     api("/api/outlook-oauth-config"),
     api("/api/openai-extraction-config"),
     api("/api/inbox-detection-results"),
     api("/api/extraction-learning"),
-    api("/api/reporting/operations"),
   ]);
   testDocuments = documentsData.documents || [];
   evaluationData = evaluationsData.latest || { run: null, results: [] };
-  inboxAccounts = inboxData.accounts || [];
-  inboxSyncRuns = inboxData.sync_runs || [];
   gmailConfig = gmailData || {};
   outlookConfig = outlookData || {};
   openaiConfig = openaiData || {};
   inboxDetectionResults = detectionData.results || [];
   inboxMessageRecords = detectionData.messages || [];
   extractionLearning = learningData || extractionLearning;
-  operationsMetrics = reportingData || {};
   renderTestDocuments();
   renderEvaluation();
   renderOpenAIConfig();
   renderGmailConfig();
   renderOutlookConfig();
-  renderInboxAccounts(inboxData.gmail_configured, inboxData.outlook_configured);
-  renderSyncRuns();
   renderDetectionResults();
   renderExtractionLearning();
-  renderOperationsMetrics();
+  applyAdminPaneReadonlyStates();
 }
 
 function renderTestDocuments() {
@@ -867,7 +1130,7 @@ function testClassifications() {
 }
 
 async function uploadTestDocuments(fileList) {
-  if (!canViewAdmin() || !fileList?.length) return;
+  if (!canEditAdminTab("testing") || !fileList?.length) return;
   const form = new FormData();
   Array.from(fileList).forEach((file) => form.append("files", file));
   setMessage("#testingMessage", "Uploading test documents...");
@@ -884,6 +1147,7 @@ async function uploadTestDocuments(fileList) {
 }
 
 async function saveTestDocument(id) {
+  if (!canEditAdminTab("testing")) return;
   const payload = {
     document_type: document.querySelector(`#test_doc_type_${id}`).value,
     expected_classification: document.querySelector(`#test_expected_${id}`).value,
@@ -895,6 +1159,7 @@ async function saveTestDocument(id) {
 }
 
 async function deleteTestDocument(id) {
+  if (!canEditAdminTab("testing")) return;
   if (!confirm("Delete this test document?")) return;
   const data = await api(`/api/testing/documents/${id}`, { method: "DELETE" });
   testDocuments = data.documents || [];
@@ -956,6 +1221,7 @@ function lineRateText(lines) {
 }
 
 async function runEvaluation() {
+  if (!canEditAdminTab("testing")) return;
   setMessage("#testingMessage", "Running extraction evaluation...");
   const data = await api("/api/testing/evaluations/run", { method: "POST", body: JSON.stringify({ extraction_mode: document.querySelector("#evaluationMode").value }) });
   if (data.error) {
@@ -975,6 +1241,7 @@ function renderOpenAIConfig() {
     ${metric("API Key", openaiConfig.api_key_configured ? "Configured" : "Not configured")}
     ${metric("Model", safe(savedModel))}
     ${metric("AI Extraction", openaiConfig.use_ai_extraction ? "On" : "Off")}
+    ${metric("Secret Storage", safe(openaiConfig.encrypted_storage || ""))}
   `;
   document.querySelector("#openaiModel").innerHTML = options
     .map((model) => `<option value="${safe(model)}" ${model === savedModel ? "selected" : ""}>${openAIModelOptions.includes(model) ? safe(model) : `Current: ${safe(model)}`}</option>`)
@@ -984,6 +1251,7 @@ function renderOpenAIConfig() {
 }
 
 async function loadExtractionLearning() {
+  if (!canViewAdminTab("testing")) return;
   const customer = encodeURIComponent(document.querySelector("#learningCustomerFilter").value.trim());
   const field = encodeURIComponent(document.querySelector("#learningFieldFilter").value.trim());
   extractionLearning = await api(`/api/extraction-learning?customer=${customer}&field=${field}`);
@@ -1047,6 +1315,27 @@ function renderPaymentTerms() {
     .join("");
 }
 
+function renderExportDestinations() {
+  const target = document.querySelector("#exportDestinationRows");
+  if (!target) return;
+  target.innerHTML = (exportDestinations || [])
+    .map(
+      (row) => `
+      <tr>
+        <td>${safe(row.name)}</td>
+        <td>${safe(row.destination_type)}</td>
+        <td>${safe(row.endpoint_url)}</td>
+        <td>${row.secret_configured ? "Configured" : "Not set"}</td>
+        <td>${row.is_active ? "Active" : "Inactive"}</td>
+        <td>
+          <button class="danger table-action" onclick="deactivateExportDestination(${row.id})">Deactivate</button>
+        </td>
+      </tr>
+    `,
+    )
+    .join("");
+}
+
 function renderProducts() {
   const target = document.querySelector("#productRows");
   if (!target) return;
@@ -1067,6 +1356,238 @@ function renderProducts() {
     `,
     )
     .join("");
+}
+
+function renderCanonicalMasterData() {
+  const rows = document.querySelector("#canonicalMasterDataRows");
+  if (!rows) return;
+  const counts = canonicalGroupRows("master_bridge", [
+    "trading_partner",
+    "trading_partner_account",
+    "trading_partner_site",
+    "partner_role_assignment",
+    "product",
+    "product_org_attributes",
+    "customer_product_alias",
+  ]);
+  rows.innerHTML = counts.length
+    ? counts
+        .map(
+          (row) => `
+      <tr>
+        <td>${safe(row.label || row.table)}</td>
+        <td>${row.count || 0}</td>
+      </tr>
+    `,
+        )
+        .join("")
+    : '<tr><td colspan="2">Master data bridge records are not available yet.</td></tr>';
+  const bridge = canonicalMasterData.bridge_counts || {};
+  const bridgeLabels = {
+    customers_to_accounts: "Customers to accounts",
+    addresses_to_sites: "Addresses to sites",
+    xrefs_to_aliases: "Xrefs to aliases",
+    products_to_canonical: "Products to canonical products",
+  };
+  document.querySelector("#canonicalBridgeRows").innerHTML = Object.keys(bridgeLabels)
+    .map((key) => `<span class="mini-pill">${bridgeLabels[key]}: ${bridge[key] || 0}</span>`)
+    .join("");
+  const aliases = canonicalMasterData.samples?.aliases || [];
+  document.querySelector("#canonicalAliasRows").innerHTML = aliases.length
+    ? aliases
+        .map((row) => `<span class="mini-pill">${safe(row.account_name)}: ${safe(row.customer_product_number)} -> ${safe(row.product_number)}</span>`)
+        .join("")
+    : '<div class="muted-panel">No canonical aliases yet.</div>';
+}
+
+function canonicalGroupRows(groupName, fallbackTables = []) {
+  const grouped = canonicalMasterData.groups?.[groupName];
+  if (Array.isArray(grouped) && grouped.length) return grouped;
+  const fallbackSet = new Set(fallbackTables);
+  return (canonicalMasterData.counts || []).filter((row) => fallbackSet.has(row.table));
+}
+
+function renderSetupReferenceData() {
+  const rows = document.querySelector("#setupReferenceRows");
+  if (!rows) return;
+  const counts = canonicalGroupRows("setup_reference", [
+    "organization_unit",
+    "selling_context",
+    "fulfillment_location",
+    "unit_of_measure",
+    "uom_alias",
+    "uom_conversion",
+    "currency",
+    "payment_terms",
+    "shipping_terms",
+    "freight_terms",
+    "delivery_method",
+    "price_reference",
+    "order_document_type",
+    "line_document_type",
+  ]);
+  rows.innerHTML = counts.length
+    ? counts
+        .map(
+          (row) => `
+      <tr>
+        <td>${safe(row.label || row.table)}</td>
+        <td>${row.count || 0}</td>
+      </tr>
+    `,
+        )
+        .join("")
+    : '<tr><td colspan="2">ERP reference data is not available yet.</td></tr>';
+  const samples = canonicalMasterData.samples?.setup_references || [];
+  const setupBridgeCount = canonicalMasterData.bridge_counts?.order_types_to_document_types || 0;
+  const sampleTarget = document.querySelector("#setupReferenceSamples");
+  if (!sampleTarget) return;
+  const sampleHtml = samples
+    .map((row) => `<span class="mini-pill">${safe(row.surface)}: ${safe(row.display_name)}${row.detail ? ` (${safe(row.detail)})` : ""}</span>`)
+    .join("");
+  const bridgeHtml = `<span class="mini-pill">Order types to document types: ${setupBridgeCount}</span>`;
+  sampleTarget.innerHTML = samples.length || setupBridgeCount
+    ? `${bridgeHtml}${sampleHtml}`
+    : '<div class="muted-panel">No ERP reference values have been synced or backfilled yet.</div>';
+}
+
+function renderErpDiagnostics() {
+  const rows = document.querySelector("#erpDiagnosticRows");
+  if (!rows) return;
+  const counts = canonicalGroupRows("erp_diagnostics", [
+    "erp_system",
+    "erp_profile",
+    "custom_field_definition",
+    "custom_field_value",
+    "external_id_map",
+    "validation_rule",
+  ]);
+  rows.innerHTML = counts.length
+    ? counts
+        .map(
+          (row) => `
+      <tr>
+        <td>${safe(row.label || row.table)}</td>
+        <td>${row.count || 0}</td>
+      </tr>
+    `,
+        )
+        .join("")
+    : '<tr><td colspan="2">ERP diagnostics are not available yet.</td></tr>';
+  const maps = canonicalMasterData.samples?.external_id_maps || [];
+  const mapTarget = document.querySelector("#erpExternalMapSamples");
+  if (!mapTarget) return;
+  mapTarget.innerHTML = maps.length
+    ? maps
+        .map((row) => `<span class="mini-pill">${safe(row.canonical_entity_type)} ${safe(row.canonical_entity_id)} -> ${safe(row.external_entity_type)} ${safe(row.external_id || row.external_code)}</span>`)
+        .join("")
+    : '<div class="muted-panel">No external ID maps yet.</div>';
+}
+
+async function refreshCanonicalBackfill() {
+  if (!canEditAdminTab("master")) return;
+  const button = document.querySelector("#canonicalBackfillBtn");
+  button.disabled = true;
+  setMessage("#canonicalMasterDataMessage", "Refreshing canonical backfill...");
+  try {
+    canonicalMasterData = await api("/api/canonical-master-data/backfill", { method: "POST", body: JSON.stringify({}) });
+    const created = Object.values(canonicalMasterData.backfill || {}).reduce((total, value) => total + Number(value || 0), 0);
+    renderCanonicalMasterData();
+    renderSetupReferenceData();
+    renderErpDiagnostics();
+    setMessage("#canonicalMasterDataMessage", `Canonical backfill refreshed. ${created} new bridge records created.`, "success");
+  } catch (error) {
+    setMessage("#canonicalMasterDataMessage", error.message || "Canonical backfill failed.", "error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function setControlValue(id, value) {
+  const el = document.querySelector(`#${id}`);
+  if (el) el.value = value ?? "";
+}
+
+function renderOracleEbsProfile() {
+  const status = document.querySelector("#oracleEbsStatus");
+  if (!status) return;
+  const profile = oracleEbsConfig.profile || {};
+  const settings = profile.settings || {};
+  const system = profile.system || {};
+  setControlValue("oracleSystemName", system.system_name || "Oracle EBS");
+  setControlValue("oracleEnvironment", system.environment || "sandbox");
+  setControlValue("oracleConnectionMode", system.connection_mode || "api");
+  setControlValue("oracleWriteMode", profile.write_mode || "preview");
+  document.querySelector("#oracleActiveFlag").checked = profile.active_flag !== false;
+  setControlValue("oracleUserId", settings.user_id);
+  setControlValue("oracleResponsibilityId", settings.responsibility_id);
+  setControlValue("oracleRespApplicationId", settings.resp_application_id);
+  setControlValue("oracleSecurityGroupId", settings.security_group_id);
+  setControlValue("oracleOrgId", settings.org_id);
+  setControlValue("oracleNlsLanguage", settings.nls_language || "AMERICAN");
+  setControlValue("oracleOrderSourceId", settings.order_source_id);
+  setControlValue("oracleOrderTypeId", settings.order_type_id);
+  setControlValue("oracleLineTypeId", settings.line_type_id);
+  setControlValue("oraclePriceReferenceId", settings.price_reference_id);
+  setControlValue("oracleFulfillmentOrgId", settings.fulfillment_org_id);
+  setControlValue("oracleEndpointUrl", settings.endpoint_url);
+  setControlValue("oracleCredentialReference", settings.credential_reference);
+  setControlValue("oracleApiUsername", settings.api_username);
+  setControlValue("oracleApiPassword", "");
+  const manifest = oracleEbsConfig.manifest || {};
+  status.innerHTML = `
+    ${metric("Adapter", manifest.adapter_code || "oracle_ebs_order_entry")}
+    ${metric("Profile", profile.id ? "Configured" : "Not Configured")}
+    ${metric("Mode", profile.write_mode || "preview")}
+    ${metric("Secret", profile.secret_configured ? "Configured" : "Not Set")}
+  `;
+  document.querySelector("#oracleManifestSummary").innerHTML = `
+    ${metric("ERP Family", manifest.erp_family || "oracle_ebs")}
+    ${metric("Transaction", manifest.supported_transaction || "entered_sales_order")}
+    ${metric("Context Fields", (manifest.required_context_fields || []).length)}
+    ${metric("Capabilities", (manifest.capabilities || []).length)}
+  `;
+  const mappings = oracleEbsConfig.mapping_summary || {};
+  document.querySelector("#oracleMappingSummary").innerHTML = Object.keys(mappings).length
+    ? Object.keys(mappings)
+        .sort()
+        .map((key) => `<span class="mini-pill">${safe(key)}: ${mappings[key]}</span>`)
+        .join("")
+    : '<div class="muted-panel">No Oracle external ID mappings yet.</div>';
+}
+
+async function saveOracleEbsProfile() {
+  if (!canEditAdminTab("erp")) return;
+  const payload = {
+    system_name: document.querySelector("#oracleSystemName").value.trim(),
+    environment: document.querySelector("#oracleEnvironment").value,
+    connection_mode: document.querySelector("#oracleConnectionMode").value,
+    write_mode: document.querySelector("#oracleWriteMode").value,
+    active_flag: document.querySelector("#oracleActiveFlag").checked,
+    user_id: document.querySelector("#oracleUserId").value.trim(),
+    responsibility_id: document.querySelector("#oracleResponsibilityId").value.trim(),
+    resp_application_id: document.querySelector("#oracleRespApplicationId").value.trim(),
+    security_group_id: document.querySelector("#oracleSecurityGroupId").value.trim(),
+    org_id: document.querySelector("#oracleOrgId").value.trim(),
+    nls_language: document.querySelector("#oracleNlsLanguage").value.trim(),
+    order_source_id: document.querySelector("#oracleOrderSourceId").value.trim(),
+    order_type_id: document.querySelector("#oracleOrderTypeId").value.trim(),
+    line_type_id: document.querySelector("#oracleLineTypeId").value.trim(),
+    price_reference_id: document.querySelector("#oraclePriceReferenceId").value.trim(),
+    fulfillment_org_id: document.querySelector("#oracleFulfillmentOrgId").value.trim(),
+    endpoint_url: document.querySelector("#oracleEndpointUrl").value.trim(),
+    credential_reference: document.querySelector("#oracleCredentialReference").value.trim(),
+    api_username: document.querySelector("#oracleApiUsername").value.trim(),
+    api_password: document.querySelector("#oracleApiPassword").value,
+  };
+  const data = await api("/api/erp/oracle-ebs", { method: "POST", body: JSON.stringify(payload) });
+  if (data.error) {
+    setMessage("#oracleEbsMessage", data.error, "error");
+    return;
+  }
+  oracleEbsConfig = data;
+  renderOracleEbsProfile();
+  setMessage("#oracleEbsMessage", data.profile?.secret_configured ? "Oracle EBS profile saved. Secret is configured." : "Oracle EBS profile saved. No password secret is configured.", data.profile?.secret_configured ? "success" : "");
 }
 
 async function loadReviewTasks() {
@@ -1177,7 +1698,7 @@ function renderOperationsMetrics() {
 }
 
 async function refreshOperationsMetrics() {
-  if (!canViewAdmin()) return;
+  if (!canViewAdminTab("analytics")) return;
   const button = document.querySelector("#refreshOperationsBtn");
   button.disabled = true;
   button.textContent = "Refreshing...";
@@ -1197,6 +1718,7 @@ async function refreshOperationsMetrics() {
 function renderInboxAccounts(gmailConfigured = false, outlookConfigured = false) {
   document.querySelector("#connectGmailBtn").title = gmailConfigured ? "Start Gmail OAuth" : "Set Gmail config first";
   document.querySelector("#connectOutlookBtn").title = outlookConfigured ? "Start Outlook OAuth" : "Set Outlook config first";
+  const canEditSetup = canEditAdminTab("setup");
   document.querySelector("#inboxAccountRows").innerHTML = inboxAccounts
     .map(
       (row) => `
@@ -1209,11 +1731,17 @@ function renderInboxAccounts(gmailConfigured = false, outlookConfigured = false)
         <td>${inboxHealthBadge(row)}</td>
         <td>${safe(row.last_sync_at)}</td>
         <td>
-          <button class="secondary table-action" onclick="openInboxConfig(${row.id})">Configure</button>
-          <button class="secondary table-action" onclick="saveInboxAccount(${row.id})">Save</button>
-          <button class="secondary table-action" onclick="toggleInboxAccount(${row.id}, ${row.is_enabled ? "false" : "true"})">${row.is_enabled ? "Deactivate" : "Activate"}</button>
-          <button class="secondary table-action" onclick="syncInboxAccount(${row.id})" ${row.is_enabled ? "" : "disabled"}>Sync Now</button>
-          <button class="danger table-action" onclick="deleteInboxAccount(${row.id})">Delete</button>
+          ${
+            canEditSetup
+              ? `
+            <button class="secondary table-action" onclick="openInboxConfig(${row.id})">Configure</button>
+            <button class="secondary table-action" onclick="saveInboxAccount(${row.id})">Save</button>
+            <button class="secondary table-action" onclick="toggleInboxAccount(${row.id}, ${row.is_enabled ? "false" : "true"})">${row.is_enabled ? "Deactivate" : "Activate"}</button>
+            <button class="secondary table-action" onclick="syncInboxAccount(${row.id})" ${row.is_enabled ? "" : "disabled"}>Sync Now</button>
+            <button class="danger table-action" onclick="deleteInboxAccount(${row.id})">Delete</button>
+          `
+              : '<span class="view-only-note">View Only</span>'
+          }
         </td>
       </tr>
     `,
@@ -1275,7 +1803,7 @@ function renderDetectionResults() {
         <td>${row.duplicate_skipped ? "Yes" : "No"}</td>
         <td>${row.purchase_order_id ? safe(row.purchase_order_id) : ""}</td>
         <td>${row.processing_latency_ms || ""} ms</td>
-        <td>${safe(row.error_message)} ${row.inbox_message_record_id && canViewAdmin() ? `<button class="secondary table-action" onclick="retryInboxMessage(${row.inbox_message_record_id})">Retry</button>` : ""}</td>
+        <td>${safe(row.error_message)} ${row.inbox_message_record_id && canEditAdminTab("testing") ? `<button class="secondary table-action" onclick="retryInboxMessage(${row.inbox_message_record_id})">Retry</button>` : ""}</td>
       </tr>
     `,
     )
@@ -1283,7 +1811,7 @@ function renderDetectionResults() {
 }
 
 async function retryInboxMessage(recordId) {
-  if (!canViewAdmin()) return;
+  if (!canEditAdminTab("testing")) return;
   setMessage("#testingMessage", "Retrying inbox message...");
   const data = await api(`/api/inbox-message-records/${recordId}/retry`, { method: "POST", body: "{}" });
   inboxAccounts = data.accounts || [];
@@ -1298,6 +1826,7 @@ async function retryInboxMessage(recordId) {
 }
 
 async function addInboxAccount() {
+  if (!canEditAdminTab("setup")) return;
   const payload = {
     provider: "gmail",
     display_name: document.querySelector("#inboxDisplayName").value.trim() || "Gmail Test Inbox",
@@ -1308,29 +1837,33 @@ async function addInboxAccount() {
   const data = await api("/api/inbox-accounts", { method: "POST", body: JSON.stringify(payload) });
   inboxAccounts = data.accounts || [];
   inboxSyncRuns = data.sync_runs || [];
+  setMessage("#inboxSetupMessage", "Inbox account added.", "success");
   renderInboxAccounts(data.gmail_configured, data.outlook_configured);
   renderSyncRuns();
 }
 
 async function connectGmail() {
+  if (!canEditAdminTab("setup")) return;
   const data = await api("/api/inbox-accounts/gmail/connect", { method: "POST", body: "{}" });
   if (data.error) {
-    setMessage("#testingMessage", data.error, "error");
+    setMessage("#inboxSetupMessage", data.error, "error");
     return;
   }
   if (data.auth_url) window.open(data.auth_url, "_blank");
 }
 
 async function connectOutlook() {
+  if (!canEditAdminTab("setup")) return;
   const data = await api("/api/inbox-accounts/outlook/connect", { method: "POST", body: "{}" });
   if (data.error) {
-    setMessage("#testingMessage", data.error, "error");
+    setMessage("#inboxSetupMessage", data.error, "error");
     return;
   }
   if (data.auth_url) window.open(data.auth_url, "_blank");
 }
 
 async function saveInboxAccount(id) {
+  if (!canEditAdminTab("setup")) return;
   const existing = inboxAccounts.find((row) => Number(row.id) === Number(id)) || {};
   const payload = {
     display_name: document.querySelector(`#inbox_name_${id}`).value.trim(),
@@ -1343,10 +1876,12 @@ async function saveInboxAccount(id) {
   };
   const data = await api(`/api/inbox-accounts/${id}`, { method: "PUT", body: JSON.stringify(payload) });
   inboxAccounts = data.accounts || [];
+  setMessage("#inboxSetupMessage", "Inbox account saved.", "success");
   renderInboxAccounts(data.gmail_configured, data.outlook_configured);
 }
 
 async function toggleInboxAccount(id, enabled) {
+  if (!canEditAdminTab("setup")) return;
   const row = inboxAccounts.find((item) => Number(item.id) === Number(id));
   if (!row) return;
   const payload = {
@@ -1360,15 +1895,17 @@ async function toggleInboxAccount(id, enabled) {
   };
   const data = await api(`/api/inbox-accounts/${id}`, { method: "PUT", body: JSON.stringify(payload) });
   inboxAccounts = data.accounts || [];
+  setMessage("#inboxSetupMessage", "Inbox account updated.", "success");
   renderInboxAccounts(data.gmail_configured, data.outlook_configured);
 }
 
 async function openInboxConfig(id) {
+  if (!canViewAdminTab("setup")) return;
   configuringInboxId = id;
   setMessage("#inboxConfigMessage", "");
   const data = await api(`/api/inbox-accounts/${id}/config`);
   if (data.error) {
-    setMessage("#testingMessage", data.error, "error");
+    setMessage("#inboxSetupMessage", data.error, "error");
     return;
   }
   currentInboxConfig = data;
@@ -1418,6 +1955,7 @@ function renderInboxConfig() {
 }
 
 async function refreshInboxLabels() {
+  if (!canEditAdminTab("setup")) return;
   if (!configuringInboxId) return;
   const account = currentInboxConfig?.account || {};
   const noun = account.provider === "outlook" ? "folders" : "labels";
@@ -1433,6 +1971,7 @@ async function refreshInboxLabels() {
 }
 
 async function saveInboxConfig() {
+  if (!canEditAdminTab("setup")) return;
   if (!configuringInboxId) return;
   const interval = Number(document.querySelector("#configSyncInterval").value || 24);
   if (!Number.isFinite(interval) || interval < 1) {
@@ -1458,10 +1997,11 @@ async function saveInboxConfig() {
   currentInboxConfig = data;
   setMessage("#inboxConfigMessage", "Configuration saved.", "success");
   renderInboxConfig();
-  await loadTestingData();
+  await loadAdminData();
 }
 
 async function saveGmailConfig() {
+  if (!canEditAdminTab("testing")) return;
   const payload = {
     client_id: document.querySelector("#gmailClientId").value.trim(),
     client_secret: document.querySelector("#gmailClientSecret").value.trim(),
@@ -1477,6 +2017,7 @@ async function saveGmailConfig() {
 }
 
 async function saveOutlookConfig() {
+  if (!canEditAdminTab("testing")) return;
   const payload = {
     client_id: document.querySelector("#outlookClientId").value.trim(),
     client_secret: document.querySelector("#outlookClientSecret").value.trim(),
@@ -1493,6 +2034,7 @@ async function saveOutlookConfig() {
 }
 
 async function saveOpenAIConfig() {
+  if (!canEditAdminTab("testing")) return;
   const payload = {
     api_key: document.querySelector("#openaiApiKey").value.trim(),
     model: document.querySelector("#openaiModel").value.trim(),
@@ -1514,6 +2056,7 @@ async function syncInboxAccount(id) {
 }
 
 function openManualSyncModal(id) {
+  if (!canEditAdminTab("setup")) return;
   manualSyncInboxId = id;
   const account = inboxAccounts.find((row) => Number(row.id) === Number(id)) || {};
   const end = new Date();
@@ -1586,15 +2129,15 @@ async function deleteInboxAccount(id) {
 }
 
 function renderXrefs() {
+  renderXrefCustomerOptions();
   document.querySelector("#xrefRows").innerHTML = xrefs
     .map(
       (row) => `
       <tr>
-        <td><input id="xref_customer_${row.id}" value="${safe(row.customer_name)}" /></td>
+        <td><input id="xref_customer_${row.id}" list="xrefCustomerOptions" value="${safe(row.customer_name)}" /></td>
         <td><input id="xref_customer_part_${row.id}" value="${safe(row.customer_part_number)}" /></td>
         <td><input id="xref_customer_rev_${row.id}" value="${safe(row.customer_part_revision)}" /></td>
         <td><input id="xref_internal_part_${row.id}" value="${safe(row.internal_part_number)}" /></td>
-        <td><input id="xref_internal_rev_${row.id}" value="${safe(row.internal_part_revision)}" /></td>
         <td>
           <button class="secondary" onclick="saveXref(${row.id})">Save</button>
           <button class="danger" onclick="deleteXref(${row.id})">Delete</button>
@@ -1602,6 +2145,15 @@ function renderXrefs() {
       </tr>
     `,
     )
+    .join("");
+}
+
+function renderXrefCustomerOptions() {
+  document.querySelector("#xrefCustomerOptions").innerHTML = customers
+    .map((customer) => customer.customer_name)
+    .filter(Boolean)
+    .sort((a, b) => a.localeCompare(b))
+    .map((name) => `<option value="${safe(name)}"></option>`)
     .join("");
 }
 
@@ -1669,6 +2221,7 @@ function renderCustomerPaymentTermOptions(selectedId = null, fallbackText = "") 
 }
 
 async function saveCustomer() {
+  if (!canEditAdminTab("master")) return;
   const payload = {
     customer_name: document.querySelector("#customerName").value.trim(),
     customer_number: document.querySelector("#customerNumber").value.trim(),
@@ -1696,6 +2249,7 @@ async function saveCustomer() {
 }
 
 async function deleteCustomer() {
+  if (!canEditAdminTab("master")) return;
   if (!editingCustomerId) return;
   if (!confirm("Delete this customer profile?")) return;
   await api(`/api/customers/${editingCustomerId}`, { method: "DELETE" });
@@ -1740,10 +2294,12 @@ function renderCustomerChildren() {
 }
 
 async function addAddress() {
+  if (!canEditAdminTab("master")) return;
   openAddressModal();
 }
 
 function openAddressModal(id = null, prefill = {}) {
+  if (!canEditAdminTab("master")) return;
   if (!editingCustomerId) {
     setMessage("#customerModalMessage", "Save the customer before adding addresses.", "error");
     return;
@@ -1772,6 +2328,7 @@ function closeAddressModal() {
 }
 
 async function saveAddressModal() {
+  if (!canEditAdminTab("master")) return;
   if (!editingCustomerId) {
     setMessage("#addressModalMessage", "Save the customer before adding addresses.", "error");
     return;
@@ -1791,6 +2348,7 @@ async function saveAddressModal() {
 }
 
 async function deleteAddress(id) {
+  if (!canEditAdminTab("master")) return;
   if (!confirm("Delete this address?")) return;
   currentCustomerDetail = await api(`/api/customer-addresses/${id}`, { method: "DELETE" });
   renderCustomerChildren();
@@ -1842,6 +2400,7 @@ function newestId(rows) {
 }
 
 function openContactModal(id = null, prefill = {}) {
+  if (!canEditAdminTab("master")) return;
   if (!editingCustomerId) {
     setMessage("#customerModalMessage", "Save the customer before adding contacts.", "error");
     return;
@@ -1865,6 +2424,7 @@ function closeContactModal() {
 }
 
 async function saveContactModal() {
+  if (!canEditAdminTab("master")) return;
   const payload = {
     first_name: document.querySelector("#modalContactFirstName").value.trim(),
     last_name: document.querySelector("#modalContactLastName").value.trim(),
@@ -1886,6 +2446,7 @@ async function saveContactModal() {
 }
 
 async function deleteContactModal() {
+  if (!canEditAdminTab("master")) return;
   if (!editingContactId) return;
   currentCustomerDetail = await api(`/api/customer-contacts/${editingContactId}`, { method: "DELETE" });
   closeContactModal();
@@ -1922,6 +2483,7 @@ function closeGoldenModal() {
 }
 
 async function saveGoldenHeader() {
+  if (!canEditAdminTab("testing")) return;
   if (!editingGoldenDocumentId) return;
   const payload = {
     expected_is_po: document.querySelector("#goldenExpectedIsPo").checked,
@@ -1966,6 +2528,7 @@ function renderGoldenLines() {
 }
 
 async function addGoldenLine() {
+  if (!canEditAdminTab("testing")) return;
   if (!currentGoldenAnswer?.header?.id) {
     await saveGoldenHeader();
   }
@@ -1988,6 +2551,7 @@ async function addGoldenLine() {
 }
 
 async function deleteGoldenLine(id) {
+  if (!canEditAdminTab("testing")) return;
   currentGoldenAnswer = await api(`/api/testing/golden-lines/${id}`, { method: "DELETE" });
   renderGoldenLines();
 }
@@ -1999,7 +2563,10 @@ function clearGoldenLineForm() {
 }
 
 function renderUsers() {
-  if (!canManageUsers()) return;
+  if (!canViewUsers()) {
+    document.querySelector("#userRows").innerHTML = "";
+    return;
+  }
   document.querySelector("#userRows").innerHTML = users
     .map(
       (row) => `
@@ -2009,13 +2576,12 @@ function renderUsers() {
         <td>${safe(row.job_title)}</td>
         <td>${safe(row.email)}</td>
         <td>${row.is_active ? "Active" : "Inactive"}</td>
-        <td>${row.is_admin ? "Yes" : "No"}</td>
-        <td>${row.can_access_admin ? "Yes" : "No"}</td>
+        <td>${userAdminAccessLabel(row)}</td>
         <td>${row.can_access_po_dashboard ? "Yes" : "No"}</td>
         <td>${accessLabel(row.po_dashboard_access_level)}</td>
         <td>${safe(row.created_at)}</td>
         <td>
-          <button class="secondary" onclick="openUserModal(${row.id})">Edit</button>
+          ${canManageUsers() ? `<button class="secondary" onclick="openUserModal(${row.id})">Edit</button>` : '<span class="view-only-note">View Only</span>'}
         </td>
       </tr>
     `,
@@ -2030,6 +2596,7 @@ async function inviteUser() {
     last_name: document.querySelector("#inviteLastName").value.trim(),
     job_title: document.querySelector("#inviteJobTitle").value.trim(),
     email: document.querySelector("#inviteEmail").value.trim(),
+    password: document.querySelector("#invitePassword").value.trim(),
     can_access_po_dashboard: true,
     po_dashboard_access_level: "view_only",
   };
@@ -2047,7 +2614,8 @@ async function inviteUser() {
   document.querySelector("#inviteLastName").value = "";
   document.querySelector("#inviteJobTitle").value = "";
   document.querySelector("#inviteEmail").value = "";
-  setMessage("#usersMessage", "User invited.", "success");
+  document.querySelector("#invitePassword").value = "";
+  setMessage("#usersMessage", data.temporary_password ? `User invited. Temporary password: ${data.temporary_password}` : "User invited.", "success");
   renderUsers();
 }
 
@@ -2055,7 +2623,53 @@ function accessLabel(value) {
   return value === "view_only" ? "View Only" : value === "edit" ? "Edit" : "None";
 }
 
+function userAdminAccessLabel(user) {
+  if (user.is_admin) return "Full Admin";
+  if (!user.can_access_admin) return "No";
+  const permissions = user.admin_tab_permissions || {};
+  const active = adminTabs.filter((tab) => permissions[tab] && permissions[tab] !== "no_access");
+  return active.length ? `Selected (${active.length})` : "Selected";
+}
+
+function defaultAdminPermissionValue(user, tab) {
+  if (user?.is_admin) return "full_access";
+  const permissions = user?.admin_tab_permissions || {};
+  if (permissions[tab]) return permissions[tab];
+  return user?.can_access_admin && tab !== "users" ? "full_access" : "no_access";
+}
+
+function setAdminPermissionForm(user) {
+  for (const tab of adminTabs) {
+    const select = document.querySelector(`#${adminPermissionSelectIds[tab]}`);
+    select.value = defaultAdminPermissionValue(user, tab);
+  }
+  updateAdminPermissionMenu();
+}
+
+function readAdminPermissionForm() {
+  const permissions = {};
+  for (const tab of adminTabs) {
+    permissions[tab] = document.querySelector(`#${adminPermissionSelectIds[tab]}`).value;
+  }
+  return permissions;
+}
+
+function updateAdminPermissionMenu() {
+  const fullAdmin = document.querySelector("#editUserAdmin").checked;
+  const selectAdmin = document.querySelector("#editUserAdminAccess");
+  if (fullAdmin) selectAdmin.checked = true;
+  selectAdmin.disabled = fullAdmin;
+  const showMenu = selectAdmin.checked && !fullAdmin;
+  document.querySelector("#adminPermissionMenu").classList.toggle("hidden", !showMenu);
+  for (const tab of adminTabs) {
+    const select = document.querySelector(`#${adminPermissionSelectIds[tab]}`);
+    if (fullAdmin) select.value = "full_access";
+    select.disabled = fullAdmin || !selectAdmin.checked;
+  }
+}
+
 function openUserModal(id) {
+  if (!canManageUsers()) return;
   const user = users.find((row) => Number(row.id) === Number(id));
   if (!user) return;
   editingUserId = id;
@@ -2068,6 +2682,8 @@ function openUserModal(id) {
   document.querySelector("#editUserAdminAccess").checked = Boolean(user.can_access_admin);
   document.querySelector("#editUserDashboardAccess").checked = Boolean(user.can_access_po_dashboard);
   document.querySelector("#editUserPoLevel").value = user.po_dashboard_access_level || "none";
+  document.querySelector("#editUserPassword").value = "";
+  setAdminPermissionForm(user);
   setMessage("#userModalMessage", "");
   document.querySelector("#userModal").classList.remove("hidden");
 }
@@ -2089,6 +2705,8 @@ async function saveUser(id = editingUserId) {
     can_access_admin: document.querySelector("#editUserAdminAccess").checked,
     can_access_po_dashboard: document.querySelector("#editUserDashboardAccess").checked,
     po_dashboard_access_level: document.querySelector("#editUserPoLevel").value,
+    admin_tab_permissions: readAdminPermissionForm(),
+    new_password: document.querySelector("#editUserPassword").value.trim(),
   };
   const data = await api(`/api/users/${id}`, { method: "PUT", body: JSON.stringify(payload) });
   if (data.error) {
@@ -2119,7 +2737,7 @@ async function deactivateUser(id = editingUserId) {
 }
 
 async function addOrderType() {
-  if (!canViewAdmin()) return;
+  if (!canEditAdminTab("setup")) return;
   const input = document.querySelector("#orderTypeName");
   if (!input.value.trim()) return;
   const data = await api("/api/order-types", { method: "POST", body: JSON.stringify({ name: input.value.trim() }) });
@@ -2129,7 +2747,7 @@ async function addOrderType() {
 }
 
 async function saveOrderType(id) {
-  if (!canViewAdmin()) return;
+  if (!canEditAdminTab("setup")) return;
   const name = document.querySelector(`#order_type_name_${id}`).value.trim();
   const data = await api(`/api/order-types/${id}`, { method: "PUT", body: JSON.stringify({ name, is_active: true }) });
   orderTypes = data.order_types;
@@ -2137,7 +2755,7 @@ async function saveOrderType(id) {
 }
 
 async function deleteOrderType(id) {
-  if (!canViewAdmin()) return;
+  if (!canEditAdminTab("setup")) return;
   const data = await api(`/api/order-types/${id}`, { method: "DELETE" });
   orderTypes = data.order_types;
   if (data.message) {
@@ -2147,7 +2765,7 @@ async function deleteOrderType(id) {
 }
 
 async function addDepartment() {
-  if (!canViewAdmin()) return;
+  if (!canEditAdminTab("setup")) return;
   const input = document.querySelector("#departmentName");
   if (!input.value.trim()) return;
   const data = await api("/api/departments", { method: "POST", body: JSON.stringify({ name: input.value.trim() }) });
@@ -2157,7 +2775,7 @@ async function addDepartment() {
 }
 
 async function saveDepartment(id) {
-  if (!canViewAdmin()) return;
+  if (!canEditAdminTab("setup")) return;
   const name = document.querySelector(`#department_name_${id}`).value.trim();
   const data = await api(`/api/departments/${id}`, { method: "PUT", body: JSON.stringify({ name, is_active: true }) });
   departments = data.departments;
@@ -2165,14 +2783,14 @@ async function saveDepartment(id) {
 }
 
 async function deleteDepartment(id) {
-  if (!canViewAdmin()) return;
+  if (!canEditAdminTab("setup")) return;
   const data = await api(`/api/departments/${id}`, { method: "DELETE" });
   departments = data.departments;
   renderDepartments();
 }
 
 async function addPaymentTerm() {
-  if (!canViewAdmin()) return;
+  if (!canEditAdminTab("setup")) return;
   const input = document.querySelector("#paymentTermName");
   if (!input.value.trim()) return;
   const data = await api("/api/payment-terms", { method: "POST", body: JSON.stringify({ name: input.value.trim() }) });
@@ -2182,7 +2800,7 @@ async function addPaymentTerm() {
 }
 
 async function savePaymentTerm(id) {
-  if (!canViewAdmin()) return;
+  if (!canEditAdminTab("setup")) return;
   const name = document.querySelector(`#payment_term_name_${id}`).value.trim();
   const data = await api(`/api/payment-terms/${id}`, { method: "PUT", body: JSON.stringify({ name, is_active: true }) });
   paymentTerms = data.payment_terms || [];
@@ -2190,21 +2808,54 @@ async function savePaymentTerm(id) {
 }
 
 async function deletePaymentTerm(id) {
-  if (!canViewAdmin()) return;
+  if (!canEditAdminTab("setup")) return;
   const data = await api(`/api/payment-terms/${id}`, { method: "DELETE" });
   paymentTerms = data.payment_terms || [];
   if (data.message) alert(data.message);
   renderPaymentTerms();
 }
 
+async function saveExportDestination() {
+  if (!canEditAdminTab("setup")) return;
+  const payload = {
+    name: document.querySelector("#exportDestinationName").value.trim(),
+    destination_type: document.querySelector("#exportDestinationType").value,
+    endpoint_url: document.querySelector("#exportDestinationUrl").value.trim(),
+    secret: document.querySelector("#exportDestinationSecret").value.trim(),
+    config: { mode: "scaffold_only" },
+    is_active: true,
+  };
+  if (!payload.name) {
+    setMessage("#exportDestinationMessage", "Destination name is required.", "error");
+    return;
+  }
+  const data = await api("/api/export-destinations", { method: "POST", body: JSON.stringify(payload) });
+  if (data.error) {
+    setMessage("#exportDestinationMessage", data.error, "error");
+    return;
+  }
+  exportDestinations = data.destinations || [];
+  document.querySelector("#exportDestinationName").value = "";
+  document.querySelector("#exportDestinationUrl").value = "";
+  document.querySelector("#exportDestinationSecret").value = "";
+  setMessage("#exportDestinationMessage", "Export destination saved.", "success");
+  renderExportDestinations();
+}
+
+async function deactivateExportDestination(id) {
+  if (!canEditAdminTab("setup")) return;
+  const data = await api(`/api/export-destinations/${id}`, { method: "DELETE" });
+  exportDestinations = data.destinations || [];
+  renderExportDestinations();
+}
+
 async function addXref() {
-  if (!canViewAdmin()) return;
+  if (!canEditAdminTab("master")) return;
   const payload = {
     customer_name: document.querySelector("#xrefCustomer").value.trim(),
     customer_part_number: document.querySelector("#xrefCustomerPart").value.trim(),
     customer_part_revision: document.querySelector("#xrefCustomerRev").value.trim(),
     internal_part_number: document.querySelector("#xrefInternalPart").value.trim(),
-    internal_part_revision: document.querySelector("#xrefInternalRev").value.trim(),
   };
   if (!payload.customer_name || !payload.customer_part_number || !payload.internal_part_number) {
     setXrefMessage("Customer, customer part number, and internal part number are required.", "error");
@@ -2216,19 +2867,17 @@ async function addXref() {
   document.querySelector("#xrefCustomerPart").value = "";
   document.querySelector("#xrefCustomerRev").value = "";
   document.querySelector("#xrefInternalPart").value = "";
-  document.querySelector("#xrefInternalRev").value = "";
   setXrefMessage("Cross reference saved.", "success");
   renderXrefs();
 }
 
 async function saveXref(id) {
-  if (!canViewAdmin()) return;
+  if (!canEditAdminTab("master")) return;
   const payload = {
     customer_name: document.querySelector(`#xref_customer_${id}`).value.trim(),
     customer_part_number: document.querySelector(`#xref_customer_part_${id}`).value.trim(),
     customer_part_revision: document.querySelector(`#xref_customer_rev_${id}`).value.trim(),
     internal_part_number: document.querySelector(`#xref_internal_part_${id}`).value.trim(),
-    internal_part_revision: document.querySelector(`#xref_internal_rev_${id}`).value.trim(),
   };
   const data = await api(`/api/customer-part-xrefs/${id}`, { method: "PUT", body: JSON.stringify(payload) });
   xrefs = data.xrefs;
@@ -2237,14 +2886,14 @@ async function saveXref(id) {
 }
 
 async function deleteXref(id) {
-  if (!canViewAdmin()) return;
+  if (!canEditAdminTab("master")) return;
   const data = await api(`/api/customer-part-xrefs/${id}`, { method: "DELETE" });
   xrefs = data.xrefs;
   renderXrefs();
 }
 
 async function uploadXrefCsv(file) {
-  if (!canViewAdmin()) return;
+  if (!canEditAdminTab("master")) return;
   if (!file) return;
   if (!file.name.toLowerCase().endsWith(".csv")) {
     setXrefMessage("Only CSV files are allowed.", "error");
@@ -2266,7 +2915,7 @@ async function uploadXrefCsv(file) {
 }
 
 async function uploadCustomerCsv(file, contacts = false) {
-  if (!canViewAdmin()) return;
+  if (!canEditAdminTab("master")) return;
   if (!file) return;
   if (!file.name.toLowerCase().endsWith(".csv")) {
     setCustomersMessage("Only CSV files are allowed.", "error");
@@ -2289,7 +2938,7 @@ async function uploadCustomerCsv(file, contacts = false) {
 }
 
 async function addProduct() {
-  if (!canViewAdmin()) return;
+  if (!canEditAdminTab("master")) return;
   const payload = {
     internal_part_number: document.querySelector("#productPart").value.trim(),
     internal_part_revision: document.querySelector("#productRevision").value.trim(),
@@ -2312,7 +2961,7 @@ async function addProduct() {
 }
 
 async function saveProduct(id) {
-  if (!canViewAdmin()) return;
+  if (!canEditAdminTab("master")) return;
   const payload = {
     internal_part_number: document.querySelector(`#product_part_${id}`).value.trim(),
     internal_part_revision: document.querySelector(`#product_rev_${id}`).value.trim(),
@@ -2327,14 +2976,14 @@ async function saveProduct(id) {
 }
 
 async function deleteProduct(id) {
-  if (!canViewAdmin()) return;
+  if (!canEditAdminTab("master")) return;
   const data = await api(`/api/products/${id}`, { method: "DELETE" });
   products = data.products || [];
   renderProducts();
 }
 
 async function uploadProductCsv(file) {
-  if (!canViewAdmin() || !file) return;
+  if (!canEditAdminTab("master") || !file) return;
   if (!file.name.toLowerCase().endsWith(".csv")) {
     setProductsMessage("Only CSV files are allowed.", "error");
     return;
@@ -2495,7 +3144,7 @@ function setFiles(files) {
 function renderSelectedFiles() {
   const container = document.querySelector("#selectedFiles");
   if (!selectedUploadFiles.length) {
-    container.textContent = "No files selected.";
+    container.textContent = "No files selected yet.";
     return;
   }
   container.innerHTML = `<ul>${selectedUploadFiles.map((file) => `<li>${safe(file.name)} (${Math.ceil(file.size / 1024)} KB)</li>`).join("")}</ul>`;
@@ -2511,10 +3160,10 @@ async function openConfirmedOrderView() {
   }
   win.document.write(`
     <html><head><title>Confirmed Order ${safe(data.purchase_order?.po_number)}</title><style>
-      body{font-family:Segoe UI,Arial,sans-serif;padding:24px;color:#17202a}
+      body{font-family:"Source Sans 3",Segoe UI,Arial,sans-serif;padding:24px;color:#0f172a}
       table{width:100%;border-collapse:collapse;margin-top:16px}
-      th,td{border:1px solid #d8dee9;padding:8px;text-align:left}
-      button{padding:8px 12px}
+      th,td{border:1px solid #e2e8f0;padding:8px;text-align:left}
+      button{padding:8px 12px;border:1px solid #2563eb;border-radius:10px;background:#2563eb;color:#fff;font:inherit;font-weight:600}
     </style></head><body>
       <button onclick="window.print()">Print</button>
       <pre>${safe(data.summary)}</pre>
@@ -2560,8 +3209,7 @@ function configureAccessUI() {
   document.querySelector("#adminViewBtn").classList.toggle("hidden", !canViewAdmin());
   document.querySelector("#syncBtn").classList.toggle("hidden", !canEditDashboard());
   document.querySelector("#importBtn").classList.toggle("hidden", !canEditDashboard());
-  document.querySelector("#usersPanel").classList.toggle("hidden", !canManageUsers());
-  document.querySelector("#adminTabUsersBtn").classList.toggle("hidden", !canManageUsers());
+  configureAdminAccessUi();
 }
 
 async function loadMe() {
@@ -2577,13 +3225,15 @@ async function loadMe() {
 
 async function login() {
   const email = document.querySelector("#loginEmail").value.trim();
-  if (!email) {
-    setMessage("#loginMessage", "Email is required.", "error");
+  const password = document.querySelector("#loginPassword").value;
+  if (!email || !password) {
+    setMessage("#loginMessage", "Email and password are required.", "error");
     return;
   }
   try {
-    const data = await api("/api/login", { method: "POST", body: JSON.stringify({ email }), skipAuthRedirect: true });
+    const data = await api("/api/login", { method: "POST", body: JSON.stringify({ email, password }), skipAuthRedirect: true });
     currentUser = data.user;
+    document.querySelector("#loginPassword").value = "";
     showApp();
     await switchView(canViewDashboard() ? "dashboard" : "admin");
   } catch (error) {
@@ -2607,7 +3257,7 @@ async function uploadSelectedFiles() {
   const btn = document.querySelector("#uploadProcessBtn");
   btn.disabled = true;
   btn.textContent = "Uploading...";
-  setUploadMessage("Uploading and processing files...");
+  setUploadMessage("Finding the clean route through these files...");
   try {
     const form = new FormData();
     selectedUploadFiles.forEach((file) => form.append("files", file));
@@ -2617,7 +3267,7 @@ async function uploadSelectedFiles() {
       throw new Error(data.error || "Upload failed");
     }
     const rejected = data.rejected_files?.length ? ` Rejected: ${data.rejected_files.map((f) => f.filename).join(", ")}.` : "";
-    setUploadMessage(`Imported ${data.imported}, skipped ${data.skipped}, created ${data.purchase_orders} PO records.${rejected}`, data.rejected_files?.length ? "error" : "success");
+    setUploadMessage(`The clean list is ready. Imported ${data.imported}, skipped ${data.skipped}, created ${data.purchase_orders} PO records.${rejected}`, data.rejected_files?.length ? "error" : "success");
     await refresh();
     if (!data.rejected_files?.length) {
       closeUploadModal();
@@ -2635,10 +3285,10 @@ async function importExistingSampleFolder() {
   const btn = document.querySelector("#folderImportBtn");
   btn.disabled = true;
   btn.textContent = "Importing...";
-  setUploadMessage("Importing existing sample folder...");
+  setUploadMessage("Finding the clean route through the sample folder...");
   try {
     const data = await api("/api/import-samples", { method: "POST" });
-    setUploadMessage(`Imported ${data.imported}, skipped ${data.skipped}, created ${data.purchase_orders} PO records.`, "success");
+    setUploadMessage(`The clean list is ready. Imported ${data.imported}, skipped ${data.skipped}, created ${data.purchase_orders} PO records.`, "success");
     await refresh();
   } catch (error) {
     setUploadMessage(error.message || "Import failed.", "error");
@@ -2651,6 +3301,9 @@ async function importExistingSampleFolder() {
 document.querySelector("#importBtn").addEventListener("click", openUploadModal);
 document.querySelector("#loginBtn").addEventListener("click", login);
 document.querySelector("#loginEmail").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") login();
+});
+document.querySelector("#loginPassword").addEventListener("keydown", (event) => {
   if (event.key === "Enter") login();
 });
 document.querySelector("#logoutBtn").addEventListener("click", logout);
@@ -2704,7 +3357,7 @@ dropZone.addEventListener("drop", (event) => {
 });
 
 document.querySelector("#syncBtn").addEventListener("click", () => {
-  alert("Gmail/Outlook sync is stubbed for the MVP. Use Import Samples to test the pipeline.");
+  alert("Gmail/Outlook sync is stubbed for the MVP. Use Import POs to test the pipeline.");
 });
 
 document.querySelector("#exportBtn").addEventListener("click", openExportModal);
@@ -2720,16 +3373,22 @@ document.querySelector("#adminTabMasterBtn").addEventListener("click", () => swi
 document.querySelector("#adminTabSetupBtn").addEventListener("click", () => switchAdminTab("setup"));
 document.querySelector("#adminTabTestingBtn").addEventListener("click", () => switchAdminTab("testing"));
 document.querySelector("#adminTabAnalyticsBtn").addEventListener("click", () => switchAdminTab("analytics"));
+document.querySelector("#adminTabErpBtn").addEventListener("click", () => switchAdminTab("erp"));
 document.querySelector("#addOrderTypeBtn").addEventListener("click", addOrderType);
 document.querySelector("#addDepartmentBtn").addEventListener("click", addDepartment);
 document.querySelector("#addPaymentTermBtn").addEventListener("click", addPaymentTerm);
+document.querySelector("#saveExportDestinationBtn").addEventListener("click", saveExportDestination);
+document.querySelector("#saveOracleEbsProfileBtn").addEventListener("click", saveOracleEbsProfile);
 document.querySelector("#addXrefBtn").addEventListener("click", addXref);
 document.querySelector("#addProductBtn").addEventListener("click", addProduct);
+document.querySelector("#canonicalBackfillBtn").addEventListener("click", refreshCanonicalBackfill);
 document.querySelector("#inviteUserBtn").addEventListener("click", inviteUser);
 document.querySelector("#closeUserModalBtn").addEventListener("click", closeUserModal);
 document.querySelector("#cancelUserModalBtn").addEventListener("click", closeUserModal);
 document.querySelector("#saveUserModalBtn").addEventListener("click", () => saveUser());
 document.querySelector("#deactivateUserModalBtn").addEventListener("click", () => deactivateUser());
+document.querySelector("#editUserAdmin").addEventListener("change", updateAdminPermissionMenu);
+document.querySelector("#editUserAdminAccess").addEventListener("change", updateAdminPermissionMenu);
 document.querySelector("#addCustomerBtn").addEventListener("click", () => openCustomerModal());
 document.querySelector("#uploadCustomersCsvBtn").addEventListener("click", () => document.querySelector("#customerCsvInput").click());
 document.querySelector("#uploadCustomerContactsCsvBtn").addEventListener("click", () => document.querySelector("#customerContactCsvInput").click());
@@ -2794,6 +3453,11 @@ document.querySelector("#saveInboxConfigBtn").addEventListener("click", saveInbo
 document.querySelector("#closeManualSyncBtn").addEventListener("click", closeManualSyncModal);
 document.querySelector("#cancelManualSyncBtn").addEventListener("click", closeManualSyncModal);
 document.querySelector("#runManualSyncBtn").addEventListener("click", runManualSync);
+document.querySelector("#savePoEntryBtn").addEventListener("click", savePoEntry);
+document.querySelector("#closePoEntryBtn").addEventListener("click", closePoEntryView);
+document.querySelector("#poEntryModal").addEventListener("click", (event) => {
+  if (event.target.id === "poEntryModal") closePoEntryView();
+});
 document.querySelector("#closeGoldenModalBtn").addEventListener("click", closeGoldenModal);
 document.querySelector("#cancelGoldenModalBtn").addEventListener("click", closeGoldenModal);
 document.querySelector("#saveGoldenHeaderBtn").addEventListener("click", saveGoldenHeader);

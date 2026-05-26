@@ -14,6 +14,7 @@ from xml.etree import ElementTree
 from pypdf import PdfReader
 
 from server.connectors import IncomingAttachment, IncomingEmail, SampleInboxConnector
+from server.config import OCR_PROVIDER
 from server.db import log
 from server.extraction import classify_purchase_order, extract_purchase_order, normalize_date
 from server.master_data import format_structured_address, parse_structured_address, run_master_data_reviews
@@ -79,6 +80,11 @@ def insert_attachment(conn: sqlite3.Connection, email_id: int, attachment: Incom
     if attachment.content_type == "application/pdf" or attachment.filename.lower().endswith(".pdf"):
         extracted_text, page_count = extract_pdf_text(attachment.local_path)
         method = "pdf_text" if extracted_text.strip() else "ocr_unavailable"
+        if not extracted_text.strip():
+            ocr_text, ocr_method = extract_pdf_with_vision_or_ocr(attachment.local_path)
+            if ocr_text.strip():
+                extracted_text = ocr_text
+                method = ocr_method
     elif attachment.filename.lower().endswith(".txt"):
         extracted_text = attachment.local_path.read_text(encoding="utf-8")
         method = "text"
@@ -201,7 +207,10 @@ def extract_docx_text_from_zip(path: Path) -> str:
 
 
 def extract_pdf_with_vision_or_ocr(path: Path) -> tuple[str, str]:
-    return "", "OCR/vision extraction is not configured for this MVP."
+    provider = (OCR_PROVIDER or "none").lower()
+    if provider in {"", "none", "disabled"}:
+        return "", "OCR/vision extraction is not configured for this instance."
+    return "", f"OCR provider '{provider}' is configured as a scaffold but is not implemented yet."
 
 
 def process_email(conn: sqlite3.Connection, email_id: int, attachments: list[dict[str, Any]]) -> int:
@@ -593,9 +602,10 @@ def insert_po_line(conn: sqlite3.Connection, purchase_order_id: int, po_number: 
             purchase_order_id, po_number, line_number, customer_part_number, customer_part_revision,
             internal_part_number, internal_part_revision, description,
             quantity, unit_of_measure, unit_price, line_total, requested_date, extraction_confidence, extraction_notes,
-            field_confidence_json, product_match_status, matched_product_id, product_match_score, product_match_reason
+            field_confidence_json, product_match_status, matched_product_id, product_match_score, product_match_reason,
+            canonical_product_id, customer_product_alias_id
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             purchase_order_id,
@@ -618,6 +628,8 @@ def insert_po_line(conn: sqlite3.Connection, purchase_order_id: int, po_number: 
             product_match["product_id"],
             product_match["score"],
             product_match["reason"],
+            product_match.get("canonical_product_id"),
+            product_match.get("customer_product_alias_id"),
         ),
     )
     conn.commit()
@@ -823,6 +835,17 @@ def apply_cross_references(conn: sqlite3.Connection, extraction: dict[str, Any])
         if not customer_part:
             continue
         customer_revision = (line.get("customer_part_revision") or "").strip().lower()
+        alias = find_canonical_customer_product_alias(conn, customer, customer_part, customer_revision)
+        if alias and alias["product_number"]:
+            line["internal_part_number"] = alias["product_number"]
+            if alias["product_revision"] and not line.get("internal_part_revision"):
+                line["internal_part_revision"] = alias["product_revision"]
+            notes = line.get("extraction_notes") or ""
+            line["extraction_notes"] = (notes + " Matched from canonical customer product alias.").strip()
+            confidence = line.setdefault("field_confidence", {})
+            confidence["internal_part_number"] = 0.95
+            confidence["internal_part_revision"] = 0.95
+            continue
         row = conn.execute(
             """
             SELECT internal_part_number, internal_part_revision
@@ -854,7 +877,72 @@ def apply_cross_references(conn: sqlite3.Connection, extraction: dict[str, Any])
         confidence["internal_part_revision"] = 0.95
 
 
+def find_canonical_customer_product_alias(
+    conn: sqlite3.Connection, customer_name: str, customer_part_number: str, customer_revision: str | None
+) -> sqlite3.Row | None:
+    if not customer_name or not customer_part_number:
+        return None
+    params = (customer_name, customer_part_number, customer_revision or "")
+    row = conn.execute(
+        """
+        SELECT cpa.*, p.product_number
+        FROM customer_product_alias cpa
+        JOIN trading_partner_account tpa ON tpa.id = cpa.trading_partner_account_id
+        LEFT JOIN product p ON p.id = cpa.product_id
+        WHERE LOWER(TRIM(tpa.account_name)) = LOWER(TRIM(?))
+          AND cpa.normalized_customer_product_number = LOWER(TRIM(?))
+          AND LOWER(TRIM(COALESCE(cpa.customer_product_revision, ''))) = LOWER(TRIM(?))
+          AND cpa.active_flag = 1
+        LIMIT 1
+        """,
+        params,
+    ).fetchone()
+    if row:
+        return row
+    return conn.execute(
+        """
+        SELECT cpa.*, p.product_number
+        FROM customer_product_alias cpa
+        JOIN trading_partner_account tpa ON tpa.id = cpa.trading_partner_account_id
+        LEFT JOIN product p ON p.id = cpa.product_id
+        WHERE LOWER(TRIM(tpa.account_name)) = LOWER(TRIM(?))
+          AND cpa.normalized_customer_product_number = LOWER(TRIM(?))
+          AND COALESCE(NULLIF(TRIM(cpa.customer_product_revision), ''), '') = ''
+          AND cpa.active_flag = 1
+        LIMIT 1
+        """,
+        (customer_name, customer_part_number),
+    ).fetchone()
+
+
+def canonical_product_id_for_legacy_product(conn: sqlite3.Connection, product_id: int | None) -> int | None:
+    if not product_id:
+        return None
+    row = conn.execute(
+        "SELECT id FROM product WHERE legacy_source_table = 'products' AND legacy_source_id = ? LIMIT 1",
+        (str(product_id),),
+    ).fetchone()
+    return int(row["id"]) if row else None
+
+
+def canonical_alias_for_po_line(conn: sqlite3.Connection, po_id: int, line: dict[str, Any]) -> sqlite3.Row | None:
+    po = conn.execute("SELECT customer_company_name FROM purchase_orders WHERE id = ?", (po_id,)).fetchone()
+    if not po:
+        return None
+    return find_canonical_customer_product_alias(
+        conn,
+        po["customer_company_name"] or "",
+        (line.get("customer_part_number") or "").strip(),
+        (line.get("customer_part_revision") or "").strip(),
+    )
+
+
 def match_product_for_line(conn: sqlite3.Connection, po_id: int, line: dict[str, Any]) -> dict[str, Any]:
+    alias = canonical_alias_for_po_line(conn, po_id, line)
+    if alias and alias["product_number"] and not line.get("internal_part_number"):
+        line["internal_part_number"] = alias["product_number"]
+        if alias["product_revision"] and not line.get("internal_part_revision"):
+            line["internal_part_revision"] = alias["product_revision"]
     internal_part = (line.get("internal_part_number") or "").strip()
     internal_revision = (line.get("internal_part_revision") or "").strip()
     if internal_part:
@@ -868,7 +956,14 @@ def match_product_for_line(conn: sqlite3.Connection, po_id: int, line: dict[str,
             (internal_part, internal_revision),
         ).fetchone()
         if row:
-            return {"status": "matched_exact", "product_id": row["id"], "score": 1.0, "reason": "Matched active product by internal part number."}
+            return {
+                "status": "matched_exact",
+                "product_id": row["id"],
+                "canonical_product_id": canonical_product_id_for_legacy_product(conn, row["id"]) or (alias["product_id"] if alias else None),
+                "customer_product_alias_id": alias["id"] if alias else None,
+                "score": 1.0,
+                "reason": "Matched active product by internal part number.",
+            }
     description = line.get("description") or ""
     best_row = None
     best_score = 0.0
@@ -887,6 +982,8 @@ def match_product_for_line(conn: sqlite3.Connection, po_id: int, line: dict[str,
         return {
             "status": "matched_fuzzy",
             "product_id": best_row["id"],
+            "canonical_product_id": canonical_product_id_for_legacy_product(conn, best_row["id"]),
+            "customer_product_alias_id": alias["id"] if alias else None,
             "score": round(best_score, 3),
             "reason": f"Fuzzy description match to {best_row['internal_part_number']}.",
         }
@@ -894,10 +991,19 @@ def match_product_for_line(conn: sqlite3.Connection, po_id: int, line: dict[str,
         return {
             "status": "needs_review",
             "product_id": best_row["id"],
+            "canonical_product_id": canonical_product_id_for_legacy_product(conn, best_row["id"]),
+            "customer_product_alias_id": alias["id"] if alias else None,
             "score": round(best_score, 3),
             "reason": f"Weak description match to {best_row['internal_part_number']}; review before using.",
         }
-    return {"status": "unmatched", "product_id": None, "score": round(best_score, 3), "reason": "No product master match."}
+    return {
+        "status": "unmatched",
+        "product_id": None,
+        "canonical_product_id": alias["product_id"] if alias else None,
+        "customer_product_alias_id": alias["id"] if alias else None,
+        "score": round(best_score, 3),
+        "reason": "No product master match.",
+    }
 
 
 def product_tokens(value: Any) -> set[str]:
